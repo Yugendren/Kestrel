@@ -712,6 +712,41 @@ struct PreparedIndexBuffer {
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
+// A GCN/RDNA vertex fetch goes through a V#: with OOB_SELECT 0 or 1 an index at or past
+// NUM_RECORDS is out of range and reads as zero, so a primitive built from such vertices
+// collapses and the geometry engine discards it. Host fixed-function vertex input has no
+// range check, so any vertex the guest buffers cannot supply would be fetched from whatever
+// guest memory follows the buffer and become a real primitive (a screen-covering wedge when
+// w happens to be 0). Bound non-indexed draws to the vertices the strided per-vertex buffers
+// actually hold.
+static uint32_t ClampAutoVertexCount(const ShaderVertexInputInfo& info, uint32_t first_vertex,
+                                     uint32_t vertex_count) {
+	uint64_t limit = UINT64_MAX;
+	for (int i = 0; i < info.buffers_num; i++) {
+		const auto& b = info.buffers[i];
+		if (b.fetch_index != 0 || b.stride == 0 || b.num_records == 0 || b.attr_num == 0) {
+			continue;
+		}
+		// OOB_SELECT == 2 only checks NumRecords != 0, so the index itself is unbounded.
+		if (info.resources[b.attr_indices[0]].OutOfBounds() == 2) {
+			continue;
+		}
+		limit = std::min<uint64_t>(limit, b.num_records);
+	}
+	if (limit == UINT64_MAX) {
+		return vertex_count;
+	}
+	const uint64_t available = first_vertex < limit ? limit - first_vertex : 0;
+	if (available < vertex_count) {
+		static std::atomic<uint32_t> clamp_logs {0};
+		if (clamp_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("draw: clamping vertex_count %u to %" PRIu64 " (first_vertex %u, V# num_records %" PRIu64 ")\n",
+			     vertex_count, available, first_vertex, limit);
+		}
+	}
+	return static_cast<uint32_t>(std::min<uint64_t>(vertex_count, available));
+}
+
 static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer,
                                            const ShaderVertexInputInfo& info) {
 	if (buffer.stride != 0 || buffer.num_records == 0) {
@@ -1261,8 +1296,8 @@ static void EmitIndirectPrimitives(vk::CommandBuffer vk_buffer, const DrawCallIn
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
-                               const DrawCallInfo& draw, const DrawEmitInfo& emit,
-                               const PreparedIndirectArgs& indirect) {
+                               const ShaderVertexInputInfo& vs_input_info, const DrawCallInfo& draw,
+                               const DrawEmitInfo& emit, const PreparedIndirectArgs& indirect) {
 	// Every other topology expands into several host draws using counts the GPU has not read
 	// yet, so SupportsIndirectDraw() never lets an indirect draw reach them.
 	EXIT_IF(indirect.IsValid() && !IsSingleHostDrawPrimitive(ucfg.GetPrimType()));
@@ -1282,7 +1317,12 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      emit.first_instance);
 			} else {
-				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
+				const auto vertex_count =
+				    ClampAutoVertexCount(vs_input_info, emit.first_vertex, draw.index_count);
+				if (vertex_count == 0) {
+					break;
+				}
+				vk_buffer.draw(vertex_count, draw.instance_count, emit.first_vertex,
 				               emit.first_instance);
 			}
 			break;
@@ -1458,7 +1498,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit, indirect_binding);
+		EmitDrawPrimitives(ucfg, vk_buffer, state.vertex_info[0], draw, emit, indirect_binding);
 	}
 
 	if (!draw.IsIndexed()) {
