@@ -217,7 +217,10 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
+    // A stream allocation can back a mesh draw's parameter block, which the shader addresses
+    // directly through its 64-bit device address rather than through a bound descriptor.
+    : Buffer(graphics, scheduler, usage, 0, AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+             size),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

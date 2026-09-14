@@ -1446,6 +1446,23 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.indirect != nullptr) {
 		indirect_binding = PrepareIndirectArgs(buffer, *draw.indirect, draw.IsIndexed());
 	}
+	uint64_t mesh_draw_block_address = 0;
+	if (mesh_active) {
+		const uint32_t draw_data[] {
+		    draw.index_count,
+		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+		    emit.first_instance, index_source.guest_element_size,
+		    static_cast<uint32_t>(index_source.address),
+		    static_cast<uint32_t>(index_source.address >> 32u)};
+		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		// Uploading the parameter block writes to host-visible memory and can finish and restart
+		// the scheduler, so it has to happen alongside PrepareIndexBuffer/PrepareIndirectArgs,
+		// before the point below where the command buffer may no longer touch guest memory. Only
+		// the resulting device address -- not the block itself -- is pushed at that point.
+		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		const auto offset = stream.Copy(draw_data, sizeof(draw_data), 16);
+		mesh_draw_block_address = stream.BufferDeviceAddress() + offset;
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1471,17 +1488,16 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
-		const uint32_t draw_data[] {
-		    draw.index_count,
-		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
-		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		const std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshDrawAddressDwordCount>
+		    address_data {static_cast<uint32_t>(mesh_draw_block_address),
+		                  static_cast<uint32_t>(mesh_draw_block_address >> 32u)};
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
-		                        0, sizeof(draw_data), draw_data);
+		                        0,
+		                        ShaderRecompiler::IR::PushData::MeshDrawAddressDwordCount *
+		                            sizeof(uint32_t),
+		                        address_data.data());
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}

@@ -703,7 +703,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawAddressDwordCount : 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);

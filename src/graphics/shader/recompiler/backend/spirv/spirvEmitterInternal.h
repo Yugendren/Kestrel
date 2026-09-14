@@ -140,6 +140,12 @@ uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
 uint32_t TypeScalarU64(EmitterState& state);
+
+// A real (non-guest) 64-bit device address, and the same built from a push-constant/SGPR low:high
+// dword pair. Used by the DMA/BDA path and by the mesh push-constant path, which addresses a
+// shader-visible parameter block directly rather than through the guest BDA page table.
+uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
+uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);

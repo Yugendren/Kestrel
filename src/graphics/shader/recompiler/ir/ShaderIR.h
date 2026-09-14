@@ -294,6 +294,9 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// MeshDrawDwordCount is the size of the parameter block in memory; push constants carry only
+	// its 64-bit address, so the same shader serves a draw whose parameters the host never sees.
+	static constexpr uint32_t MeshDrawAddressDwordCount = 2;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
