@@ -525,13 +525,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features12.pNext = &depth_clip_control;
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
+	vk::PhysicalDeviceVulkan12Features supported_features12 {};
+	supported_features13.pNext = &supported_features12;
 
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness2 {};
 	if (robustness2_ext_enabled) {
-		supported_features13.pNext = &supported_robustness2;
+		supported_features12.pNext = &supported_robustness2;
 	}
 
 	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
@@ -572,6 +574,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
 	physical_device.getProperties2(&properties2);
+
+	// GPU-side indirect draws let the command processor hand the guest's argument block straight
+	// to the GPU instead of reading it back. Every capability here is optional: RenderExecutor
+	// falls back to host-read arguments for whatever a device cannot express.
+	graphics.multi_draw_indirect_enabled = supported_features2.features.multiDrawIndirect == VK_TRUE;
+	graphics.draw_indirect_first_instance_enabled =
+	    supported_features2.features.drawIndirectFirstInstance == VK_TRUE;
+	graphics.draw_indirect_count_enabled = supported_features12.drawIndirectCount == VK_TRUE;
+	graphics.max_draw_indirect_count     = properties2.properties.limits.maxDrawIndirectCount;
+	LOGF("Vulkan indirect draws: multi=%s first_instance=%s count_buffer=%s max_count=%u\n",
+	     graphics.multi_draw_indirect_enabled ? "true" : "false",
+	     graphics.draw_indirect_first_instance_enabled ? "true" : "false",
+	     graphics.draw_indirect_count_enabled ? "true" : "false",
+	     graphics.max_draw_indirect_count);
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
@@ -636,7 +652,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.occlusionQueryPrecise    = supported_features2.features.occlusionQueryPrecise;
 	graphics.occlusion_query_precise_enabled =
 	    supported_features2.features.occlusionQueryPrecise == VK_TRUE;
-	device_features.shaderInt64 = VK_TRUE;
+	device_features.shaderInt64               = VK_TRUE;
+	device_features.multiDrawIndirect         = graphics.multi_draw_indirect_enabled;
+	device_features.drawIndirectFirstInstance = graphics.draw_indirect_first_instance_enabled;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 #if defined(__APPLE__)
@@ -668,6 +686,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+
+	features12.drawIndirectCount = graphics.draw_indirect_count_enabled ? VK_TRUE : VK_FALSE;
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};

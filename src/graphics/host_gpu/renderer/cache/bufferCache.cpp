@@ -570,6 +570,18 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	return address + m_slot_buffers[id].Size() > vaddr;
 }
 
+bool BufferCache::IsRegionObtainableWithoutRegistering(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	if (IsRegionRegistered(vaddr, size)) {
+		return true;
+	}
+	// Mirrors the streaming shortcut ObtainBuffer() takes for a small host-resident range.
+	return size <= CACHING_PAGESIZE && !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+	       m_memory_tracker.IsRegionCpuModified(vaddr, size);
+}
+
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
