@@ -47,6 +47,7 @@ struct ConfigOptions {
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
+	float                  render_scale                = 1.0F;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -80,6 +81,7 @@ PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
+float GetRenderScale();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 

@@ -10,7 +10,9 @@
 #include "kytyGitVersion.h"
 
 #include <charconv>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 
 using namespace Common;
@@ -55,6 +57,11 @@ static void PrintUsage() {
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --render-scale <float>               Internal render resolution scale (0.1-4.0).\n"
+	         "                                       Default: 1.0 (native).\n");
+	::printf("  --internal-resolution <value>        Internal resolution preset: native, 2160p,\n"
+	         "                                       1440p, 1080p, 720p, 540p. Overridden by\n"
+	         "                                       --render-scale if both are given.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -137,6 +144,42 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 	}
 	out = user_id;
 	return true;
+}
+
+static bool ParseFloat(const std::string& value, float& out, float min_value, float max_value) {
+	if (value.empty()) {
+		return false;
+	}
+
+	char*       end    = nullptr;
+	const float parsed = std::strtof(value.c_str(), &end);
+	if (end != value.c_str() + value.size() || !std::isfinite(parsed) || parsed < min_value ||
+	    parsed > max_value) {
+		return false;
+	}
+
+	out = parsed;
+	return true;
+}
+
+static bool ParseInternalResolution(const std::string& value, float& out) {
+	struct Preset {
+		const char* name;
+		float       scale;
+	};
+	static constexpr Preset PRESETS[] = {
+	    {"native", 1.0F}, {"2160p", 1.0F}, {"1440p", 0.6666667F},
+	    {"1080p", 0.5F},  {"720p", 0.3333333F},  {"540p", 0.25F},
+	};
+
+	for (const auto& preset: PRESETS) {
+		if (Common::EqualNoCase(value, preset.name)) {
+			out = preset.scale;
+			return true;
+		}
+	}
+
+	return false;
 }
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
@@ -246,6 +289,20 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			const int32_t vblank_frequency = Common::ToInt32(value);
 			options.config.vblank_frequency =
 			    static_cast<uint32_t>(vblank_frequency < 0 ? 0 : vblank_frequency);
+		} else if (arg == "--render-scale") {
+			float parsed = 0.0F;
+			if (!ParseFloat(value, parsed, 0.1F, 4.0F)) {
+				::printf("invalid render scale: %s\n", value.c_str());
+				return false;
+			}
+			options.config.render_scale = parsed;
+		} else if (arg == "--internal-resolution") {
+			float mapped = 0.0F;
+			if (!ParseInternalResolution(value, mapped)) {
+				::printf("invalid internal resolution: %s\n", value.c_str());
+				return false;
+			}
+			options.config.render_scale = mapped;
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());

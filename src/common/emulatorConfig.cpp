@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 
 namespace Config {
@@ -57,6 +58,14 @@ bool FullscreenEnabled() {
 
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
+}
+
+float GetRenderScale() {
+	const float scale = g_config->render_scale;
+	if (!std::isfinite(scale)) {
+		return 1.0F;
+	}
+	return std::clamp(scale, 0.1F, 4.0F);
 }
 
 uint32_t GetConsoleLanguage() {
