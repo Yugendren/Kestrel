@@ -7,6 +7,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/virtualMemory.h"
 #include "kernel/eventFlag.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -2364,132 +2365,53 @@ static bool FiberIsValid(const FiberObject* fiber) {
 	       fiber->magic_end == FIBER_MAGIC_END;
 }
 
-static thread_local FiberObject*                  g_current_fiber       = nullptr;
-static thread_local FiberObject*                  g_thread_return_fiber = nullptr;
-static thread_local FiberObject*                  g_starting_fiber      = nullptr;
-static thread_local FiberObject*                  g_pending_idle_fiber  = nullptr;
-static thread_local FiberCpuContext               g_thread_fiber_context {};
-static std::mutex                                 g_fiber_owner_mutex;
-static std::unordered_map<FiberObject*, uint64_t> g_fiber_owner_thread;
-static std::unordered_map<uint64_t, FiberObject*> g_fiber_current_by_thread;
+// Per-host-thread fiber state. Fibers migrate between host threads (a fiber suspended on one
+// thread may be resumed by another), so this state must be re-resolved after every context
+// switch; the accessor is kept out of line so a cached TLS address never survives a switch.
+struct FiberThreadState {
+	FiberObject*    current  = nullptr; // fiber executing on this host thread
+	FiberObject*    returned = nullptr; // fiber that handed control back to this thread's FiberRun
+	FiberObject*    starting = nullptr; // hand-off to the start trampoline
+	FiberCpuContext thread_context {};  // registers of this thread's FiberRun frame
+};
+
+__attribute__((noinline)) static FiberThreadState& FiberTls() {
+	static thread_local FiberThreadState state;
+	return state;
+}
 
 static uint32_t FiberLoadState(const FiberObject* fiber) {
 	auto& state = const_cast<uint32_t&>(fiber->state);
 	return std::atomic_ref<uint32_t>(state).load(std::memory_order_acquire);
 }
 
-static uint64_t FiberCurrentHostThreadId() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	return static_cast<uint64_t>(::GetCurrentThreadId());
-#else
-	return std::hash<std::thread::id> {}(std::this_thread::get_id());
-#endif
-}
-
-static void FiberSetOwner(FiberObject* fiber) {
-	std::lock_guard lock(g_fiber_owner_mutex);
-	g_fiber_owner_thread[fiber] = FiberCurrentHostThreadId();
-}
-
-static void FiberClearOwner(FiberObject* fiber) {
-	std::lock_guard lock(g_fiber_owner_mutex);
-	g_fiber_owner_thread.erase(fiber);
-}
-
-static uint64_t FiberGetOwner(FiberObject* fiber) {
-	std::lock_guard lock(g_fiber_owner_mutex);
-	auto            it = g_fiber_owner_thread.find(fiber);
-	return it != g_fiber_owner_thread.end() ? it->second : 0;
-}
-
-static void FiberSetCurrentFiber(FiberObject* fiber) {
-	g_current_fiber = fiber;
-
-	std::lock_guard lock(g_fiber_owner_mutex);
-	const auto      thread_id = FiberCurrentHostThreadId();
-	if (fiber != nullptr) {
-		g_fiber_current_by_thread[thread_id] = fiber;
-	} else {
-		g_fiber_current_by_thread.erase(thread_id);
-	}
-}
-
-static void FiberStoreState(FiberObject* fiber, uint32_t state) {
-	std::atomic_ref<uint32_t>(fiber->state).store(state, std::memory_order_release);
-	if (state == FIBER_STATE_RUNNING) {
-		FiberSetOwner(fiber);
-	} else {
-		FiberClearOwner(fiber);
-	}
-}
-
-static void FiberDeferIdle(FiberObject* fiber) {
-	g_pending_idle_fiber = fiber;
-}
-
-static void FiberCommitDeferredIdle() {
-	auto* fiber          = g_pending_idle_fiber;
-	g_pending_idle_fiber = nullptr;
-	if (fiber != nullptr) {
-		FiberStoreState(fiber, FIBER_STATE_IDLE);
-	}
-}
-
 static bool FiberCompareExchangeState(FiberObject* fiber, uint32_t expected, uint32_t desired) {
-	const bool ok = std::atomic_ref<uint32_t>(fiber->state)
-	                    .compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
-	                                             std::memory_order_acquire);
-	if (ok) {
-		if (desired == FIBER_STATE_RUNNING) {
-			FiberSetOwner(fiber);
-		} else {
-			FiberClearOwner(fiber);
-		}
-	}
-	return ok;
+	auto ref = std::atomic_ref<uint32_t>(fiber->state);
+	return ref.compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
+	                                   std::memory_order_acquire);
 }
 
-static bool FiberWaitAndEnterRunning(FiberObject* fiber, uint32_t* observed_state) {
+// Claims a suspended fiber for running. A fiber that is mid-suspension on another thread reads
+// as RUNNING for a few instructions, so allow a short bounded wait before reporting STATE.
+static bool FiberAcquireRunning(FiberObject* fiber) {
 	const auto start = std::chrono::steady_clock::now();
-	uint32_t   spin  = 0;
-	auto&      state = fiber->state;
-	auto       ref   = std::atomic_ref<uint32_t>(state);
-
-	for (;;) {
+	for (uint32_t spin = 0;; spin++) {
 		uint32_t expected = FIBER_STATE_IDLE;
+		auto     ref      = std::atomic_ref<uint32_t>(fiber->state);
 		if (ref.compare_exchange_strong(expected, FIBER_STATE_RUNNING, std::memory_order_acq_rel,
 		                                std::memory_order_acquire)) {
-			FiberSetOwner(fiber);
 			return true;
 		}
-		if (observed_state != nullptr) {
-			*observed_state = expected;
-		}
-		if (expected != FIBER_STATE_RUNNING) {
+		if (expected != FIBER_STATE_RUNNING ||
+		    std::chrono::steady_clock::now() - start > std::chrono::milliseconds(2)) {
 			return false;
 		}
-		if (std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(5)) {
-			return false;
-		}
-		if (spin++ < 64) {
+		if (spin < 32) {
 			std::this_thread::yield();
 		} else {
-			std::this_thread::sleep_for(std::chrono::microseconds(100));
+			std::this_thread::sleep_for(std::chrono::microseconds(50));
 		}
 	}
-}
-
-static bool FiberRepairStaleRunningOnThisThread(FiberObject* fiber, uint32_t observed_state) {
-	if (observed_state != FIBER_STATE_RUNNING || fiber == g_current_fiber) {
-		return false;
-	}
-
-	const auto owner = FiberGetOwner(fiber);
-	if (owner != 0) {
-		return false;
-	}
-
-	return FiberCompareExchangeState(fiber, FIBER_STATE_RUNNING, FIBER_STATE_IDLE);
 }
 
 static void FiberSetContextValid(FiberObject* fiber, bool valid) {
@@ -2497,94 +2419,140 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	fiber->context       = valid ? &fiber->saved_context : nullptr;
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
-[[gnu::naked,
-  gnu::returns_twice]] static KYTY_SYSV_ABI int FiberSaveContext(FiberCpuContext* /*ctx*/) {
-	asm volatile("movq %rdi, %r10\n\t"
-	             "movq %rbx, 0(%r10)\n\t"
-	             "movq %rbp, 8(%r10)\n\t"
-	             "movq %rdi, 16(%r10)\n\t"
-	             "movq %rsi, 24(%r10)\n\t"
-	             "movq %r12, 32(%r10)\n\t"
-	             "movq %r13, 40(%r10)\n\t"
-	             "movq %r14, 48(%r10)\n\t"
-	             "movq %r15, 56(%r10)\n\t"
-	             "leaq 8(%rsp), %r11\n\t"
-	             "movq %r11, 64(%r10)\n\t"
-	             "movq (%rsp), %r11\n\t"
-	             "movq %r11, 72(%r10)\n\t"
-	             "xorl %eax, %eax\n\t"
-	             "retq\n");
+// Emulator-owned stacks. Guest fiber contexts can be as small as 2 KiB (ASTRO's PLAYROOM converts
+// threads to fibers with 2 KiB contexts) while every library call the guest makes from inside a
+// fiber runs emulator C++ on the fiber's stack. Running fibers on the guest context would
+// overflow it into adjacent game memory, so every fiber runs on a guarded host stack instead. The
+// guest context is still reported through sceFiberGetInfo.
+constexpr uint64_t FIBER_HOST_STACK_SIZE      = 256u * 1024u;
+constexpr uint64_t FIBER_HOST_STACK_GUARD     = 16u * 1024u;
+constexpr uint64_t FIBER_HOST_STACK_THRESHOLD = FIBER_HOST_STACK_SIZE; // guest contexts at least
+                                                                       // this large run in place
+
+static std::mutex                                 g_fiber_stack_mutex;
+static std::unordered_map<FiberObject*, uint64_t> g_fiber_stacks; // fiber -> allocation base
+static std::vector<uint64_t>                      g_fiber_stack_pool; // released, reusable
+
+static uint64_t FiberAcquireStackTop(FiberObject* fiber) {
+	if (fiber->size_context >= FIBER_HOST_STACK_THRESHOLD) {
+		return reinterpret_cast<uint64_t>(fiber->addr_context) + fiber->size_context;
+	}
+	std::lock_guard lock(g_fiber_stack_mutex);
+	auto            it = g_fiber_stacks.find(fiber);
+	if (it == g_fiber_stacks.end()) {
+		uint64_t base = 0;
+		if (!g_fiber_stack_pool.empty()) {
+			base = g_fiber_stack_pool.back();
+			g_fiber_stack_pool.pop_back();
+		} else {
+			base = Libs::LibKernel::Memory::AllocateRuntimeMemory(0, FIBER_HOST_STACK_SIZE + FIBER_HOST_STACK_GUARD,
+			                                        Common::VirtualMemory::Mode::ReadWrite,
+			                                        "fiber_stack");
+			EXIT_NOT_IMPLEMENTED(base == 0);
+			Libs::LibKernel::Memory::ProtectGuestMemory(base, FIBER_HOST_STACK_GUARD,
+			                                            Common::VirtualMemory::Mode::NoAccess);
+		}
+		it = g_fiber_stacks.emplace(fiber, base).first;
+	}
+	return it->second + FIBER_HOST_STACK_GUARD + FIBER_HOST_STACK_SIZE;
 }
 
-[[gnu::naked, gnu::noreturn]] static KYTY_SYSV_ABI void
-FiberRestoreContext(FiberCpuContext* /*ctx*/, uint64_t /*ret*/) {
-	asm volatile("movq %rdi, %r10\n\t"
-	             "movq %rsi, %rax\n\t"
-	             "movq 72(%r10), %r11\n\t"
-	             "movq 0(%r10), %rbx\n\t"
-	             "movq 8(%r10), %rbp\n\t"
-	             "movq 16(%r10), %rdi\n\t"
-	             "movq 24(%r10), %rsi\n\t"
-	             "movq 32(%r10), %r12\n\t"
-	             "movq 40(%r10), %r13\n\t"
-	             "movq 48(%r10), %r14\n\t"
-	             "movq 56(%r10), %r15\n\t"
-	             "movq 64(%r10), %rsp\n\t"
-	             "jmp *%r11\n");
+static void FiberReleaseStack(FiberObject* fiber) {
+	std::lock_guard lock(g_fiber_stack_mutex);
+	auto            it = g_fiber_stacks.find(fiber);
+	if (it != g_fiber_stacks.end()) {
+		g_fiber_stack_pool.push_back(it->second);
+		g_fiber_stacks.erase(it);
+	}
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+// Saves the callee-saved state into *save, loads *restore, publishes `release_value` to
+// *release_state (if non-null) once this context is no longer in use, and continues in the
+// restored context with `ret` as this function's return value there. The state is published
+// after the last access to the outgoing stack, so a suspended fiber becomes claimable only when
+// it is safe to resume it from any thread. MXCSR and the x87 control word travel with the fiber
+// (offsets 16 and 24 reuse the former rdi/rsi slots).
+[[gnu::naked]] static KYTY_SYSV_ABI uint64_t
+FiberSwapContext(FiberCpuContext* /*save*/, const FiberCpuContext* /*restore*/,
+                 uint32_t* /*release_state*/, uint32_t /*release_value*/, uint64_t /*ret*/) {
+	asm volatile("movq %rbx, 0(%rdi)\n\t"
+	             "movq %rbp, 8(%rdi)\n\t"
+	             "stmxcsr 16(%rdi)\n\t"
+	             "fnstcw 24(%rdi)\n\t"
+	             "movq %r12, 32(%rdi)\n\t"
+	             "movq %r13, 40(%rdi)\n\t"
+	             "movq %r14, 48(%rdi)\n\t"
+	             "movq %r15, 56(%rdi)\n\t"
+	             "leaq 8(%rsp), %rax\n\t"
+	             "movq %rax, 64(%rdi)\n\t"
+	             "movq (%rsp), %rax\n\t"
+	             "movq %rax, 72(%rdi)\n\t"
+	             "movq 72(%rsi), %r11\n\t"
+	             "movq 64(%rsi), %r10\n\t"
+	             "movq 0(%rsi), %rbx\n\t"
+	             "movq 8(%rsi), %rbp\n\t"
+	             "ldmxcsr 16(%rsi)\n\t"
+	             "fldcw 24(%rsi)\n\t"
+	             "movq 32(%rsi), %r12\n\t"
+	             "movq 40(%rsi), %r13\n\t"
+	             "movq 48(%rsi), %r14\n\t"
+	             "movq 56(%rsi), %r15\n\t"
+	             "movq %r8, %rax\n\t"
+	             "testq %rdx, %rdx\n\t"
+	             "jz 1f\n\t"
+	             "movl %ecx, (%rdx)\n\t"
+	             "1:\n\t"
+	             "movq %r10, %rsp\n\t"
+	             "jmp *%r11\n\t");
 }
 #else
-static int FiberSaveContext(FiberCpuContext* ctx) {
-	(void)ctx;
-	return 0;
-}
-
-static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
-	(void)ctx;
-	(void)ret;
+static KYTY_SYSV_ABI uint64_t FiberSwapContext(FiberCpuContext*, const FiberCpuContext*,
+                                                uint32_t*, uint32_t, uint64_t) {
 	EXIT("Fiber context switching is only implemented on x86_64\n");
 }
 #endif
 
 [[noreturn]] static void FiberStartTrampoline();
 
-[[noreturn]] static void FiberStartOnGuestStack(FiberObject* fiber) {
-	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
-	                            static_cast<uintptr_t>(fiber->size_context);
-	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
+// Builds the initial context of a fiber that has never run: fresh stack, default FPU control
+// state, entry through the trampoline with a properly aligned frame.
+static void FiberPrepareStartContext(FiberObject* fiber, FiberCpuContext* ctx) {
+	auto rsp = FiberAcquireStackTop(fiber) & ~static_cast<uint64_t>(0x0f);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	rsp -= 4u * sizeof(uint64_t);
+	rsp -= 4u * sizeof(uint64_t); // shadow space for the trampoline
 #endif
 	rsp -= sizeof(uint64_t);
 	*reinterpret_cast<uint64_t*>(rsp) = 0;
 
-	ctx.rsp = rsp;
-	ctx.rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
-
-	g_starting_fiber = fiber;
-	FiberRestoreContext(&ctx, 1);
+	*ctx     = {};
+	ctx->rdi = 0x1f80; // MXCSR default
+	ctx->rsi = 0x037f; // x87 control word default
+	ctx->rsp = rsp;
+	ctx->rip = reinterpret_cast<uint64_t>(&FiberStartTrampoline);
 }
 
 [[noreturn]] static void FiberStartTrampoline() {
-	auto* fiber      = g_starting_fiber;
-	g_starting_fiber = nullptr;
+	auto& tls   = FiberTls();
+	auto* fiber = tls.starting;
+	tls.starting = nullptr;
 	if (fiber == nullptr) {
-		EXIT("Fiber start without current fiber\n");
+		EXIT("Fiber start without a fiber\n");
 	}
-
-	FiberCommitDeferredIdle();
-	FiberSetCurrentFiber(fiber);
+	tls.current = fiber;
 
 	fiber->entry(fiber->arg_on_initialize, fiber->arg_on_run);
 
-	FiberStoreState(fiber, FIBER_STATE_TERMINATED);
+	// The entry returned: the fiber terminates and control goes back to the thread that ran it.
+	// TERMINATED is published by the switch itself, after this stack is no longer in use.
 	FiberSetContextValid(fiber, false);
-	fiber->arg_on_return  = 0;
-	g_thread_return_fiber = fiber;
-	FiberSetCurrentFiber(nullptr);
-
-	FiberRestoreContext(&g_thread_fiber_context, 1);
+	fiber->arg_on_return = 0;
+	auto& end_tls        = FiberTls();
+	end_tls.returned     = fiber;
+	end_tls.current      = nullptr;
+	FiberCpuContext scratch {};
+	FiberSwapContext(&scratch, &end_tls.thread_context, &fiber->state, FIBER_STATE_TERMINATED, 1);
+	__builtin_unreachable();
 }
 
 int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, FiberEntry entry,
@@ -2613,6 +2581,7 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 		return FIBER_ERROR_INVALID;
 	}
 
+	FiberReleaseStack(fiber);
 	std::memset(fiber, 0, sizeof(*fiber));
 	std::strncpy(fiber->name, name, FIBER_MAX_NAME_LENGTH);
 	fiber->name[FIBER_MAX_NAME_LENGTH] = '\0';
@@ -2681,9 +2650,14 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	if (!FiberIsValid(fiber)) {
 		return FIBER_ERROR_INVALID;
 	}
-	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
+	// A suspended or terminated fiber can be finalized; a running one cannot.
+	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED) &&
+	    FiberLoadState(fiber) != FIBER_STATE_TERMINATED) {
 		return FIBER_ERROR_STATE;
 	}
+	FiberReleaseStack(fiber);
+	fiber->magic_start = 0;
+	fiber->magic_end   = 0;
 
 	return OK;
 }
@@ -2694,34 +2668,41 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	if (!FiberIsValid(fiber)) {
 		return FIBER_ERROR_INVALID;
 	}
-	if (g_current_fiber != nullptr) {
+	auto& tls = FiberTls();
+	if (tls.current != nullptr) {
 		return FIBER_ERROR_PERMISSION;
 	}
-	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
+	if (!FiberAcquireRunning(fiber)) {
 		return FIBER_ERROR_STATE;
 	}
 
-	fiber->arg_on_run     = arg_on_run;
-	fiber->arg_on_return  = 0;
-	g_thread_return_fiber = nullptr;
+	fiber->arg_on_run    = arg_on_run;
+	fiber->arg_on_return = 0;
+	tls.returned         = nullptr;
 
-	if (FiberSaveContext(&g_thread_fiber_context) == 0) {
-		if (fiber->context_valid) {
-			FiberRestoreContext(&fiber->saved_context, 1);
-		}
-		FiberStartOnGuestStack(fiber);
+	FiberCpuContext        start {};
+	const FiberCpuContext* target = &fiber->saved_context;
+	if (!fiber->context_valid) {
+		FiberPrepareStartContext(fiber, &start);
+		tls.starting = fiber;
+		target       = &start;
 	}
+	FiberSwapContext(&tls.thread_context, target, nullptr, 0, 1);
 
-	FiberCommitDeferredIdle();
-	FiberSetCurrentFiber(nullptr);
-	auto* returned_fiber  = (g_thread_return_fiber != nullptr ? g_thread_return_fiber : fiber);
-	g_thread_return_fiber = nullptr;
+	// Control came back to this thread: either the fiber returned to the thread or terminated.
+	auto& after    = FiberTls();
+	auto* returned = after.returned != nullptr ? after.returned : fiber;
+	after.returned = nullptr;
+	after.current  = nullptr;
+	if (FiberLoadState(returned) == FIBER_STATE_TERMINATED) {
+		FiberReleaseStack(returned);
+	}
 
 	if (arg_on_return != nullptr) {
-		*arg_on_return = returned_fiber->arg_on_return;
+		*arg_on_return = returned->arg_on_return;
 	}
 
-	return (FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK);
+	return OK;
 }
 
 int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
@@ -2731,38 +2712,31 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	if (!FiberIsValid(fiber)) {
 		return FIBER_ERROR_INVALID;
 	}
-	if (g_current_fiber == nullptr) {
+	auto& tls    = FiberTls();
+	auto* caller = tls.current;
+	if (caller == nullptr) {
 		return FIBER_ERROR_PERMISSION;
 	}
-
-	for (;;) {
-		uint32_t observed_state = 0;
-		if (FiberWaitAndEnterRunning(fiber, &observed_state)) {
-			break;
-		}
-		if (FiberRepairStaleRunningOnThisThread(fiber, observed_state)) {
-			continue;
-		}
+	if (fiber == caller || !FiberAcquireRunning(fiber)) {
 		return FIBER_ERROR_STATE;
 	}
 
-	auto* caller = g_current_fiber;
-
 	fiber->arg_on_run    = arg_on_run;
 	fiber->arg_on_return = 0;
+	FiberSetContextValid(caller, true);
 
-	if (FiberSaveContext(&caller->saved_context) == 0) {
-		FiberSetContextValid(caller, true);
-		FiberDeferIdle(caller);
-		if (fiber->context_valid) {
-			FiberRestoreContext(&fiber->saved_context, 1);
-		}
-		FiberStartOnGuestStack(fiber);
+	FiberCpuContext        start {};
+	const FiberCpuContext* target = &fiber->saved_context;
+	if (!fiber->context_valid) {
+		FiberPrepareStartContext(fiber, &start);
+		tls.starting = fiber;
+		target       = &start;
 	}
+	// The caller becomes IDLE only once the switch has left its stack.
+	FiberSwapContext(&caller->saved_context, target, &caller->state, FIBER_STATE_IDLE, 1);
 
-	FiberCommitDeferredIdle();
-	FiberSetCurrentFiber(caller);
-	FiberStoreState(caller, FIBER_STATE_RUNNING);
+	// Resumed, possibly on another host thread. Whoever resumed us already set RUNNING.
+	FiberTls().current = caller;
 
 	if (arg_on_return != nullptr) {
 		*arg_on_return = caller->arg_on_run;
@@ -2777,8 +2751,11 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	if (fiber == nullptr) {
 		return FIBER_ERROR_NULL;
 	}
-
-	*fiber = g_current_fiber;
+	auto* current = FiberTls().current;
+	if (current == nullptr) {
+		return FIBER_ERROR_PERMISSION;
+	}
+	*fiber = current;
 
 	return OK;
 }
@@ -2786,23 +2763,22 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_on_run) {
 	PRINT_NAME();
 
-	if (g_current_fiber == nullptr) {
+	auto& tls   = FiberTls();
+	auto* fiber = tls.current;
+	if (fiber == nullptr) {
 		return FIBER_ERROR_PERMISSION;
 	}
 
-	auto* fiber          = g_current_fiber;
 	fiber->arg_on_return = arg_on_return;
+	FiberSetContextValid(fiber, true);
+	tls.returned = fiber;
+	tls.current  = nullptr;
+	// Back to this thread's FiberRun frame; IDLE is published once this stack is left.
+	FiberSwapContext(&fiber->saved_context, &tls.thread_context, &fiber->state, FIBER_STATE_IDLE,
+	                 1);
 
-	if (FiberSaveContext(&fiber->saved_context) == 0) {
-		FiberSetContextValid(fiber, true);
-		g_thread_return_fiber = fiber;
-		FiberDeferIdle(fiber);
-		FiberRestoreContext(&g_thread_fiber_context, 1);
-	}
-
-	FiberCommitDeferredIdle();
-	FiberSetCurrentFiber(fiber);
-	FiberStoreState(fiber, FIBER_STATE_RUNNING);
+	// Resumed, possibly on another host thread.
+	FiberTls().current = fiber;
 	if (arg_on_run != nullptr) {
 		*arg_on_run = fiber->arg_on_run;
 	}
