@@ -1579,7 +1579,7 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 
 uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
 	PRINT_NAME();
-	LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
+	LOGF_SAMPLED(64, 4096, "\t operation = 0x%08" PRIx32 "\n", operation);
 
 	const auto size_dw = context_state_op_size_dw(operation);
 	if (buf == nullptr || size_dw == 0) {
@@ -3734,9 +3734,10 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetCommandAddress(uint32_t*                cmd
                                                     const volatile uint32_t* command) {
 	PRINT_NAME();
 
-	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
-	     "\t command = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(command));
+	LOGF_SAMPLED(64, 4096,
+	             "\t cmd     = 0x%016" PRIx64 "\n"
+	             "\t command = 0x%016" PRIx64 "\n",
+	             reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(command));
 
 	if (cmd == nullptr || command == nullptr) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
@@ -3878,9 +3879,10 @@ static uint32_t* get_agc_wait_packet(uint32_t* cmd) {
 int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address) {
 	PRINT_NAME();
 
-	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
-	     "\t address = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
+	LOGF_SAMPLED(64, 4096,
+	             "\t cmd     = 0x%016" PRIx64 "\n"
+	             "\t address = 0x%016" PRIx64 "\n",
+	             reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
@@ -3902,9 +3904,10 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* 
 int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference) {
 	PRINT_NAME();
 
-	LOGF("\t cmd       = 0x%016" PRIx64 "\n"
-	     "\t reference = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), reference);
+	LOGF_SAMPLED(64, 4096,
+	             "\t cmd       = 0x%016" PRIx64 "\n"
+	             "\t reference = 0x%016" PRIx64 "\n",
+	             reinterpret_cast<uint64_t>(cmd), reference);
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
@@ -3923,9 +3926,10 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 
 	// Not sure
 
-	LOGF("\t cmd     = 0x%016" PRIx64 "\n"
-	     "\t address = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
+	LOGF_SAMPLED(64, 4096,
+	             "\t cmd     = 0x%016" PRIx64 "\n"
+	             "\t address = 0x%016" PRIx64 "\n",
+	             reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(address));
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 

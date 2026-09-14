@@ -3,6 +3,8 @@
 
 #include "common/common.h"
 
+#include <atomic>
+#include <cstdint>
 #include <fmt/color.h>
 #include <fmt/printf.h>
 #include <string_view>
@@ -61,6 +63,35 @@ inline constexpr auto BrightWhite   = fmt::fg(fmt::terminal_color::bright_white)
 		if (!::Log::IsSilent()) {                                                                  \
 			::Log::Write((style), ::fmt::sprintf(__VA_ARGS__));                                    \
 		}                                                                                          \
+	} while (false)
+
+// Per-call-site sampled logging: writes the first `first` occurrences and then every
+// `every`-th one. Statements on per-packet or per-end-of-pipe paths run thousands of times
+// per frame; writing every one of them costs more than the work being logged as soon as the
+// log goes to a file, while a sample still shows that the path is being taken.
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define LOGF_SAMPLED(first, every, ...)                                                            \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                   \
+			static ::std::atomic<uint64_t> log_sample_count {0};                                    \
+			const auto log_sample_index =                                                           \
+			    log_sample_count.fetch_add(1, ::std::memory_order_relaxed);                         \
+			if (log_sample_index < (first) || log_sample_index % (every) == 0) {                     \
+				::Log::Write(::fmt::sprintf(__VA_ARGS__));                                          \
+			}                                                                                       \
+		}                                                                                           \
+	} while (false)
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define LOGF_COLOR_SAMPLED(style, first, every, ...)                                               \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                   \
+			static ::std::atomic<uint64_t> log_sample_count {0};                                    \
+			const auto log_sample_index =                                                           \
+			    log_sample_count.fetch_add(1, ::std::memory_order_relaxed);                         \
+			if (log_sample_index < (first) || log_sample_index % (every) == 0) {                     \
+				::Log::Write((style), ::fmt::sprintf(__VA_ARGS__));                                 \
+			}                                                                                       \
+		}                                                                                           \
 	} while (false)
 
 #endif /* KYTY_COMMON_LOGGING_LOG_H_ */
