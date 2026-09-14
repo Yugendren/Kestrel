@@ -64,6 +64,13 @@ struct RenderDepthInfo {
 	ImageId                     image_id;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
+	// Guest-visible attachment size, as the game programmed it.
+	[[nodiscard]] vk::Extent2D GuestExtent() const {
+		return {desc.info.extent.width, desc.info.extent.height};
+	}
+	// Host attachment size: the guest size times the internal render scale.
+	[[nodiscard]] vk::Extent2D Extent() const { return desc.info.HostExtent2D(); }
+	[[nodiscard]] bool         IsScaled() const { return desc.info.IsScaled(); }
 };
 
 inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,

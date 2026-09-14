@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <memory>
+#include <vector>
 #include <cstdint>
 #include <xxhash.h>
 
@@ -219,6 +221,13 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
+	if (IsScaled()) {
+		// The guest-memory layout describes native-resolution texels; stage and upscale.
+		auto& alias = GuestAlias();
+		alias.Upload(copies, buffer, offset, size);
+		BlitScaled(alias);
+		return;
+	}
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
@@ -259,6 +268,13 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
                      uint64_t offset, uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	if (IsScaled()) {
+		// Guest memory must receive native-resolution texels.
+		auto& alias = GuestAlias();
+		alias.BlitScaled(*this);
+		alias.Download(copies, buffer, offset, size);
+		return;
+	}
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
@@ -318,6 +334,12 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	if (IsScaled() != source.IsScaled() && backing.samples == 1 &&
+	    source.backing.extent != backing.extent) {
+		// One side is resolution-scaled: resample instead of a same-size copy.
+		BlitScaled(source);
+		return;
+	}
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	const uint32_t base_depth = backing.image_type == vk::ImageType::e3D
@@ -377,6 +399,14 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	        destination_range.base_level >= backing.mip_levels ||
 	        source_range.base_layer >= source.backing.layers ||
 	        destination_range.base_layer >= backing.layers);
+	if (IsScaled() != source.IsScaled()) {
+		// Multisample images are never scaled, so a scaled resolve target must be resolved at
+		// its native footprint first and then upscaled over exactly the resolved subresource.
+		auto& native = GuestAlias();
+		native.Resolve(source, source_range, destination_range);
+		BlitScaled(native, destination_range, destination_range);
+		return;
+	}
 	const auto layers       = std::min({source_range.layer_count, destination_range.layer_count,
 	                                    source.backing.layers - source_range.base_layer,
 	                                    backing.layers - destination_range.base_layer});
@@ -388,15 +418,18 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const auto destination_height =
 	    std::max(backing.extent.height >> destination_range.base_level, 1u);
 	const bool copy = source.backing.samples == 1;
-	EXIT_IF(layers == 0 || info.extent.width > source_width || info.extent.height > source_height ||
-	        info.extent.width > destination_width || info.extent.height > destination_height ||
+	EXIT_IF(layers == 0 || info.HostExtent().width > source_width ||
+	        info.HostExtent().height > source_height ||
+	        info.HostExtent().width > destination_width ||
+	        info.HostExtent().height > destination_height ||
 	        (copy ? !ImageViewOps::FormatsCompatible(source.backing.format, backing.format)
 	              : source.backing.format != backing.format));
 	auto resolved_source_range             = source_range;
 	auto resolved_destination_range        = destination_range;
 	resolved_source_range.layer_count      = layers;
 	resolved_destination_range.layer_count = layers;
-	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
+	const auto         host_extent = info.HostExtent();
+	const vk::Extent3D resolve_extent {host_extent.width, host_extent.height, 1};
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
@@ -436,6 +469,20 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
+	if (IsScaled() != source.IsScaled()) {
+		// This is a byte-for-byte reinterpretation through a scratch buffer, so both sides must
+		// have the same footprint. Stage the scaled side at its native resolution.
+		if (source.IsScaled()) {
+			auto& native = source.GuestAlias();
+			native.BlitScaled(source);
+			CopyImageWithBuffer(native, buffer);
+			return;
+		}
+		auto& native = GuestAlias();
+		native.CopyImageWithBuffer(source, buffer);
+		BlitScaled(native);
+		return;
+	}
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
 	const auto     source_aspect =
@@ -532,10 +579,18 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
-	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
 	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 	const auto aspects                             = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
+	if (IsScaled() != source.IsScaled() && backing.image_type == vk::ImageType::e2D &&
+	    source.backing.image_type == vk::ImageType::e2D) {
+		// Scaled images are single-level, so only one side can carry a mip chain here.
+		EXIT_IF(source.backing.mip_levels != 1 && backing.mip_levels != 1);
+		BlitScaled(source, ImageSubresourceRange {0, 1, 0, source_layers},
+		           ImageSubresourceRange {mip, 1, layer, destination_layers});
+		return;
+	}
+	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
 	std::array<vk::ImageCopy, 2> copies {};
 	uint32_t                     copy_count = 0;
 	for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
@@ -664,7 +719,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	vk::ImageCreateInfo create {};
 	create.flags         = ImageCreateFlags(graphics, info);
 	create.imageType     = HostImageType(info.type);
-	create.extent        = info.extent;
+	create.extent        = info.HostExtent();
 	create.mipLevels     = info.resources.levels;
 	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
 	create.format        = info.pixel_format;
@@ -697,6 +752,86 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
 	    info.samples);
 }
+
+Image& Image::GuestAlias() {
+	if (!m_guest_alias) {
+		ImageInfo alias        = info;
+		alias.scaled           = false;
+		alias.data             = {};
+		alias.stencil          = {};
+		alias.metadata         = {};
+		alias.htile_clear_mask = UINT32_MAX;
+		m_guest_alias          = std::make_unique<Image>(m_graphics, m_scheduler, alias);
+	}
+	return *m_guest_alias;
+}
+
+void Image::BlitScaled(Image& source, const ImageSubresourceRange& source_range,
+                       const ImageSubresourceRange& destination_range) {
+	EXIT_IF(backing.image == nullptr || source.backing.image == nullptr);
+	EXIT_IF(backing.samples != 1 || source.backing.samples != 1);
+	EXIT_IF(source_range.level_count == 0 ||
+	        source_range.level_count != destination_range.level_count ||
+	        source_range.layer_count == 0 ||
+	        source_range.layer_count != destination_range.layer_count);
+	EXIT_IF(source_range.base_level + source_range.level_count > source.backing.mip_levels ||
+	        destination_range.base_level + destination_range.level_count > backing.mip_levels ||
+	        source_range.base_layer + source_range.layer_count > source.backing.layers ||
+	        destination_range.base_layer + destination_range.layer_count > backing.layers);
+	const auto aspects = FullAspectMask(backing.format);
+	EXIT_IF(aspects != FullAspectMask(source.backing.format));
+	m_scheduler.EndRendering();
+
+	// Depth/stencil blits are nearest-only; colour is filtered so downscales average.
+	const bool depth = DepthAspectTransferFormat(backing.format) != vk::Format::eUndefined;
+	const auto mip_offset = [](const VulkanImage& image, uint32_t level) {
+		return vk::Offset3D {static_cast<int32_t>(std::max(image.extent.width >> level, 1u)),
+		                     static_cast<int32_t>(std::max(image.extent.height >> level, 1u)),
+		                     static_cast<int32_t>(std::max(image.extent.depth >> level, 1u))};
+	};
+
+	std::vector<vk::ImageBlit> regions;
+	regions.reserve(static_cast<size_t>(source_range.level_count) * 2);
+	for (uint32_t level = 0; level < source_range.level_count; level++) {
+		for (const auto aspect: {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
+		                         vk::ImageAspectFlagBits::eStencil}) {
+			if (!static_cast<bool>(aspects & aspect)) {
+				continue;
+			}
+			vk::ImageBlit region {};
+			region.srcSubresource = {aspect, source_range.base_level + level,
+			                         source_range.base_layer, source_range.layer_count};
+			region.dstSubresource = {aspect, destination_range.base_level + level,
+			                         destination_range.base_layer, destination_range.layer_count};
+			region.srcOffsets[1] = mip_offset(source.backing, source_range.base_level + level);
+			region.dstOffsets[1] = mip_offset(backing, destination_range.base_level + level);
+			regions.push_back(region);
+		}
+	}
+	if (regions.empty()) {
+		return;
+	}
+
+	auto command = m_scheduler.Current().Handle();
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	               source_range, command);
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	        destination_range, command);
+	command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal,
+	                  static_cast<uint32_t>(regions.size()), regions.data(),
+	                  depth ? vk::Filter::eNearest : vk::Filter::eLinear);
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
+	        destination_range, command);
+}
+
+void Image::BlitScaled(Image& source) {
+	const ImageSubresourceRange range {0, std::min(source.backing.mip_levels, backing.mip_levels),
+	                                   0, std::min(source.backing.layers, backing.layers)};
+	BlitScaled(source, range, range);
+}
+
 
 uint64_t Image::HashGuestEdges() const {
 	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};

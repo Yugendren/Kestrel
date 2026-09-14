@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
+#include "graphics/host_gpu/renderer/renderScale.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -315,8 +317,11 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	KYTY_PROFILER_FUNCTION();
 
 	const auto& ctx = buffer.GetRegisters();
-	const auto&        vp  = ctx.GetScreenViewport();
-	const vk::Extent2D framebuffer_extent {rendering.width, rendering.height};
+	const auto& vp = ctx.GetScreenViewport();
+	// Guest-space framebuffer size: guest scissor rectangles are clamped against it, and the
+	// result is converted to host space afterwards.
+	const vk::Extent2D framebuffer_extent {rendering.guest_width, rendering.guest_height};
+	const bool         scaled_targets = rendering.scaled;
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -338,6 +343,14 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			viewport.y      = guest.yoffset - guest.yscale;
 			viewport.width  = guest.xscale * 2.0f;
 			viewport.height = guest.yscale * 2.0f;
+			if (scaled_targets) {
+				// The attachments are allocated at the scaled resolution, so the guest
+				// window transform has to be stretched to match. Depth range is unchanged.
+				viewport.x      = RenderScale::ApplyF(viewport.x);
+				viewport.y      = RenderScale::ApplyF(viewport.y);
+				viewport.width  = RenderScale::ApplyF(viewport.width);
+				viewport.height = RenderScale::ApplyF(viewport.height);
+			}
 		}
 		viewport.minDepth =
 		    guest.zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : guest.zscale);
@@ -345,10 +358,28 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 
 		const auto final_scissor =
 		    calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
-		auto& scissor  = scissors[i];
-		scissor.offset = {final_scissor.left, final_scissor.top};
-		scissor.extent = {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
-		                  static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)};
+		auto& scissor = scissors[i];
+		auto  left    = final_scissor.left;
+		auto  top     = final_scissor.top;
+		auto  right   = final_scissor.right;
+		auto  bottom  = final_scissor.bottom;
+		if (scaled_targets) {
+			// Round the guest rectangle outward so a full-target scissor still covers the
+			// whole scaled attachment, then clamp to it.
+			const auto factor = static_cast<double>(RenderScale::Factor());
+			const auto host   = RenderScale::Apply(framebuffer_extent);
+			left   = static_cast<int>(std::floor(left * factor));
+			top    = static_cast<int>(std::floor(top * factor));
+			right  = std::min(static_cast<int>(std::ceil(right * factor)),
+			                  static_cast<int>(host.width));
+			bottom = std::min(static_cast<int>(std::ceil(bottom * factor)),
+			                  static_cast<int>(host.height));
+			left   = std::min(left, right);
+			top    = std::min(top, bottom);
+		}
+		scissor.offset = {left, top};
+		scissor.extent = {static_cast<uint32_t>(right - left),
+		                  static_cast<uint32_t>(bottom - top)};
 		if (viewport.width == 0.0f) {
 			// Keep empty slots at their guest index; Vulkan requires a positive viewport width.
 			viewport.width = 1.0f;
@@ -481,6 +512,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
 	state.height                = std::numeric_limits<uint32_t>::max();
+	state.guest_width           = std::numeric_limits<uint32_t>::max();
+	state.guest_height          = std::numeric_limits<uint32_t>::max();
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
 	state.num_color_attachments = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
@@ -505,8 +538,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                                     view.layer_count},
 		              buffer.Handle());
 		const auto extent       = target.Extent();
+		const auto guest_extent = target.GuestExtent();
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
+		state.guest_width       = std::min(state.guest_width, guest_extent.width);
+		state.guest_height      = std::min(state.guest_height, guest_extent.height);
+		if (i == 0) {
+			state.scaled = target.IsScaled();
+		}
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
 		auto& attachment            = state.color_attachments[target.target_slot];
@@ -524,14 +563,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	// and leaves the rest of it stale. Astro Bot does exactly that -- two colour slots covering
 	// one 1024x1024 surface with complementary channel masks, over a full-size depth buffer.
 	if (depth.image_id && color_count > 0 &&
-	    (depth.desc.info.extent.width != state.width ||
-	     depth.desc.info.extent.height != state.height)) {
+	    (depth.Extent().width != state.width || depth.Extent().height != state.height)) {
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
 			LOGF("RenderState: depth target %ux%u does not match colour %ux%u -- unbinding it "
 			     "for the draw\n",
-			     depth.desc.info.extent.width, depth.desc.info.extent.height, state.width,
-			     state.height);
+			     depth.Extent().width, depth.Extent().height, state.width, state.height);
 		}
 		depth.image_id = {};
 	}
@@ -604,8 +641,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width               = std::min(state.width, depth.desc.info.extent.width);
-		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		state.width               = std::min(state.width, depth.Extent().width);
+		state.height              = std::min(state.height, depth.Extent().height);
+		state.guest_width         = std::min(state.guest_width, depth.GuestExtent().width);
+		state.guest_height        = std::min(state.guest_height, depth.GuestExtent().height);
+		if (color_count == 0) {
+			state.scaled = depth.IsScaled();
+		}
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
@@ -622,6 +664,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		state.width        = limits.maxFramebufferWidth;
 		state.height       = limits.maxFramebufferHeight;
+		state.guest_width  = state.width;
+		state.guest_height = state.height;
 	}
 	if (state.num_layers == std::numeric_limits<uint32_t>::max()) {
 		state.num_layers = 1;

@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/renderScale.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -71,7 +72,22 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
+	// Internal render-resolution scaling: the host allocation is Factor()-times the guest
+	// extent. Guest-visible geometry (extent, pitch, data, mip_layout) always stays native.
+	bool                         scaled          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
+
+	[[nodiscard]] bool IsScaled() const noexcept { return scaled && RenderScale::Enabled(); }
+	// Host allocation extent. Array/volume depth is never scaled.
+	[[nodiscard]] vk::Extent3D HostExtent() const noexcept {
+		return IsScaled() ? RenderScale::Apply(extent) : extent;
+	}
+	// Host extent of one mip level as a 2D attachment size.
+	[[nodiscard]] vk::Extent2D HostExtent2D(uint32_t level = 0) const noexcept {
+		const vk::Extent2D guest {std::max(extent.width >> level, 1u),
+		                          std::max(extent.height >> level, 1u)};
+		return IsScaled() ? RenderScale::Apply(guest) : guest;
+	}
 
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
