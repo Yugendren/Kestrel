@@ -322,6 +322,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	// result is converted to host space afterwards.
 	const vk::Extent2D framebuffer_extent {rendering.guest_width, rendering.guest_height};
 	const bool         scaled_targets = rendering.scaled;
+	const RenderScale::Mapping mapping {scaled_targets};
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -335,22 +336,28 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		const auto& guest    = vp.viewports[i];
 		auto&       viewport = viewports[i];
 		if (ctx.GetClipControl().clip_disable) {
+			// The guest emits window coordinates and the vertex shader normalises them against
+			// a fixed half-extent (see PipelineCache clip_space). Window position therefore
+			// comes out as viewport_size / (2 * half_extent) times the guest coordinate, so
+			// stretching this viewport by the render scale is what moves those draws onto a
+			// scaled attachment.
 			const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
-			viewport.width  = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
-			viewport.height = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
+			const auto  base_x = static_cast<float>(std::min(limits.maxViewportDimensions[0], 16384u));
+			const auto  base_y = static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u));
+			viewport.width     = base_x;
+			viewport.height    = base_y;
+			mapping.Viewport(viewport);
+			// Supersampling beyond the device viewport limit cannot preserve the identity.
+			viewport.width =
+			    std::min(viewport.width, static_cast<float>(limits.maxViewportDimensions[0]));
+			viewport.height =
+			    std::min(viewport.height, static_cast<float>(limits.maxViewportDimensions[1]));
 		} else {
 			viewport.x      = guest.xoffset - guest.xscale;
 			viewport.y      = guest.yoffset - guest.yscale;
 			viewport.width  = guest.xscale * 2.0f;
 			viewport.height = guest.yscale * 2.0f;
-			if (scaled_targets) {
-				// The attachments are allocated at the scaled resolution, so the guest
-				// window transform has to be stretched to match. Depth range is unchanged.
-				viewport.x      = RenderScale::ApplyF(viewport.x);
-				viewport.y      = RenderScale::ApplyF(viewport.y);
-				viewport.width  = RenderScale::ApplyF(viewport.width);
-				viewport.height = RenderScale::ApplyF(viewport.height);
-			}
+			mapping.Viewport(viewport);
 		}
 		viewport.minDepth =
 		    guest.zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : guest.zscale);
@@ -358,32 +365,12 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 
 		const auto final_scissor =
 		    calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
-		auto& scissor = scissors[i];
-		auto  left    = final_scissor.left;
-		auto  top     = final_scissor.top;
-		auto  right   = final_scissor.right;
-		auto  bottom  = final_scissor.bottom;
-		if (scaled_targets) {
-			// Round the guest rectangle outward so a full-target scissor still covers the
-			// whole scaled attachment, then clamp to it.
-			const auto factor = static_cast<double>(RenderScale::Factor());
-			const auto host   = RenderScale::Apply(framebuffer_extent);
-			left   = static_cast<int>(std::floor(left * factor));
-			top    = static_cast<int>(std::floor(top * factor));
-			right  = std::min(static_cast<int>(std::ceil(right * factor)),
-			                  static_cast<int>(host.width));
-			bottom = std::min(static_cast<int>(std::ceil(bottom * factor)),
-			                  static_cast<int>(host.height));
-			left   = std::min(left, right);
-			top    = std::min(top, bottom);
-		}
-		scissor.offset = {left, top};
-		scissor.extent = {static_cast<uint32_t>(right - left),
-		                  static_cast<uint32_t>(bottom - top)};
+		scissors[i] = mapping.Rect(final_scissor.left, final_scissor.top, final_scissor.right,
+		                           final_scissor.bottom, framebuffer_extent);
 		if (viewport.width == 0.0f) {
 			// Keep empty slots at their guest index; Vulkan requires a positive viewport width.
-			viewport.width = 1.0f;
-			scissor.extent = {0, 0};
+			viewport.width      = 1.0f;
+			scissors[i].extent  = {0, 0};
 		}
 	}
 	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
@@ -965,6 +952,39 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
+// A Vulkan render pass has a single render area, so every attachment of a pass must share one
+// scale. Discovery can produce a mixed group when one attachment range has been denied scaling,
+// for example because a compute shader writes it as a storage image. Converge the whole pass
+// onto the native resolution; the denial is permanent, so later frames discover a uniform group.
+void RenderExecutor::UnifyRenderTargetScale(CommandBuffer& buffer, DrawRenderState& state) {
+	if (!RenderScale::Enabled()) {
+		return;
+	}
+	bool any_scaled = false;
+	bool any_native = false;
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		(state.color_info[i].IsScaled() ? any_scaled : any_native) = true;
+	}
+	if (state.depth_info.image_id) {
+		(state.depth_info.IsScaled() ? any_scaled : any_native) = true;
+	}
+	if (!any_scaled || !any_native) {
+		return;
+	}
+	auto& cache = buffer.GetContext().GetTextureCache();
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		auto& target = state.color_info[i];
+		if (target.image_id) {
+			target.image_id         = cache.DenyImageScale(target.image_id);
+			target.desc.info.scaled = false;
+		}
+	}
+	if (state.depth_info.image_id) {
+		state.depth_info.image_id         = cache.DenyImageScale(state.depth_info.image_id);
+		state.depth_info.desc.info.scaled = false;
+	}
+}
+
 // Soft ladder (PPSA21564 only). A companion to the oversized-shader drop in the pipeline
 // cache: when Astro Bot's oversized GI pixel / mesh kernel is handed back as a null module,
 // its draw has no usable program. Skip that draw for this title so the frame still presents
@@ -1047,6 +1067,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	UnifyRenderTargetScale(buffer, state);
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
