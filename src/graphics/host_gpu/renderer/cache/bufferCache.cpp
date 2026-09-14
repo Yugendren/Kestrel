@@ -250,6 +250,60 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool from_faul
 	}
 }
 
+BufferCache::ReadbackWindow BufferCache::ReadbackWindowFor(const Buffer& buffer, uint64_t vaddr,
+                                                           uint64_t size) const {
+	// Widen nearby CPU reads so they share one GPU drain.
+	const auto buffer_begin = buffer.CpuAddress();
+	const auto buffer_end   = buffer_begin + buffer.Size();
+	const auto begin = std::max(Common::AlignDown(vaddr, READBACK_WINDOW_SIZE), buffer_begin);
+	const auto end = std::min(std::max(begin + READBACK_WINDOW_SIZE, vaddr + size), buffer_end);
+	return {begin, end};
+}
+
+void BufferCache::RememberReadbackWindow(ReadbackWindow window) {
+	if (window.Size() == 0 || m_readback_windows.Contains(window.begin, window.Size())) {
+		return;
+	}
+	// The set only exists to amortise future drains, so dropping it when it outgrows the budget
+	// costs at most one extra drain per hot window while it is rebuilt.
+	if (m_readback_window_bytes >= READBACK_WINDOW_BUDGET) {
+		m_readback_windows.Clear();
+		m_readback_window_bytes = 0;
+	}
+	m_readback_windows.Add(window.begin, window.Size());
+	m_readback_window_bytes += window.Size();
+}
+
+void BufferCache::DownloadReadbackWindows(ReadbackWindow              current,
+                                          std::vector<ReadbackWindow>& downloaded) {
+	std::vector<ReadbackWindow> candidates;
+	m_readback_windows.ForEach([&candidates, current](uint64_t begin, uint64_t end) {
+		if (begin >= current.end || end <= current.begin) {
+			candidates.push_back({begin, end});
+		}
+	});
+	for (const auto& candidate: candidates) {
+		if (!m_gpu_modified_ranges.Intersects(candidate.begin, candidate.Size())) {
+			continue;
+		}
+		const auto* owner = m_page_table.Find(candidate.begin >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || IsBufferInvalid(*owner)) {
+			// The window outlived its buffer; forget it rather than keep probing.
+			m_readback_windows.Subtract(candidate.begin, candidate.Size());
+			continue;
+		}
+		auto&      buffer = m_slot_buffers[*owner];
+		const auto begin  = std::max(candidate.begin, buffer.CpuAddress());
+		const auto end = std::min(candidate.end, buffer.CpuAddress() + buffer.Size());
+		if (begin >= end) {
+			continue;
+		}
+		if (DownloadBufferMemory(buffer, begin, end - begin)) {
+			downloaded.push_back({begin, end});
+		}
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -260,14 +314,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-
-		// Widen nearby CPU reads so they share one GPU drain.
-		constexpr uint64_t WindowSize   = 512 * 1024;
-		const auto         buffer_begin = buffer.CpuAddress();
-		const auto         buffer_end   = buffer_begin + buffer.Size();
-		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+		auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		const auto window = ReadbackWindowFor(buffer, vaddr, size);
 
 		{
 			static std::atomic<uint32_t> readback_logs {0};
@@ -275,16 +323,28 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (n < 96 || (n % 512) == 0) {
 				LOGF("ReadMemory#%u: vaddr=0x%016" PRIx64 " size=0x%" PRIx64 " window=0x%016" PRIx64
 				     "..0x%016" PRIx64 " write=%d buffer=0x%016" PRIx64 "+0x%" PRIx64 "\n",
-				     n, vaddr, size, window_begin, window_end, is_write ? 1 : 0, buffer_begin,
-				     buffer.Size());
+				     n, vaddr, size, window.begin, window.end, is_write ? 1 : 0,
+				     buffer.CpuAddress(), buffer.Size());
 			}
 		}
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+
+		std::vector<ReadbackWindow> downloaded;
+		if (DownloadBufferMemory(buffer, window.begin, window.Size())) {
+			downloaded.push_back(window);
+		}
+		RememberReadbackWindow(window);
+		// One drain has to serve as much of the frame's readback traffic as possible: the copies
+		// are cheap next to the CPU/GPU serialisation the wait below imposes.
+		DownloadReadbackWindows(window, downloaded);
+
+		if (!downloaded.empty()) {
 			KYTY_PROFILER_BLOCK("BufferCache::ReadMemory::Drain");
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			for (const auto& range: downloaded) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(range.begin, range.Size());
+			}
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

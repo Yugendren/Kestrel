@@ -95,6 +95,21 @@ private:
 
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
+
+	// A guest range downloaded as one unit. Nearby reads share a window so they share a drain.
+	struct ReadbackWindow {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+
+		[[nodiscard]] uint64_t Size() const { return end - begin; }
+	};
+	static constexpr uint64_t READBACK_WINDOW_SIZE   = 512 * 1024;
+	static constexpr uint64_t READBACK_WINDOW_BUDGET = 4 * 1024 * 1024;
+
+	[[nodiscard]] ReadbackWindow ReadbackWindowFor(const Buffer& buffer, uint64_t vaddr,
+	                                              uint64_t size) const;
+	void RememberReadbackWindow(ReadbackWindow window);
+	void DownloadReadbackWindows(ReadbackWindow current, std::vector<ReadbackWindow>& downloaded);
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
@@ -123,6 +138,11 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// Windows the guest has read back at least once. Draining the GPU, not copying, is what a
+	// readback costs, so every drain also flushes these: the next read of a known-hot window
+	// then finds clean memory and needs no drain of its own.
+	RangeSet                                          m_readback_windows;
+	uint64_t                                          m_readback_window_bytes = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
