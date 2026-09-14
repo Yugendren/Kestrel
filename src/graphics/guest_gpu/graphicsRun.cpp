@@ -277,6 +277,19 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+bool CommandProcessor::DeferReleaseMemFlush() {
+	// Batching a RELEASE_MEM only pays for itself while the GPU still has queued work: the
+	// submission it saves would otherwise interrupt work in flight. Once the queue has drained
+	// there is no pipeline bubble left to avoid and holding the label or the event back only
+	// keeps a guest thread waiting, which is exactly what a loading screen does -- little GPU
+	// work, many waits.
+	const auto tick = GetScheduler().CurrentTick();
+	if (tick == 0 || GetScheduler().IsFree(tick - 1)) {
+		return false;
+	}
+	return m_release_mem_batch.Defer();
+}
+
 void CommandProcessor::FlushPendingReleaseMem() {
 	if (m_release_mem_batch.Pending()) {
 		BufferFlush();
@@ -284,6 +297,7 @@ void CommandProcessor::FlushPendingReleaseMem() {
 }
 
 void CommandProcessor::BufferFlushAndWait() {
+	m_release_mem_batch.Reset();
 	GetScheduler().FlushAndWait();
 }
 
@@ -726,10 +740,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
-		if (m_release_mem_batch.Pending() &&
-		    !ReleaseMemBatch::Eligible({packet, remaining_dw})) {
-			FlushPendingReleaseMem();
-		}
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
 		if (packet_header == 0x80000000u) {

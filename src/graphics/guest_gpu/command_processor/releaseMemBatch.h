@@ -1,26 +1,28 @@
 #pragma once
 
 #include <cstdint>
-#include <span>
 
 namespace Libs::Graphics {
 
-// Only adjacent, non-predicated, plain 32-bit CPU labels may share a submission.
+// A RELEASE_MEM packet either writes a label into guest memory or raises an end-of-pipe
+// interrupt once the work before it has finished. Both are carried by the command buffer the
+// packet was recorded into and take effect when that buffer completes, so they only need the
+// buffer to be submitted eventually, not immediately. Submitting per packet costs a queue
+// submission -- and the GPU pipeline bubble that comes with it -- for every one of the hundreds
+// of these a title emits per frame.
+//
+// Batching them delays when the guest observes a label or an event, never the other way round,
+// so the guest can still not see work reported as finished before it is. The count is bounded
+// so a guest thread polling a label or waiting on the event queue cannot be held up for long,
+// and the command processor flushes the batch whenever it waits, submits, or finishes a
+// command buffer.
 class ReleaseMemBatch {
 public:
-	static constexpr uint32_t MaxPackets = 8;
+	static constexpr uint32_t MAX_PACKETS = 32;
 
-	static bool Eligible(std::span<const uint32_t> packet) noexcept {
-		if (packet.size() < 8 || packet[0] != 0xc0061060u || packet[1] != 0x528u ||
-		    packet[2] != (1u << 29u)) {
-			return false;
-		}
-		const uint64_t address = uint64_t {packet[3]} | (uint64_t {packet[4]} << 32u);
-		return address != 0 && (address & 3u) == 0;
-	}
-
-	bool Defer(std::span<const uint32_t> current, std::span<const uint32_t> next) noexcept {
-		if (m_pending + 1 >= MaxPackets || !Eligible(current) || !Eligible(next)) {
+	// Returns true when the caller may leave its flush to a later packet.
+	bool Defer() noexcept {
+		if (m_pending + 1 >= MAX_PACKETS) {
 			return false;
 		}
 		++m_pending;
@@ -28,7 +30,7 @@ public:
 	}
 
 	[[nodiscard]] bool Pending() const noexcept { return m_pending != 0; }
-	void Reset() noexcept { m_pending = 0; }
+	void               Reset() noexcept { m_pending = 0; }
 
 private:
 	uint32_t m_pending = 0;

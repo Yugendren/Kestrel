@@ -64,10 +64,7 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void            FlushPendingReleaseMem();
-	bool DeferReleaseMemFlush(std::span<const uint32_t> current,
-	                          std::span<const uint32_t> next) {
-		return m_release_mem_batch.Defer(current, next);
-	}
+	bool            DeferReleaseMemFlush();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
