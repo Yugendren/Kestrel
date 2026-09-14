@@ -1,7 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
-#include "graphics/host_gpu/renderer/renderScale.h"
-
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -15,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/renderScale.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
@@ -238,6 +237,8 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	return true;
 }
 
+namespace {
+
 // Minimum guest edge length that may be resolution-scaled. Small targets (LUTs, reduction
 // buffers, tiny UI surfaces) gain nothing and lose disproportionate detail.
 constexpr uint32_t SCALE_MIN_EDGE = 64;
@@ -277,6 +278,8 @@ constexpr uint32_t SCALE_MIN_EDGE = 64;
 	const auto features = graphics.GetFormatProperties(info.pixel_format).optimalTilingFeatures;
 	return (features & required) == required;
 }
+
+} // namespace
 
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	if (image.info.IsDepth()) {

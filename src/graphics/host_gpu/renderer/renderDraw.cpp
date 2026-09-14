@@ -1,7 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
-#include "graphics/host_gpu/renderer/renderScale.h"
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
@@ -21,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderScale.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
