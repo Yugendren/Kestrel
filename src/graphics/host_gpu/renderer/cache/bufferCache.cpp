@@ -225,6 +225,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	// Nothing will read the guest mapping again, so drop the in-flight bookkeeping rather than
+	// wait for submissions the shutdown path has already retired.
+	for (const auto& pending: m_pending_downloads) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(pending.begin, pending.end - pending.begin);
+	}
+	m_pending_downloads.clear();
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -283,7 +289,8 @@ void BufferCache::DownloadReadbackWindows(ReadbackWindow              current,
 		}
 	});
 	for (const auto& candidate: candidates) {
-		if (!m_gpu_modified_ranges.Intersects(candidate.begin, candidate.Size())) {
+		if (!m_gpu_modified_ranges.Intersects(candidate.begin, candidate.Size()) ||
+		    HasPendingDownload(candidate.begin, candidate.Size())) {
 			continue;
 		}
 		const auto* owner = m_page_table.Find(candidate.begin >> PageTable::kPageBits);
@@ -304,6 +311,76 @@ void BufferCache::DownloadReadbackWindows(ReadbackWindow              current,
 	}
 }
 
+bool BufferCache::HasPendingDownload(uint64_t vaddr, uint64_t size) const {
+	return std::any_of(m_pending_downloads.begin(), m_pending_downloads.end(),
+	                   [vaddr, size](const PendingDownload& pending) {
+		                   return pending.begin < vaddr + size && vaddr < pending.end;
+	                   });
+}
+
+void BufferCache::RetireCompletedDownloads() {
+	if (m_pending_downloads.empty()) {
+		return;
+	}
+	const auto retired = std::remove_if(
+	    m_pending_downloads.begin(), m_pending_downloads.end(),
+	    [this](const PendingDownload& pending) {
+		    if (!m_scheduler.IsFree(pending.tick)) {
+			    return false;
+		    }
+		    // The copy landed in the staging buffer; the priority operation is what writes it
+		    // through to the guest mapping.
+		    m_scheduler.WaitPriorityOperations(pending.tick);
+		    m_memory_tracker.UnmarkRegionAsGpuModified(pending.begin, pending.end - pending.begin);
+		    return true;
+	    });
+	m_pending_downloads.erase(retired, m_pending_downloads.end());
+}
+
+void BufferCache::ResolvePendingDownloads(uint64_t vaddr, uint64_t size) {
+	uint64_t wait_tick = 0;
+	for (const auto& pending: m_pending_downloads) {
+		if (pending.begin < vaddr + size && vaddr < pending.end) {
+			wait_tick = std::max(wait_tick, pending.tick);
+		}
+	}
+	if (wait_tick != 0) {
+		// An older submission, not everything recorded since: this is the whole point of copying
+		// the range back before the guest asked for it.
+		m_scheduler.Wait(wait_tick);
+		m_scheduler.WaitPriorityOperations(wait_tick);
+	}
+	RetireCompletedDownloads();
+}
+
+void BufferCache::FinishPendingDownloads() {
+	if (m_pending_downloads.empty()) {
+		return;
+	}
+	uint64_t newest = 0;
+	for (const auto& pending: m_pending_downloads) {
+		newest = std::max(newest, pending.tick);
+	}
+	m_scheduler.Wait(newest);
+	m_scheduler.WaitPriorityOperations(newest);
+	RetireCompletedDownloads();
+}
+
+void BufferCache::RecordPendingReadbacks() {
+	if (m_recording_readbacks || m_readback_windows.Empty() ||
+	    CommandScheduler::InDeferredOperation()) {
+		return;
+	}
+	m_recording_readbacks = true;
+	std::vector<ReadbackWindow> downloaded;
+	DownloadReadbackWindows({}, downloaded);
+	const auto tick = m_scheduler.CurrentTick();
+	for (const auto& range: downloaded) {
+		m_pending_downloads.push_back({range.begin, range.end, tick});
+	}
+	m_recording_readbacks = false;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -311,6 +388,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		ResolvePendingDownloads(vaddr, size);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -674,7 +752,9 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// An in-flight download has the bytes but has not published them, so the guest mapping is
+	// still stale: report the range as dirty and let ReadMemory wait for that submission.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) || HasPendingDownload(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -682,6 +762,9 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	// The collector inspects GPU-dirty ownership buffer by buffer, so no download may still be in
+	// flight with its bytes unpublished.
+	FinishPendingDownloads();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

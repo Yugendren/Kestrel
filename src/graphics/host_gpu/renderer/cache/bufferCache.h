@@ -72,6 +72,10 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Appends the copies for guest memory the CPU reads every frame to the command buffer that is
+	// about to be submitted, so the read waits on that submission instead of draining everything
+	// recorded after it. Called by CommandScheduler just before it closes the buffer.
+	void               RecordPendingReadbacks();
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -106,10 +110,28 @@ private:
 	static constexpr uint64_t READBACK_WINDOW_SIZE   = 512 * 1024;
 	static constexpr uint64_t READBACK_WINDOW_BUDGET = 4 * 1024 * 1024;
 
+	// A download recorded before the guest asked for it. Between recording and retirement the
+	// bytes are in flight: the range has left m_gpu_modified_ranges, but the tracker still marks
+	// its pages and the guest mapping still holds the stale values, so nothing may read it until
+	// RetireCompletedDownloads() has published it. HasGpuDirtyBytes() reports such a range as
+	// dirty and DownloadReadbackWindows() leaves it alone, which keeps the cache's "tracker pages
+	// and dirty bytes agree" invariant intact for everything that is not in flight.
+	struct PendingDownload {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+
 	[[nodiscard]] ReadbackWindow ReadbackWindowFor(const Buffer& buffer, uint64_t vaddr,
 	                                              uint64_t size) const;
 	void RememberReadbackWindow(ReadbackWindow window);
 	void DownloadReadbackWindows(ReadbackWindow current, std::vector<ReadbackWindow>& downloaded);
+	[[nodiscard]] bool HasPendingDownload(uint64_t vaddr, uint64_t size) const;
+	// Waits for the submission that already carries this range, which is normally long finished,
+	// and publishes every download that has completed since.
+	void ResolvePendingDownloads(uint64_t vaddr, uint64_t size);
+	void RetireCompletedDownloads();
+	void FinishPendingDownloads();
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
@@ -143,6 +165,9 @@ private:
 	// then finds clean memory and needs no drain of its own.
 	RangeSet                                          m_readback_windows;
 	uint64_t                                          m_readback_window_bytes = 0;
+	std::vector<PendingDownload>                      m_pending_downloads;
+	// Recording a readback can wrap the download buffer, which submits; one level is enough.
+	bool                                              m_recording_readbacks = false;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
