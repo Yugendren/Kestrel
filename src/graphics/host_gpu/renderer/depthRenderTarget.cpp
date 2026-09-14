@@ -451,7 +451,13 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 		region.srcSubresource = {aspect, range.base_level, range.base_layer,
 		                         range.layer_count};
 		region.dstSubresource = region.srcSubresource;
-		region.extent = write_desc.info.extent;
+		// Both sides are depth targets and therefore share a scale; clamp defensively.
+		const auto host = write_desc.info.HostExtent();
+		region.extent   = {std::min({host.width, source.backing.extent.width,
+		                             destination.backing.extent.width}),
+		                   std::min({host.height, source.backing.extent.height,
+		                             destination.backing.extent.height}),
+		                   host.depth};
 	}
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,

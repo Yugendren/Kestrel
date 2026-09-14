@@ -20,10 +20,14 @@ struct RenderColorInfo {
 	uint32_t                        guest_array_layer = 0;
 	Prospero::ColorComponentMapping export_mapping;
 
-	[[nodiscard]] vk::Extent2D Extent() const {
+	// Guest-visible attachment size, as the game programmed it.
+	[[nodiscard]] vk::Extent2D GuestExtent() const {
 		return {std::max(desc.info.extent.width >> guest_mip_level, 1u),
 		        std::max(desc.info.extent.height >> guest_mip_level, 1u)};
 	}
+	// Host attachment size: the guest size times the internal render scale.
+	[[nodiscard]] vk::Extent2D Extent() const { return desc.info.HostExtent2D(guest_mip_level); }
+	[[nodiscard]] bool IsScaled() const { return desc.info.IsScaled(); }
 };
 
 } // namespace Libs::Graphics

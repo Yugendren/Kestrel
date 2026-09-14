@@ -9,6 +9,7 @@
 
 #include <compare>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -66,6 +67,12 @@ public:
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
+	// Resamples a compatible image across a resolution-scale difference. The subresource
+	// ranges select matching source and destination levels/layers; the whole-image overload
+	// covers every level and layer the two images have in common.
+	void BlitScaled(Image& source, const ImageSubresourceRange& source_range,
+	                const ImageSubresourceRange& destination_range);
+	void BlitScaled(Image& source);
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);
@@ -143,6 +150,7 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
+	[[nodiscard]] bool     IsScaled() const noexcept { return info.IsScaled(); }
 
 	ImageInfo        info;
 	VulkanImage      backing;
@@ -165,7 +173,11 @@ private:
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
+	// Guest-resolution companion allocation used to stage guest-memory transfers of a
+	// resolution-scaled image. Created on first use; most scaled targets never need one.
+	[[nodiscard]] Image& GuestAlias();
 
+	std::unique_ptr<Image> m_guest_alias;
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;

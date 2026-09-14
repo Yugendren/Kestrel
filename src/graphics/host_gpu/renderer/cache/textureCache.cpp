@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "graphics/host_gpu/renderer/renderScale.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -234,6 +236,46 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 		return false;
 	}
 	return true;
+}
+
+// Minimum guest edge length that may be resolution-scaled. Small targets (LUTs, reduction
+// buffers, tiny UI surfaces) gain nothing and lose disproportionate detail.
+constexpr uint32_t SCALE_MIN_EDGE = 64;
+
+// Render-target-class images may be allocated at a scaled host resolution: they are produced
+// by rasterisation and consumed through normalised sampling or same-scale blits. Sampled and
+// storage textures are addressed with absolute guest texel coordinates, so they stay native.
+[[nodiscard]] bool ShouldScaleImage(GraphicContext& graphics, const ImageInfo& info,
+                                    TextureCache::BindingType binding) {
+	if (!RenderScale::Enabled()) {
+		return false;
+	}
+	switch (binding) {
+		case TextureCache::BindingType::RenderTarget:
+		case TextureCache::BindingType::DepthTarget:
+		case TextureCache::BindingType::VideoOut: break;
+		default: return false;
+	}
+	if (info.pixel_format == vk::Format::eUndefined || info.data.Empty()) {
+		return false;
+	}
+	// MSAA resolves, mip chains, volumes and block formats have no scale-aware transfer path.
+	if (info.samples != 1 || info.resources.levels != 1 ||
+	    info.type != Prospero::ImageType::kColor2D || info.IsBlock()) {
+		return false;
+	}
+	// DCC/compressed video-out surfaces are decoded against the guest footprint.
+	if (info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	if (info.extent.width < SCALE_MIN_EDGE || info.extent.height < SCALE_MIN_EDGE) {
+		return false;
+	}
+	// Staging transfers and cross-scale copies resample with vkCmdBlitImage.
+	constexpr auto required =
+	    vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst;
+	const auto features = graphics.GetFormatProperties(info.pixel_format).optimalTilingFeatures;
+	return (features & required) == required;
 }
 
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
@@ -810,7 +852,16 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
 			recreate |= raw_d16_texture;
 			break;
-		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
+		case BindingType::Storage:
+			recreate |= cached.info.IsDepth();
+			// Compute shaders address storage images with absolute guest texel coordinates
+			// and dispatch guest-sized workgroup counts. Drop the scale for this range for
+			// good, otherwise the binding would recreate the image every frame.
+			if (cached.info.IsScaled()) {
+				m_scale_denied.insert(cached.info.data.address);
+				recreate = true;
+			}
+			break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
@@ -823,6 +874,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	RefreshImage(cached_id);
 	auto info = requested;
+	if (m_scale_denied.contains(info.data.address)) {
+		info.scaled = false;
+	}
 	if (retain_cached_layout) {
 		info.data       = cached.info.data;
 		info.resources  = cached.info.resources;
@@ -860,8 +914,17 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			EXIT("TextureCache: multisample depth conversion source is not native-current\n");
 		}
 		PrepareImageCopy(replacement);
-		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
-		CommitGpuWrite(replacement);
+		if (cached.IsScaled()) {
+			// The colour surface holds packed multisample depth bits; resampling it would
+			// destroy the bit pattern, so this reinterpretation is skipped while the image is
+			// resolution-scaled.
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: skipping MSAA depth reinterpretation of a "
+			           "resolution-scaled colour image\n");
+		} else {
+			m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
+			CommitGpuWrite(replacement);
+		}
 	} else {
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
@@ -1384,6 +1447,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		desc.info.scaled = ShouldScaleImage(m_graphics, desc.info, desc.type) &&
+		                   !m_scale_denied.contains(desc.info.data.address);
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
@@ -1463,6 +1528,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
+		// The lookup may have matched or recreated an image with a different scale decision;
+		// the caller sizes its attachments from desc.info, so report what it actually got.
+		desc.info.scaled         = image.info.scaled;
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 	}
@@ -1729,9 +1797,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
 		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
 		attachment.clearValue  = clear;
 		vk::RenderingInfo rendering {};
-		rendering.renderArea.extent = {
-		    std::max(image.info.extent.width >> range.baseMipLevel, 1u),
-		    std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
+		rendering.renderArea.extent = image.info.HostExtent2D(range.baseMipLevel);
 		rendering.layerCount           = range.layerCount;
 		rendering.colorAttachmentCount = 1;
 		rendering.pColorAttachments    = &attachment;
