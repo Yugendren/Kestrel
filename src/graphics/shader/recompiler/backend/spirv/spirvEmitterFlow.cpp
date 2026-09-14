@@ -567,16 +567,47 @@ void EmitBarrier(EmitterState& state) {
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
 	const auto index  = inst.Arg(0).U32();
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
+	// Push constants now carry only the 64-bit device address of the six-dword parameter block
+	// (PushData::MeshDrawAddressDwordCount dwords), not the dwords themselves: that is what lets
+	// the same compiled shader serve a draw whose parameters the GPU, rather than the host,
+	// produces. Load the address's two push-constant words exactly as a single dword used to be
+	// loaded here, rebuild the 64-bit address the same way the DMA path does
+	// (DeviceAddressFromWords), and fetch the requested dword through a physical storage buffer
+	// pointer -- the same OpConvertUToPtr + aligned OpLoad idiom LoadBdaDword() uses in
+	// spirvEmitterMemory.cpp, minus the guest BDA page-table lookup that idiom otherwise needs,
+	// since this address is already a real device address rather than a guest one.
+	const auto address_low_pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+	                          address_low_pointer, state.push_constant_variable,
+	                          ConstantU32(state, 0), ConstantU32(state, 0));
+	const auto address_low = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), address_low, address_low_pointer);
+
+	const auto address_high_pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+	                          address_high_pointer, state.push_constant_variable,
+	                          ConstantU32(state, 0), ConstantU32(state, 1));
+	const auto address_high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), address_high, address_high_pointer);
+
+	const auto base_address = DeviceAddressFromWords(state, address_low, address_high);
+	const auto byte_offset  = static_cast<uint64_t>(index) * sizeof(uint32_t);
+	const auto element_address =
+	    byte_offset == 0 ? base_address
+	                     : Binary(state, spv::OpIAdd, TypeScalarU64(state), base_address,
+	                              ConstantDeviceAddress(state, byte_offset));
+
 	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+	                          element_address);
+	const auto         result    = state.builder.AllocateId();
+	constexpr uint32_t alignment = sizeof(uint32_t);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer,
+	                          spv::MemoryAccessAlignedMask, alignment);
 	return result;
 }
 

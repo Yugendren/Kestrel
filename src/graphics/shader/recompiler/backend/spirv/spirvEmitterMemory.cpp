@@ -5,6 +5,24 @@
 #include <algorithm>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+// Builds a real (non-guest) 64-bit device address. Shared with the mesh push-constant path in
+// spirvEmitterFlow.cpp, which loads a shader-visible parameter block through a plain device
+// address rather than through the guest BDA page table that LoadBdaDword() below resolves.
+uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
+	return state.builder.Constant(spv::OpConstant, TypeScalarU64(state),
+	                              static_cast<uint32_t>(value),
+	                              static_cast<uint32_t>(value >> 32u));
+}
+
+uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high) {
+	const auto low64  = Unary(state, spv::OpUConvert, TypeScalarU64(state), low);
+	const auto high64 = Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state),
+	                           Unary(state, spv::OpUConvert, TypeScalarU64(state), high),
+	                           ConstantDeviceAddress(state, 32));
+	return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), low64, high64);
+}
+
 namespace {
 
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
@@ -104,20 +122,6 @@ uint32_t ScratchByteAddress(ValueEmitContext& ctx, const IR::MemoryInfo& mem, ui
 	low                      = AddU64Low(state, low, high, immediate_low, immediate_high, high);
 	const auto valid = Binary(state, spv::OpIEqual, TypeBool(state), high, ConstantU32(state, 0));
 	return Select(state, TypeU32(state), valid, low, ConstantU32(state, UINT32_MAX));
-}
-
-uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
-	return state.builder.Constant(spv::OpConstant, TypeScalarU64(state),
-	                              static_cast<uint32_t>(value),
-	                              static_cast<uint32_t>(value >> 32u));
-}
-
-uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high) {
-	const auto low64  = Unary(state, spv::OpUConvert, TypeScalarU64(state), low);
-	const auto high64 = Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state),
-	                           Unary(state, spv::OpUConvert, TypeScalarU64(state), high),
-	                           ConstantDeviceAddress(state, 32));
-	return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), low64, high64);
 }
 
 uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
