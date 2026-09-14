@@ -90,6 +90,7 @@ public:
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
 
 	Id       AudioInOpen(uint32_t type, uint32_t samples_num, uint32_t freq, Format format);
+	bool     AudioInClose(Id handle);
 	bool     AudioInValid(Id handle);
 	uint32_t AudioInInput(Id handle, void* dest);
 
@@ -592,6 +593,17 @@ Audio::Id Audio::AudioInOpen(uint32_t type, uint32_t samples_num, uint32_t freq,
 	return Id::Invalid();
 }
 
+bool Audio::AudioInClose(Id handle) {
+	Common::LockGuard lock(m_mutex);
+
+	if (handle.GetId() >= 0 && handle.GetId() < IN_PORTS_MAX && m_in_ports[handle.GetId()].used) {
+		m_in_ports[handle.GetId()] = {};
+		return true;
+	}
+
+	return false;
+}
+
 bool Audio::AudioInValid(Id handle) {
 	Common::LockGuard lock(m_mutex);
 
@@ -843,6 +855,54 @@ int KYTY_SYSV_ABI AudioInOpen(int user_id, uint32_t type, uint32_t index, uint32
 	}
 
 	return id.ToInt();
+}
+
+// sceAudioInHqOpen: the high-quality capture variant used for the DualSense microphone. It takes
+// the same arguments as sceAudioInOpen; the port delivers silence like every other input port.
+int KYTY_SYSV_ABI AudioInHqOpen(int user_id, uint32_t type, uint32_t index, uint32_t len,
+                                uint32_t freq, uint32_t param) {
+	PRINT_NAME();
+
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %u\n"
+	     "\t index   = %u\n"
+	     "\t len     = %u\n"
+	     "\t freq    = %u\n"
+	     "\t param   = %u\n",
+	     user_id, type, index, len, freq, param);
+
+	if (len == 0 || freq == 0) {
+		return AUDIO_IN_ERROR_INVALID_PARAM;
+	}
+
+	Audio::Format format = Audio::Format::Unknown;
+	switch (param & 0xffu) {
+		case 1: format = Audio::Format::Signed16bitMono; break;
+		case 2: format = Audio::Format::Signed16bitStereo; break;
+		default: return AUDIO_IN_ERROR_INVALID_PARAM;
+	}
+
+	EXIT_IF(g_audio == nullptr);
+
+	auto id = g_audio->AudioInOpen(type, len, freq, format);
+
+	if (!id.IsValid()) {
+		return AUDIO_IN_ERROR_PORT_FULL;
+	}
+
+	return id.ToInt();
+}
+
+int KYTY_SYSV_ABI AudioInClose(int handle) {
+	PRINT_NAME();
+
+	EXIT_IF(g_audio == nullptr);
+
+	if (!g_audio->AudioInClose(Audio::Id(handle))) {
+		return AUDIO_IN_ERROR_INVALID_HANDLE;
+	}
+
+	return OK;
 }
 
 int KYTY_SYSV_ABI AudioInInput(int handle, void* dest) {
