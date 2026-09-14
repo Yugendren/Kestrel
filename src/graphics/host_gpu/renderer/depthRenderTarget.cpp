@@ -72,9 +72,38 @@ static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t
 	}
 }
 
-static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
-	constexpr auto replace_op = static_cast<uint8_t>(Prospero::StencilOp::kReplaceOp);
-	return fail == replace_op || pass == replace_op || depth_fail == replace_op;
+static bool UsesStencilOp(uint8_t fail, uint8_t pass, uint8_t depth_fail, Prospero::StencilOp op) {
+	const auto value = static_cast<uint8_t>(op);
+	return fail == value || pass == value || depth_fail == value;
+}
+
+struct StencilFaceReference {
+	bool    supported = false;
+	uint8_t reference = 0;
+};
+
+// The PS5 has two stencil replace operations. kReplaceTest writes STENCIL_TESTVAL, the value the
+// compare also reads, and kReplaceOp writes STENCIL_OPVAL, a second per-face value with no Vulkan
+// equivalent: Vulkan's replace writes the face's reference. When a face replaces only with the op
+// value and its compare cannot observe the reference (ALWAYS, NEVER, or an all-zero compare mask),
+// the op value can serve as that face's Vulkan reference without changing any result.
+static StencilFaceReference ResolveStencilFaceReference(uint8_t func, uint8_t compare_mask,
+                                                        uint8_t write_mask, uint8_t fail,
+                                                        uint8_t pass, uint8_t depth_fail,
+                                                        uint8_t test_value, uint8_t op_value) {
+	if (write_mask == 0 || op_value == test_value ||
+	    !UsesStencilOp(fail, pass, depth_fail, Prospero::StencilOp::kReplaceOp)) {
+		return {true, test_value};
+	}
+	const bool uses_test_value =
+	    UsesStencilOp(fail, pass, depth_fail, Prospero::StencilOp::kReplaceTest);
+	const bool compare_ignores_reference = func == static_cast<uint8_t>(vk::CompareOp::eNever) ||
+	                                       func == static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	                                       compare_mask == 0;
+	if (uses_test_value || !compare_ignores_reference) {
+		return {false, test_value};
+	}
+	return {true, op_value};
 }
 
 [[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
@@ -320,30 +349,44 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		    rc.stencil_clear_enable || z.depth_view.stencil_write_disable;
 		const uint8_t front_write_mask = stencil_ops_disabled ? 0 : sm.stencil_writemask;
 		const uint8_t back_write_mask  = stencil_ops_disabled ? 0 : sm.stencil_writemask_bf;
+		const auto front_reference = ResolveStencilFaceReference(
+		    dc.stencilfunc, sm.stencil_mask, front_write_mask, sc.stencil_fail, sc.stencil_zpass,
+		    sc.stencil_zfail, sm.stencil_testval, sm.stencil_opval);
+		const auto back_reference =
+		    dc.backface_enable
+		        ? ResolveStencilFaceReference(dc.stencilfunc_bf, sm.stencil_mask_bf,
+		                                      back_write_mask, sc.stencil_fail_bf,
+		                                      sc.stencil_zpass_bf, sc.stencil_zfail_bf,
+		                                      sm.stencil_testval_bf, sm.stencil_opval_bf)
+		        : front_reference;
 		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
 		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways)) ||
-		    (front_write_mask != 0 &&
-		     UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
-		     sm.stencil_opval != sm.stencil_testval) ||
-		    (dc.backface_enable && back_write_mask != 0 &&
-		     UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
-		     sm.stencil_opval_bf != sm.stencil_testval_bf)) {
-			DepthFatal("unsupported stencil compare or replacement state");
+		    !front_reference.supported || !back_reference.supported) {
+			DepthFatal("unsupported stencil compare or replacement state: func=%u func_bf=%u "
+			           "backface=%u | front fail=%u zpass=%u zfail=%u test=0x%02x op=0x%02x "
+			           "mask=0x%02x wmask=0x%02x | back fail=%u zpass=%u zfail=%u test=0x%02x "
+			           "op=0x%02x mask=0x%02x wmask=0x%02x",
+			           dc.stencilfunc, dc.stencilfunc_bf, dc.backface_enable ? 1u : 0u,
+			           sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail, sm.stencil_testval,
+			           sm.stencil_opval, sm.stencil_mask, front_write_mask, sc.stencil_fail_bf,
+			           sc.stencil_zpass_bf, sc.stencil_zfail_bf, sm.stencil_testval_bf,
+			           sm.stencil_opval_bf, sm.stencil_mask_bf, back_write_mask);
 		}
 		r.stencil_static_front = {
 		    ConvertStencilOp(sc.stencil_fail, front_write_mask, sm.stencil_opval),
 		    ConvertStencilOp(sc.stencil_zpass, front_write_mask, sm.stencil_opval),
 		    ConvertStencilOp(sc.stencil_zfail, front_write_mask, sm.stencil_opval),
 		    static_cast<vk::CompareOp>(dc.stencilfunc)};
-		r.stencil_dynamic_front = {sm.stencil_mask, front_write_mask, sm.stencil_testval};
+		r.stencil_dynamic_front = {sm.stencil_mask, front_write_mask, front_reference.reference};
 		if (dc.backface_enable) {
 			r.stencil_static_back = {
 			    ConvertStencilOp(sc.stencil_fail_bf, back_write_mask, sm.stencil_opval_bf),
 			    ConvertStencilOp(sc.stencil_zpass_bf, back_write_mask, sm.stencil_opval_bf),
 			    ConvertStencilOp(sc.stencil_zfail_bf, back_write_mask, sm.stencil_opval_bf),
 			    static_cast<vk::CompareOp>(dc.stencilfunc_bf)};
-			r.stencil_dynamic_back = {sm.stencil_mask_bf, back_write_mask, sm.stencil_testval_bf};
+			r.stencil_dynamic_back = {sm.stencil_mask_bf, back_write_mask,
+			                          back_reference.reference};
 		} else {
 			r.stencil_static_back  = r.stencil_static_front;
 			r.stencil_dynamic_back = r.stencil_dynamic_front;
