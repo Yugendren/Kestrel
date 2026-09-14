@@ -56,6 +56,10 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// Permanently drops internal resolution scaling for the guest range of an image and returns
+	// the native replacement (the old id is freed). Used when a render pass would otherwise mix
+	// scaled and native attachments, which a single Vulkan render area cannot express.
+	[[nodiscard]] ImageId DenyImageScale(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);

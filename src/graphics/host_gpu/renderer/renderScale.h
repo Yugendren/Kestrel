@@ -51,6 +51,55 @@ namespace Libs::Graphics::RenderScale {
 	return {Apply(e.width), Apply(e.height), e.depth};
 }
 
+// Maps guest-resolution geometry onto the attachments of one render pass. Every attachment of
+// a pass shares a single scale (the draw path unifies them), so a pass has exactly one mapping.
+// Call sites use this instead of multiplying by Factor() themselves.
+class Mapping {
+public:
+	explicit Mapping(bool scaled) noexcept : m_factor(scaled ? Factor() : 1.0F) {}
+
+	[[nodiscard]] bool IsIdentity() const noexcept { return m_factor == 1.0F; }
+
+	[[nodiscard]] vk::Extent2D Extent(vk::Extent2D extent) const noexcept {
+		return IsIdentity() ? extent : Apply(extent);
+	}
+
+	// Stretches a guest window transform onto the host attachment. The depth range describes
+	// clip space, not the framebuffer, so it is never touched.
+	void Viewport(vk::Viewport& viewport) const noexcept {
+		if (IsIdentity()) {
+			return;
+		}
+		viewport.x      = viewport.x * m_factor;
+		viewport.y      = viewport.y * m_factor;
+		viewport.width  = viewport.width * m_factor;
+		viewport.height = viewport.height * m_factor;
+	}
+
+	// Maps a guest-space rectangle onto the host attachment. Edges round outward so a rectangle
+	// covering the whole guest target still covers the whole host target, then clamp to it.
+	[[nodiscard]] vk::Rect2D Rect(int32_t left, int32_t top, int32_t right, int32_t bottom,
+	                              vk::Extent2D guest_extent) const noexcept {
+		if (!IsIdentity()) {
+			const auto factor = static_cast<double>(m_factor);
+			const auto host   = Apply(guest_extent);
+			left   = static_cast<int32_t>(std::floor(left * factor));
+			top    = static_cast<int32_t>(std::floor(top * factor));
+			right  = std::min(static_cast<int32_t>(std::ceil(right * factor)),
+			                  static_cast<int32_t>(host.width));
+			bottom = std::min(static_cast<int32_t>(std::ceil(bottom * factor)),
+			                  static_cast<int32_t>(host.height));
+			left   = std::min(left, right);
+			top    = std::min(top, bottom);
+		}
+		return {{left, top},
+		        {static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top)}};
+	}
+
+private:
+	float m_factor;
+};
+
 } // namespace Libs::Graphics::RenderScale
 
 #endif

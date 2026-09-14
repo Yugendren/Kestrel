@@ -852,16 +852,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
 			recreate |= raw_d16_texture;
 			break;
-		case BindingType::Storage:
-			recreate |= cached.info.IsDepth();
-			// Compute shaders address storage images with absolute guest texel coordinates
-			// and dispatch guest-sized workgroup counts. Drop the scale for this range for
-			// good, otherwise the binding would recreate the image every frame.
-			if (cached.info.IsScaled()) {
-				m_scale_denied.insert(cached.info.data.address);
-				recreate = true;
-			}
-			break;
+		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
@@ -1447,8 +1438,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		if (desc.type == BindingType::Storage) {
+			// Compute shaders address storage images with absolute guest texel coordinates and
+			// are dispatched with guest-sized workgroup counts, so this range can never be
+			// scaled. The denial is permanent; otherwise a range that alternates between a
+			// render-target and a storage binding would be recreated every frame.
+			m_scale_denied.insert(desc.info.data.address);
+		}
 		desc.info.scaled = ShouldScaleImage(m_graphics, desc.info, desc.type) &&
 		                   !m_scale_denied.contains(desc.info.data.address);
+		if (desc.info.scaled) {
+			static std::atomic<uint32_t> logged_scale {0};
+			if (logged_scale.fetch_add(1, std::memory_order_relaxed) < 32) {
+				const auto host = desc.info.HostExtent();
+				LOGF("TextureCache: internal resolution scaling %s addr=0x%016" PRIx64
+				     " %ux%u -> %ux%u\n",
+				     BindingTypeName(desc.type), desc.info.data.address, desc.info.extent.width,
+				     desc.info.extent.height, host.width, host.height);
+			}
+		}
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
@@ -1475,6 +1483,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 
+		if (result && desc.type == BindingType::Storage && m_slot_images[result].info.IsScaled()) {
+			// The range was scaled while it was only a render target. Sampled textures are fine
+			// scaled because they are addressed with normalised coordinates, but a storage
+			// binding is not: rebuild it natively and resample the existing contents.
+			auto native   = m_slot_images[result].info;
+			native.scaled = false;
+			result        = ExpandImage(native, result);
+		}
 		if (result) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
@@ -1535,6 +1551,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		TouchImage(image);
 	}
 	return result;
+}
+
+ImageId TextureCache::DenyImageScale(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	m_scale_denied.insert(image.info.data.address);
+	if (!image.info.IsScaled()) {
+		return id;
+	}
+	auto native   = image.info;
+	native.scaled = false;
+	return ExpandImage(native, id);
 }
 
 void TextureCache::UpdateImage(ImageId id) {
