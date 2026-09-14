@@ -30,7 +30,10 @@ public:
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
-	template <typename Flush>
+	// With from_fault the range is a single faulting guest page and the CPU-dirty mark is
+	// widened over its coarse block, which is what keeps a sequential guest write from costing
+	// one fault per page.
+	template <bool from_fault = false, typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
@@ -44,7 +47,12 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				if constexpr (from_fault) {
+					manager->MarkCpuModifiedFromFault(manager->GetCpuAddr() + offset);
+				} else {
+					manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
+					                                             bytes);
+				}
 				return false;
 			}();
 			if (should_flush) {

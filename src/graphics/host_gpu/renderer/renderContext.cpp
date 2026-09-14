@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -62,7 +63,14 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// Widening the CPU-dirty mark to the faulting page's coarse block turns a sequential
+		// guest write into one fault per block instead of one per page, but it may only be done
+		// when the whole block is mapped: the page protection update would otherwise reach
+		// guest addresses that have no host mapping.
+		constexpr uint64_t block_size = TRACKER_FAULT_BLOCK_PAGES * TRACKER_PAGE_SIZE;
+		const auto         block      = Common::AlignDown(fault_vaddr, block_size);
+		const bool         may_widen  = IsMapped(block, block_size);
+		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, may_widen);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);

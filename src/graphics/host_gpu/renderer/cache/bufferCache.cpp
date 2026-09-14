@@ -222,12 +222,16 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
-void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool from_fault) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	const auto flush = [this, vaddr, size] { ReadMemory(vaddr, size, true); };
+	if (from_fault) {
+		m_memory_tracker.InvalidateRegion<true>(vaddr, size, flush);
+	} else {
+		m_memory_tracker.InvalidateRegion(vaddr, size, flush);
+	}
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
