@@ -123,6 +123,14 @@ private:
 		}
 	}
 
+	// Coarse, lock-free "is any image registered here" filter, one counter per image page-table
+	// page. A guest write fault on memory that holds no image can then skip the texture-cache
+	// lock instead of contending with the command-processor thread, which holds that lock for
+	// the duration of a draw. The counters use the same page granularity as the owner index, so
+	// a zero counter means FindImagesInRegion() would have returned nothing.
+	[[nodiscard]] bool MayCoverImages(uint64_t address, uint64_t size) const noexcept;
+	void               UpdateImageCover(uint64_t address, uint64_t size, bool add);
+
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
@@ -186,6 +194,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	std::unique_ptr<std::atomic<uint32_t>[]>          m_image_page_cover;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
