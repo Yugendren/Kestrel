@@ -64,6 +64,11 @@ public:
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	// True when ObtainBuffer() can serve this range without newly registering guest memory for
+	// write tracking: either a cached buffer already covers it, or it is small and host-resident
+	// enough for the streaming shortcut. Callers that only read a few bytes use this to stay off
+	// the write-fault path for memory the cache has no other reason to track.
+	[[nodiscard]] bool IsRegionObtainableWithoutRegistering(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);

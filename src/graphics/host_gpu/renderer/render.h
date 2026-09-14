@@ -54,6 +54,33 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// A draw whose parameters the GPU fetches from guest memory instead of the command processor
+// reading them back. `args_addr` points at tightly packed VkDrawIndirectCommand /
+// VkDrawIndexedIndirectCommand records -- the guest's DrawIndirectArgs and DrawIndexedIndirectArgs
+// blocks have exactly those layouts. When `count_addr` is non-zero the GPU reads the draw count
+// from there as well and `draw_count` is only an upper bound.
+struct DrawIndirectSource {
+	uint64_t args_addr  = 0;
+	uint64_t count_addr = 0;
+	uint32_t draw_count = 0;
+	uint32_t stride     = 0;
+};
+
+// Why a draw cannot keep its arguments on the GPU. Anything other than Supported sends the draw
+// down the command processor's host-read path, which is correct but stalls on a GPU drain.
+enum class IndirectDrawSupport : uint8_t {
+	Supported,
+	DeviceFeature,       // the host cannot express this draw count or a GPU-resident draw count
+	Topology,            // legacy rect / quad lists expand into host draws sized by the counts
+	IndexEncoding,       // 8-bit indices are widened on the host from a host-known count
+	PrimitiveRestart,    // a custom reset index has to be looked for in the index data
+	ArgumentsNotCached,  // the argument block is not backed by a cached device buffer
+	IndexRangeUnknown,   // INDEX_BUFFER_SIZE gives no range for the GPU to index into
+	MeshStage,           // a mesh draw takes its counts as push constants
+};
+
+[[nodiscard]] const char* IndirectDrawSupportName(IndirectDrawSupport support);
+
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
 	const void*      index_addr                 = nullptr;
@@ -63,6 +90,10 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Non-null when the GPU reads the draw parameters itself. `index_addr` / `index_count` then
+	// describe the whole index range to bind, and `instance_count`, `base_vertex` and
+	// `first_instance` are unused: those come from the argument block.
+	const DrawIndirectSource* indirect = nullptr;
 };
 
 struct DrawAutoArgs {
@@ -72,6 +103,9 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Non-null when the GPU reads the draw parameters itself; every count and offset above is
+	// then unused because they come from the argument block.
+	const DrawIndirectSource* indirect = nullptr;
 };
 
 struct SubmitInfo {
@@ -170,8 +204,19 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// Records the draw. A draw with `args.indirect == nullptr` is always recorded and returns
+	// true; an indirect draw returns false when the bound guest state cannot be expressed as a
+	// GPU-side indirect draw, and the caller must retry it with host-read arguments.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// Whether DrawIndex()/DrawAuto() can record `source` as a GPU-side indirect draw with the
+	// currently bound guest state. Evaluated before any draw state is touched, so a rejected draw
+	// can take the host-read path without repeating work. Only the mesh-shader stage, which is
+	// not known until the shaders are resolved, is rejected later by the draw itself.
+	[[nodiscard]] IndirectDrawSupport SupportsIndirectDraw(CommandBuffer&            buffer,
+	                                                       const DrawIndirectSource& source,
+	                                                       bool                      indexed,
+	                                                       uint32_t index_type_and_size);
 
 	struct GraphicsBindings {
 		PreparedBindings                vertex;
@@ -192,7 +237,9 @@ private:
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
-	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	// False when the prepared draw turned out to be an indirect draw that cannot be recorded; no
+	// commands are written in that case.
+	bool ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
@@ -218,6 +265,11 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	// Vertex-stage programs already found to be mesh shaders. A mesh draw takes its counts as
+	// push constants, so it can never be issued indirectly, and its stage is only known once the
+	// shaders are resolved: remembering the rejection keeps later draws from the same program
+	// from preparing a whole render state just to be turned away.
+	std::unordered_set<uint64_t> m_indirect_mesh_programs;
 	std::unordered_set<uint64_t> m_unrepresentable_textures;
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
 

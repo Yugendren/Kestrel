@@ -35,6 +35,13 @@ struct GraphicContext {
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               nv_diagnostics_enabled                = false;
+	// GPU-side indirect draws (vkCmdDraw*Indirect*). multiDrawIndirect allows a draw count above
+	// one, drawIndirectFirstInstance is required because the guest argument blocks always carry a
+	// start-instance, and drawIndirectCount sources the draw count from GPU memory.
+	bool                               multi_draw_indirect_enabled           = false;
+	bool                               draw_indirect_first_instance_enabled  = false;
+	bool                               draw_indirect_count_enabled           = false;
+	uint32_t                           max_draw_indirect_count               = 1;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

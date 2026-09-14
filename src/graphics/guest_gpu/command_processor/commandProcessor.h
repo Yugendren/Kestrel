@@ -76,9 +76,11 @@ public:
 	void SetDrawIndirectArgsBaseAddress(uint64_t draw_indirect_args_base_addr);
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
 	void SetNumInstances(uint32_t num_instances);
-	void DrawIndex(DrawIndexArgs args);
+	// Both return false only for an indirect draw the renderer could not record on the GPU; see
+	// CommandProcessor::DrawIndirect().
+	bool DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
-	void DrawIndexAuto(DrawAutoArgs args);
+	bool DrawIndexAuto(DrawAutoArgs args);
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
@@ -149,6 +151,11 @@ private:
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
+	// Records `source` as a GPU-side indirect draw, leaving the argument block in GPU memory.
+	// Anything but IndirectDrawSupport::Supported means nothing was recorded and the caller has
+	// to read the arguments back to the host instead.
+	IndirectDrawSupport TryDrawIndirectOnGpu(const DrawIndirectSource& source, bool indexed);
+
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }
 
