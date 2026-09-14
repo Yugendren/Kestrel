@@ -5,7 +5,9 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
+#include <bit>
 #include <mutex>
 #include <utility>
 
@@ -117,6 +119,38 @@ public:
 		}
 	}
 
+	// Marks a faulting guest page CPU-dirty, widened to the pages of the same coarse block that
+	// earlier faults already observed the guest writing. Widening is purely an optimisation:
+	// marking extra pages CPU-dirty can only cost a redundant upload, it can never hide a guest
+	// write, because every page that is left out keeps its write protection.
+	void MarkCpuModifiedFromFault(uint64_t vaddr) {
+		const auto [page, page_end] = GetPageRange(vaddr, 1);
+		static_cast<void>(page_end);
+		const auto block = page / TRACKER_FAULT_BLOCK_PAGES;
+		const auto base  = block * TRACKER_FAULT_BLOCK_PAGES;
+		const auto bit   = uint32_t {1} << (page - base);
+		auto&      seen  = m_fault_pages[block];
+		seen             = static_cast<uint16_t>(seen | bit);
+		uint32_t pages   = seen;
+		if (std::popcount(pages) < TRACKER_FAULT_WIDEN_MIN_PAGES) {
+			pages = bit;
+		}
+		// Pages the GPU owns must keep faulting: their contents have to be flushed back first.
+		for (uint32_t index = 0; index < TRACKER_FAULT_BLOCK_PAGES; index++) {
+			const auto page_bit = uint32_t {1} << index;
+			if ((pages & page_bit) != 0 && m_gpu_dirty.Get(base + index)) {
+				pages &= ~page_bit;
+			}
+		}
+		while (pages != 0) {
+			const auto first = static_cast<uint32_t>(std::countr_zero(pages));
+			const auto run   = static_cast<uint32_t>(std::countr_one(pages >> first));
+			ChangeState<DirtySource::Cpu, true>(
+			    m_cpu_addr + (base + first) * TRACKER_PAGE_SIZE, run * TRACKER_PAGE_SIZE);
+			pages &= ~(((uint32_t {1} << run) - 1u) << first);
+		}
+	}
+
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
@@ -180,6 +214,8 @@ private:
 
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
+	// Pages of each coarse block that a guest write fault has already been seen on.
+	std::array<uint16_t, TRACKER_FAULT_BLOCKS> m_fault_pages {};
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
