@@ -217,7 +217,11 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	}
 	auto& processor = m_compute_cp[queue_id - 1];
 	if (processor == nullptr) {
-		processor = std::make_unique<CommandProcessor>(m_renderer, ComputeQueueBase + queue_id - 1);
+		// Async compute end-of-pipe interrupts are reported per compute pipe, not per queue:
+		// the guest registers event id ComputeQueueBase + pipe for its compute event queue and
+		// tells the queues apart with the interrupt context. Queue q lives on pipe q / 8.
+		const auto pipe = (queue_id - 1) / QueuesPerComputePipe;
+		processor = std::make_unique<CommandProcessor>(m_renderer, ComputeQueueBase + pipe);
 	}
 	return *processor;
 }
