@@ -1569,7 +1569,7 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 
 uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
 	PRINT_NAME();
-	LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
+	AgcTrace("\t operation = 0x%08" PRIx32 "\n", operation);
 
 	const auto size_dw = context_state_op_size_dw(operation);
 	if (buf == nullptr || size_dw == 0) {
@@ -3892,9 +3892,9 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* 
 int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference) {
 	PRINT_NAME();
 
-	LOGF("\t cmd       = 0x%016" PRIx64 "\n"
-	     "\t reference = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(cmd), reference);
+	AgcTrace("\t cmd       = 0x%016" PRIx64 "\n"
+	         "\t reference = 0x%016" PRIx64 "\n",
+	         reinterpret_cast<uint64_t>(cmd), reference);
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
