@@ -59,6 +59,10 @@ struct ConfigOptions {
 	bool                   graphics_debug_dump_enabled = false;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
+	// How often (in seconds) an fps/frame/time line is written to the log, using the same
+	// counters as the window title. Lets a run be measured from the log when the window
+	// title is not reachable, e.g. over SSH on Windows. 0 disables it.
+	uint32_t               fps_log_seconds             = 0;
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
@@ -97,6 +101,7 @@ bool GraphicsDebugDumpEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
+uint32_t              GetFpsLogSeconds();
 
 bool ProfilerEnabled();
 

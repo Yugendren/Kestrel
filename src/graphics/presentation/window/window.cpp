@@ -1022,6 +1022,21 @@ void WindowContext::UpdateTitle() {
 	    device_name, processor_name, frame_num, current_fps);
 
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
+
+	// --fps-log writes the same frame/fps counters as the window title to the log every N
+	// seconds, so a run can be measured from the log when the title is not reachable, e.g.
+	// over SSH on Windows. Off by default, and costs a single comparison when disabled.
+	const uint32_t fps_log_seconds = Config::GetFpsLogSeconds();
+	if (fps_log_seconds != 0) {
+		static uint64_t fps_log_origin = now;
+		static uint64_t fps_log_last   = now;
+		if (now - fps_log_last >= static_cast<uint64_t>(fps_log_seconds) * frequency) {
+			fps_log_last          = now;
+			const auto elapsed_s = static_cast<uint64_t>((now - fps_log_origin) / frequency);
+			LOGF("fps: %.0f frame: %" PRIu64 " t=%" PRIu64 "s\n", current_fps, frame_num,
+			     elapsed_s);
+		}
+	}
 }
 
 } // namespace Libs::Graphics
