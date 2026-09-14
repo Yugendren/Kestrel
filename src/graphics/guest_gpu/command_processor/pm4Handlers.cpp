@@ -2301,7 +2301,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
-		if (queued) {
+		if (queued && !cp.DeferReleaseMemFlush()) {
 			cp.BufferFlush();
 		}
 	};
@@ -2341,9 +2341,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		const std::array<uint32_t, 8> current {cmd_id, buffer[0], buffer[1], buffer[2],
-		                                      buffer[3], buffer[4], buffer[5], buffer[6]};
-		if (dw < 16 || !cp.DeferReleaseMemFlush(current, {buffer + 7, dw - 8})) {
+		if (!cp.DeferReleaseMemFlush()) {
 			cp.BufferFlush();
 		}
 
