@@ -1448,15 +1448,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		if (desc.type == BindingType::Storage) {
-			// Compute shaders address storage images with absolute guest texel coordinates and
-			// are dispatched with guest-sized workgroup counts, so this range can never be
-			// scaled. The denial is permanent; otherwise a range that alternates between a
-			// render-target and a storage binding would be recreated every frame.
-			m_scale_denied.insert(desc.info.data.address);
+		if (RenderScale::Enabled()) {
+			if (desc.type == BindingType::Storage) {
+				// Compute shaders address storage images with absolute guest texel coordinates
+				// and are dispatched with guest-sized workgroup counts, so this range can never
+				// be scaled. The denial is permanent; otherwise a range that alternates between
+				// a render-target and a storage binding would be recreated every frame.
+				m_scale_denied.insert(desc.info.data.address);
+			}
+			desc.info.scaled = ShouldScaleImage(m_graphics, desc.info, desc.type) &&
+			                   !m_scale_denied.contains(desc.info.data.address);
 		}
-		desc.info.scaled = ShouldScaleImage(m_graphics, desc.info, desc.type) &&
-		                   !m_scale_denied.contains(desc.info.data.address);
 		if (desc.info.scaled) {
 			static std::atomic<uint32_t> logged_scale {0};
 			if (logged_scale.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -1502,7 +1504,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 
-		if (result && desc.type == BindingType::Storage && m_slot_images[result].info.IsScaled()) {
+		if (result && desc.type == BindingType::Storage && RenderScale::Enabled() &&
+		    m_slot_images[result].info.IsScaled()) {
 			// The range was scaled while it was only a render target. Sampled textures are fine
 			// scaled because they are addressed with normalised coordinates, but a storage
 			// binding is not: rebuild it natively and resample the existing contents.
