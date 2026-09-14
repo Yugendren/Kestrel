@@ -764,8 +764,8 @@ struct PreparedIndexBuffer {
 // guest memory follows the buffer and become a real primitive (a screen-covering wedge when
 // w happens to be 0). Bound non-indexed draws to the vertices the strided per-vertex buffers
 // actually hold.
-static uint32_t ClampAutoVertexCount(const ShaderVertexInputInfo& info, uint32_t first_vertex,
-                                     uint32_t vertex_count) {
+// The highest vertex index the bound V#s can supply, or UINT64_MAX when none of them bounds it.
+static uint64_t AutoVertexLimit(const ShaderVertexInputInfo& info) {
 	uint64_t limit = UINT64_MAX;
 	for (int i = 0; i < info.buffers_num; i++) {
 		const auto& b = info.buffers[i];
@@ -778,6 +778,12 @@ static uint32_t ClampAutoVertexCount(const ShaderVertexInputInfo& info, uint32_t
 		}
 		limit = std::min<uint64_t>(limit, b.num_records);
 	}
+	return limit;
+}
+
+static uint32_t ClampAutoVertexCount(const ShaderVertexInputInfo& info, uint32_t first_vertex,
+                                     uint32_t vertex_count) {
+	const uint64_t limit = AutoVertexLimit(info);
 	if (limit == UINT64_MAX) {
 		return vertex_count;
 	}
@@ -1385,6 +1391,14 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                     bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
 	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
+	if (draw.indirect != nullptr && !draw.IsIndexed() &&
+	    AutoVertexLimit(state.vs_input_info) != UINT64_MAX) {
+		// The vertex count comes out of guest memory, so ClampAutoVertexCount() cannot bound it
+		// to what the V#s hold. Rather than let the GPU fetch vertices past NUM_RECORDS, hand the
+		// draw to the host path, which reads the count and clamps it. The bound depends on the
+		// descriptors rather than the program, so it is re-checked for every draw.
+		return false;
+	}
 	if (mesh_active && draw.indirect != nullptr) {
 		// A mesh draw hands its index count and vertex/instance offsets to the shader as push
 		// constants and sizes its workgroup grid from them, so those have to be known on the
@@ -1567,7 +1581,7 @@ const char* IndirectDrawSupportName(IndirectDrawSupport support) {
 		case IndirectDrawSupport::PrimitiveRestart: return "primitive restart";
 		case IndirectDrawSupport::ArgumentsNotCached: return "arguments not cached";
 		case IndirectDrawSupport::IndexRangeUnknown: return "index range unknown";
-		case IndirectDrawSupport::MeshStage: return "mesh stage";
+		case IndirectDrawSupport::RendererRefused: return "renderer refused";
 	}
 	EXIT("unknown indirect-draw support value: %u\n", static_cast<uint32_t>(support));
 }
@@ -1577,7 +1591,7 @@ IndirectDrawSupport RenderExecutor::SupportsIndirectDraw(CommandBuffer&         
                                                          bool                      indexed,
                                                          uint32_t index_type_and_size) {
 	if (m_indirect_mesh_programs.contains(VertexStageKey(buffer.GetShaders()))) {
-		return IndirectDrawSupport::MeshStage;
+		return IndirectDrawSupport::RendererRefused;
 	}
 	const auto& graphics = m_context.GetGraphics();
 	// The argument blocks always carry a start-instance; a host that cannot honour it would

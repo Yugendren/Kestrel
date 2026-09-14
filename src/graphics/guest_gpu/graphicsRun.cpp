@@ -1011,8 +1011,7 @@ IndirectDrawSupport CommandProcessor::TryDrawIndirectOnGpu(const DrawIndirectSou
 	            : executor.DrawAuto(
 	                  m_submit_id, CurrentBuffer(),
 	                  {.offset_source = DrawOffsetSource::IndirectArgs, .indirect = &source});
-	// The renderer only refuses a prepared indirect draw for the mesh-shader stage.
-	return recorded ? IndirectDrawSupport::Supported : IndirectDrawSupport::MeshStage;
+	return recorded ? IndirectDrawSupport::Supported : IndirectDrawSupport::RendererRefused;
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
