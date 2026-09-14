@@ -80,6 +80,8 @@ static void PrintUsage() {
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
+	::printf("  --fps-log <seconds>                  Log fps/frame/time counters every N seconds.\n"
+	         "                                       Default: 0 (disabled).\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
@@ -382,6 +384,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--fps-log") {
+			const int32_t fps_log_seconds = Common::ToInt32(value);
+			options.config.fps_log_seconds =
+			    static_cast<uint32_t>(fps_log_seconds < 0 ? 0 : fps_log_seconds);
 		} else if (arg == "--spirv-debug-printf") {
 			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
