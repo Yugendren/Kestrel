@@ -77,7 +77,10 @@ enum class IndirectDrawSupport : uint8_t {
 	PrimitiveRestart,    // a custom reset index has to be looked for in the index data
 	ArgumentsNotCached,  // the argument block is not backed by a cached device buffer
 	IndexRangeUnknown,   // INDEX_BUFFER_SIZE gives no range for the GPU to index into
-	MeshStage,           // a mesh draw takes its counts as push constants
+	// Only decidable once the shaders and their descriptors are resolved: a mesh-shader stage,
+	// whose counts become push constants, or a non-indexed draw whose vertex count has to be
+	// clamped to what the V#s can supply.
+	RendererRefused,
 };
 
 [[nodiscard]] const char* IndirectDrawSupportName(IndirectDrawSupport support);
@@ -213,8 +216,8 @@ private:
 	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 	// Whether DrawIndex()/DrawAuto() can record `source` as a GPU-side indirect draw with the
 	// currently bound guest state. Evaluated before any draw state is touched, so a rejected draw
-	// can take the host-read path without repeating work. Only the mesh-shader stage, which is
-	// not known until the shaders are resolved, is rejected later by the draw itself.
+	// can take the host-read path without repeating work. What is only knowable once the shaders
+	// and their descriptors are resolved is rejected later, by the draw itself.
 	[[nodiscard]] IndirectDrawSupport SupportsIndirectDraw(CommandBuffer&            buffer,
 	                                                       const DrawIndirectSource& source,
 	                                                       bool                      indexed,
