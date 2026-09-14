@@ -48,6 +48,11 @@
 
 namespace Libs::Graphics {
 
+// Out of line because MeshDrawArgsBuilder's constructor needs RenderContext::GetGraphics(), and
+// RenderContext is only forward-declared in render.h to avoid an include cycle.
+RenderExecutor::RenderExecutor(RenderContext& context)
+    : m_context(context), m_mesh_draw_args_builder(context.GetGraphics()) {}
+
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	                                           const ShaderVertexInputInfo& vs_input_info) {
 	auto     vertex_offset   = static_cast<int32_t>(index_offset);
@@ -1249,6 +1254,76 @@ static void EmitIndirectArgsBarrier(vk::CommandBuffer           vk_buffer,
 	                          nullptr, count, barriers.data(), 0, nullptr);
 }
 
+// Turns a mesh draw's guest indirect-args block into its mesh draw parameter block and
+// VkDrawMeshTasksIndirectCommandEXT entirely on the GPU. Unlike EmitIndirectArgsBarrier(), the
+// guest block itself is read by mesh_draw_args.comp rather than fetched by fixed-function indirect
+// draw logic, so it needs a shader-read barrier rather than an indirect-command-read one; the two
+// blocks the shader writes get an indirect-command-read / shader-read barrier of their own before
+// the mesh draw that consumes them. Must be recorded outside a render pass instance, like
+// EmitIndirectArgsBarrier().
+static void EmitMeshIndirectArgsConversion(vk::CommandBuffer vk_buffer,
+                                           const MeshDrawArgsBuilder&   builder,
+                                           const PreparedIndirectArgs&  indirect,
+                                           const ShaderMeshInputInfo&   mesh,
+                                           const DrawIndexBufferSource& index_source,
+                                           const vk::PhysicalDeviceMeshShaderPropertiesEXT& limits,
+                                           vk::Buffer params_buffer, uint64_t params_offset,
+                                           vk::Buffer dispatch_buffer, uint64_t dispatch_offset) {
+	vk::BufferMemoryBarrier args_barrier {};
+	args_barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite |
+	                              vk::AccessFlagBits::eTransferWrite |
+	                              vk::AccessFlagBits::eMemoryWrite;
+	args_barrier.dstAccessMask       = vk::AccessFlagBits::eShaderRead;
+	args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	args_barrier.buffer              = indirect.args_buffer;
+	args_barrier.offset              = indirect.args_offset;
+	args_barrier.size                = indirect.args_size;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags {}, 0,
+	                          nullptr, 1, &args_barrier, 0, nullptr);
+
+	MeshDrawArgsBuilder::Args args {};
+	args.guest_args_buffer    = indirect.args_buffer;
+	args.guest_args_offset    = indirect.args_offset;
+	args.params_buffer        = params_buffer;
+	args.params_offset        = params_offset;
+	args.dispatch_buffer      = dispatch_buffer;
+	args.dispatch_offset      = dispatch_offset;
+	args.primitive_size       = mesh.InputPrimitiveSize();
+	args.primitive_step       = mesh.InputPrimitiveStep();
+	args.primitives_per_group = mesh.primitives_per_group;
+	args.element_size         = index_source.guest_element_size;
+	args.index_base           = index_source.address;
+	args.max_groups_x         = limits.maxMeshWorkGroupCount[0];
+	args.max_groups_y         = limits.maxMeshWorkGroupCount[1];
+	builder.Record(vk_buffer, args);
+
+	std::array<vk::BufferMemoryBarrier, 2> out_barriers {};
+	const auto add_out_barrier = [&out_barriers](uint32_t index, vk::Buffer buffer_handle,
+	                                             uint64_t offset, uint64_t size) {
+		auto& barrier               = out_barriers[index];
+		barrier.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead |
+		                        vk::AccessFlagBits::eShaderRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = buffer_handle;
+		barrier.offset              = offset;
+		barrier.size                = size;
+	};
+	add_out_barrier(0, params_buffer, params_offset,
+	                MeshDrawArgsBuilder::ParamsDwordCount * sizeof(uint32_t));
+	add_out_barrier(1, dispatch_buffer, dispatch_offset,
+	                MeshDrawArgsBuilder::DispatchDwordCount * sizeof(uint32_t));
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                          vk::PipelineStageFlagBits::eDrawIndirect |
+	                              vk::PipelineStageFlagBits::eMeshShaderEXT,
+	                          vk::DependencyFlags {}, 0, nullptr,
+	                          static_cast<uint32_t>(out_barriers.size()), out_barriers.data(), 0,
+	                          nullptr);
+}
+
 static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
@@ -1372,18 +1447,6 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
-// Identifies the bound vertex-stage program by the guest addresses its hardware registers point
-// at: two draws sharing a key run the same program.
-static uint64_t VertexStageKey(const HW::Shader& shaders) {
-	constexpr uint64_t Prime = 0x9e3779b97f4a7c15ull;
-	const auto&        vs    = shaders.GetVs();
-	uint64_t           key   = vs.es_regs.data_addr;
-	key = key * Prime + vs.ls_regs.data_addr;
-	key = key * Prime + vs.hs_regs.data_addr;
-	key = key * Prime + vs.gs_regs.data_addr;
-	return key;
-}
-
 bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1399,12 +1462,13 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// descriptors rather than the program, so it is re-checked for every draw.
 		return false;
 	}
-	if (mesh_active && draw.indirect != nullptr) {
-		// A mesh draw hands its index count and vertex/instance offsets to the shader as push
-		// constants and sizes its workgroup grid from them, so those have to be known on the
-		// host. Nothing has been recorded yet: the caller retries with host-read arguments, and
-		// SupportsIndirectDraw() turns the same program away before it prepares anything.
-		m_indirect_mesh_programs.insert(VertexStageKey(buffer.GetShaders()));
+	if (mesh_active && draw.indirect != nullptr && !draw.IsIndexed()) {
+		// mesh_draw_args.comp assumes the guest argument record is a DrawIndexedIndirectArgs block
+		// (index_count, instance_count, start_index, base_vertex, start_instance); a non-indexed mesh
+		// draw's guest block is the smaller DrawIndirectArgs one, and converting it as though it were
+		// the larger layout would read past it and misinterpret every field after the first two. A
+		// mesh draw without real indices is rare enough that this just falls back to the host-read
+		// path instead of teaching the shader a second layout.
 		return false;
 	}
 	uint32_t   mesh_groups = 0;
@@ -1414,18 +1478,24 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
-		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-		if (primitives == 0 || draw.instance_count == 0) {
-			return true;
-		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+		// draw.index_count and draw.instance_count are only real counts for a direct draw; an
+		// indirect draw's are read out of the guest argument block by mesh_draw_args.comp, on the
+		// GPU, so neither the zero-count shortcut nor the host workgroup-limit clamp below can run
+		// for it. The shader clamps to the same limits itself (see max_groups_x/max_groups_y).
+		if (draw.indirect == nullptr) {
+			const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
+			if (primitives == 0 || draw.instance_count == 0) {
+				return true;
+			}
+			mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+			    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+			    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+			        limits.maxMeshWorkGroupTotalCount) {
+				EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
+				     draw.instance_count);
+			}
 		}
 	}
 
@@ -1450,22 +1520,42 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.indirect != nullptr) {
 		indirect_binding = PrepareIndirectArgs(buffer, *draw.indirect, draw.IsIndexed());
 	}
+	static_assert(MeshDrawArgsBuilder::ParamsDwordCount ==
+	              ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 	uint64_t mesh_draw_block_address = 0;
+	uint64_t mesh_params_offset      = 0;
+	uint64_t mesh_dispatch_offset    = 0;
 	if (mesh_active) {
-		const uint32_t draw_data[] {
-		    draw.index_count,
-		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
-		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
-		// Uploading the parameter block writes to host-visible memory and can finish and restart
-		// the scheduler, so it has to happen alongside PrepareIndexBuffer/PrepareIndirectArgs,
-		// before the point below where the command buffer may no longer touch guest memory. Only
-		// the resulting device address -- not the block itself -- is pushed at that point.
-		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		const auto offset = stream.Copy(draw_data, sizeof(draw_data), 16);
-		mesh_draw_block_address = stream.BufferDeviceAddress() + offset;
+		if (draw.indirect != nullptr) {
+			// mesh_draw_args.comp fills both blocks, not the host, so they come from the DeviceLocal
+			// utility buffer rather than the Stream one below. Reserving still has to happen here,
+			// alongside PrepareIndirectArgs, because it can wait on a previous reservation's GPU tick
+			// and, like Stream's Copy(), that can finish and restart the scheduler.
+			auto& device_buffer =
+			    buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
+			const auto alignment =
+			    std::max<uint64_t>(buffer.GetGraphics().StorageMinAlignment(), sizeof(uint32_t));
+			mesh_params_offset = device_buffer.Reserve(
+			    MeshDrawArgsBuilder::ParamsDwordCount * sizeof(uint32_t), alignment);
+			mesh_dispatch_offset = device_buffer.Reserve(
+			    MeshDrawArgsBuilder::DispatchDwordCount * sizeof(uint32_t), alignment);
+			mesh_draw_block_address = device_buffer.BufferDeviceAddress() + mesh_params_offset;
+		} else {
+			const uint32_t draw_data[] {
+			    draw.index_count,
+			    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+			    emit.first_instance, index_source.guest_element_size,
+			    static_cast<uint32_t>(index_source.address),
+			    static_cast<uint32_t>(index_source.address >> 32u)};
+			static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+			// Uploading the parameter block writes to host-visible memory and can finish and restart
+			// the scheduler, so it has to happen alongside PrepareIndexBuffer/PrepareIndirectArgs,
+			// before the point below where the command buffer may no longer touch guest memory. Only
+			// the resulting device address -- not the block itself -- is pushed at that point.
+			auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+			const auto offset = stream.Copy(draw_data, sizeof(draw_data), 16);
+			mesh_draw_block_address = stream.BufferDeviceAddress() + offset;
+		}
 	}
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1530,7 +1620,16 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// A buffer barrier may not name VK_PIPELINE_STAGE_ALL_COMMANDS_BIT inside a render pass
 		// instance, so close the current one before making the arguments visible.
 		m_context.GetCommandScheduler().EndRendering();
-		EmitIndirectArgsBarrier(vk_buffer, indirect_binding);
+		if (mesh_active) {
+			auto& device_buffer =
+			    buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
+			EmitMeshIndirectArgsConversion(
+			    vk_buffer, m_mesh_draw_args_builder, indirect_binding, state.vs_input_info.mesh,
+			    index_source, m_context.GetGraphics().mesh_shader_properties, device_buffer.Handle(),
+			    mesh_params_offset, device_buffer.Handle(), mesh_dispatch_offset);
+		} else {
+			EmitIndirectArgsBarrier(vk_buffer, indirect_binding);
+		}
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
@@ -1541,7 +1640,13 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                             ? state.ps_input_info.stage.program->shader_hash
 	                             : 0u);
 	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		if (draw.indirect != nullptr) {
+			auto& device_buffer =
+			    buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::DeviceLocal);
+			vk_buffer.drawMeshTasksIndirectEXT(device_buffer.Handle(), mesh_dispatch_offset, 1, 0);
+		} else {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit, indirect_binding);
 	}
@@ -1606,9 +1711,6 @@ IndirectDrawSupport RenderExecutor::SupportsIndirectDraw(CommandBuffer&         
                                                          const DrawIndirectSource& source,
                                                          bool                      indexed,
                                                          uint32_t index_type_and_size) {
-	if (m_indirect_mesh_programs.contains(VertexStageKey(buffer.GetShaders()))) {
-		return IndirectDrawSupport::RendererRefused;
-	}
 	const auto& graphics = m_context.GetGraphics();
 	// The argument blocks always carry a start-instance; a host that cannot honour it would
 	// silently draw the wrong instances.

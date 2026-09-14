@@ -241,9 +241,9 @@ bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& 
 
 std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignment,
                                                 bool allow_wait) {
-	if (Mapped().empty()) {
-		return {nullptr, 0};
-	}
+	// A MemoryUsage::DeviceLocal buffer has no host mapping (nothing ever writes it from the CPU),
+	// so Mapped() is empty here; the ring-offset and watch bookkeeping below still applies to it,
+	// only the returned pointer cannot. Reserve() is the entry point such callers use.
 	uint64_t   mapped_size = size;
 	const auto atom        = Graphics().physical_device_properties.limits.nonCoherentAtomSize;
 	if (!NormalizeReservation(IsCoherent(), atom, mapped_size, alignment)) {
@@ -282,11 +282,11 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	m_wait_bound  = wait_bound;
 	m_offset      = aligned_offset;
 	m_mapped_size = mapped_size;
-	return {Mapped().data() + m_offset, m_offset};
+	return {Mapped().empty() ? nullptr : Mapped().data() + m_offset, m_offset};
 }
 
 void StreamBuffer::Commit() {
-	if (Usage() != MemoryUsage::Download && m_mapped_size != 0) {
+	if (Usage() != MemoryUsage::Download && m_mapped_size != 0 && !Mapped().empty()) {
 		Flush(m_offset, m_mapped_size);
 	}
 
@@ -309,6 +309,13 @@ uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignmen
 	const auto [data, offset] = Map(size, alignment);
 	EXIT_IF(data == nullptr);
 	std::memcpy(data, source, static_cast<size_t>(size));
+	Commit();
+	return offset;
+}
+
+uint64_t StreamBuffer::Reserve(uint64_t size, uint64_t alignment) {
+	const auto [data, offset] = Map(size, alignment);
+	EXIT_IF(data == nullptr && !Mapped().empty());
 	Commit();
 	return offset;
 }

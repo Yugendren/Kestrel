@@ -103,6 +103,11 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// Reserves a range without producing a CPU pointer, for a usage a shader writes into directly
+	// (MemoryUsage::DeviceLocal has no host mapping to copy through). Shares Map()'s ring offset and
+	// in-flight watch bookkeeping, so a later reservation still waits on whatever last read this
+	// range instead of racing it.
+	[[nodiscard]] uint64_t Reserve(uint64_t size, uint64_t alignment = 0);
 
 private:
 	friend struct StreamBufferTestAccess;

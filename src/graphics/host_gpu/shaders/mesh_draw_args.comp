@@ -1,0 +1,79 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// The guest DrawIndexedIndirectArgs block: index_count, instance_count, start_index, base_vertex,
+// start_instance.
+layout(std430, binding = 0) readonly buffer guest_args_buf {
+    uint guest_args[];
+};
+
+// The six-dword mesh draw parameter block a mesh program addresses through its push constants:
+// index_count, vertex_offset, first_instance, element_size, index_address_low, index_address_high.
+layout(std430, binding = 1) writeonly buffer params_buf {
+    uint params[];
+};
+
+// A VkDrawMeshTasksIndirectCommandEXT: groupCountX, groupCountY, groupCountZ.
+layout(std430, binding = 2) writeonly buffer dispatch_buf {
+    uint dispatch[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint args_dword_offset;
+    uint params_dword_offset;
+    uint dispatch_dword_offset;
+    // Together with primitive_step, describes how index_count turns into a primitive count the
+    // same way ShaderMeshInputInfo::InputPrimitiveCount() does on the host.
+    uint primitive_size;
+    uint primitive_step;
+    uint primitives_per_group;
+    // Guest index element size in bytes, used to turn start_index into a byte offset.
+    uint element_size;
+    uint index_base_low;
+    uint index_base_high;
+    // The host clamps mesh_groups and instance_count on a direct draw and EXITs if either is out
+    // of range; an indirect draw cannot EXIT once its counts are only known on the GPU, so the
+    // shader clamps to these limits instead.
+    uint max_groups_x;
+    uint max_groups_y;
+};
+
+void main() {
+    const uint index_count     = guest_args[args_dword_offset + 0u];
+    const uint instance_count  = guest_args[args_dword_offset + 1u];
+    const uint start_index     = guest_args[args_dword_offset + 2u];
+    const uint base_vertex     = guest_args[args_dword_offset + 3u];
+    const uint start_instance  = guest_args[args_dword_offset + 4u];
+
+    const uint primitives = index_count < primitive_size
+                                ? 0u
+                                : (index_count - primitive_size) / primitive_step + 1u;
+    const uint groups = primitives == 0u ? 0u : (primitives - 1u) / primitives_per_group + 1u;
+
+    dispatch[dispatch_dword_offset + 0u] = min(groups, max_groups_x);
+    dispatch[dispatch_dword_offset + 1u] = min(instance_count, max_groups_y);
+    dispatch[dispatch_dword_offset + 2u] = 1u;
+
+    params[params_dword_offset + 0u] = index_count;
+    params[params_dword_offset + 1u] = base_vertex;
+    params[params_dword_offset + 2u] = start_instance;
+    params[params_dword_offset + 3u] = element_size;
+
+    // index_address = index_base + start_index * element_size. This is done without
+    // GL_ARB_gpu_shader_int64: element_size is 2 or 4 (SupportsIndirectDraw() already turns away
+    // 8-bit indices, which need host-side widening), and no guest index buffer is remotely close to
+    // the several billion elements start_index would need for start_index * element_size itself to
+    // overflow 32 bits, so that product is computed as a plain 32-bit multiply. Only the addition
+    // to the 64-bit base can carry, and that carry is detected by comparing the low sum against
+    // either addend.
+    const uint offset_low            = start_index * element_size;
+    const uint address_low           = index_base_low + offset_low;
+    const uint carry                 = address_low < index_base_low ? 1u : 0u;
+    const uint address_high          = index_base_high + carry;
+    params[params_dword_offset + 4u] = address_low;
+    params[params_dword_offset + 5u] = address_high;
+}

@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/meshDrawArgs.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -76,9 +77,8 @@ enum class IndirectDrawSupport : uint8_t {
 	PrimitiveRestart,    // a custom reset index has to be looked for in the index data
 	ArgumentsNotCached,  // the argument block is not backed by a cached device buffer
 	IndexRangeUnknown,   // INDEX_BUFFER_SIZE gives no range for the GPU to index into
-	// Only decidable once the shaders and their descriptors are resolved: a mesh-shader stage,
-	// whose counts become push constants, or a non-indexed draw whose vertex count has to be
-	// clamped to what the V#s can supply.
+	// Only decidable once the shaders and their descriptors are resolved: a non-indexed draw whose
+	// vertex count has to be clamped to what the V#s can supply.
 	RendererRefused,
 };
 
@@ -191,7 +191,9 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	// Defined out of line: building m_mesh_draw_args_builder needs RenderContext::GetGraphics(), and
+	// RenderContext is only forward-declared here to avoid an include cycle with renderContext.h.
+	explicit RenderExecutor(RenderContext& context);
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -264,16 +266,14 @@ private:
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
+	// Converts a guest indirect-args block into a mesh draw's parameter and dispatch buffers on the
+	// GPU; see meshDrawArgs.h. Owned here because ExecutePreparedDraw() is its only caller.
+	MeshDrawArgsBuilder                   m_mesh_draw_args_builder;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
-	// Vertex-stage programs already found to be mesh shaders. A mesh draw takes its counts as
-	// push constants, so it can never be issued indirectly, and its stage is only known once the
-	// shaders are resolved: remembering the rejection keeps later draws from the same program
-	// from preparing a whole render state just to be turned away.
-	std::unordered_set<uint64_t> m_indirect_mesh_programs;
 	std::unordered_set<uint64_t> m_unrepresentable_textures;
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
 
