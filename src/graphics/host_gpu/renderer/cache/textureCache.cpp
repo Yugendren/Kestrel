@@ -148,6 +148,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
+      m_image_page_cover(std::make_unique<std::atomic<uint32_t>[]>(ImagePageTable::kPageCount)),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		ConfigureGarbageCollectionBudget(m_graphics.GetTotalMemoryBudget());
@@ -246,6 +247,35 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+bool TextureCache::MayCoverImages(uint64_t address, uint64_t size) const noexcept {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return true;
+	}
+	bool covered = false;
+	ForEachPage(address, size, [this, &covered](uint64_t page) {
+		if (m_image_page_cover[page].load(std::memory_order_acquire) != 0) {
+			covered = true;
+			return true;
+		}
+		return false;
+	});
+	return covered;
+}
+
+void TextureCache::UpdateImageCover(uint64_t address, uint64_t size, bool add) {
+	ForEachPage(address, size, [this, add](uint64_t page) {
+		auto& counter = m_image_page_cover[page];
+		if (add) {
+			if (counter.fetch_add(1, std::memory_order_release) == UINT32_MAX) {
+				EXIT("TextureCache: image coverage counter overflow\n");
+			}
+		} else if (counter.fetch_sub(1, std::memory_order_release) == 0) {
+			EXIT("TextureCache: image coverage counter underflow\n");
+		}
+	});
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -255,6 +285,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	UpdateImageCover(image.info.data.address, image.info.data.size, true);
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
@@ -279,6 +310,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	UpdateImageCover(image.info.data.address, image.info.data.size, false);
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -1763,6 +1795,9 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	if (!MayCoverImages(address, size)) {
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
