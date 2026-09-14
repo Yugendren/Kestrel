@@ -1383,7 +1383,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 							case 0x2d:
 							case 0x2f:
 							case 0x30:
-								if (event_index == 0x00 && !with_interrupt) {
+								// Cache-flush timestamp events write the 64-bit value at end of
+								// pipe exactly like BOTTOM_OF_PIPE_TS above; the interrupt form
+								// only adds the EOP interrupt the helper already raises.
+								if (event_index == 0x00) {
 									write64(false);
 									return;
 								}
@@ -1471,7 +1474,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		default: break;
 	}
 
-	EXIT("unknown event type\n");
+	EXIT("unknown end-of-pipe write: bits=%u cache_policy=0x%x event_write_dest=0x%x "
+	     "eop_event_type=0x%x cache_action=0x%x event_index=0x%x event_write_source=0x%x "
+	     "interrupt_selector=0x%x interrupt_context=0x%x with_interrupt=%u\n",
+	     static_cast<unsigned>(sizeof(T) * 8u), cache_policy, event_write_dest, eop_event_type,
+	     cache_action, event_index, event_write_source, interrupt_selector, interrupt_context_id,
+	     with_interrupt ? 1u : 0u);
 }
 
 void CommandProcessor::WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
