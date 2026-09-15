@@ -9,16 +9,14 @@ namespace Libs::Graphics {
 struct ShaderStageRuntime;
 
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);
-VulkanMemoryBarrier     MakeShaderAccessDependency();
-VulkanMemoryBarrier     MakeShaderWriteHazardDependency();
 VulkanMemoryBarrier     MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages,
-                         bool writes_memory = true);
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
-                              vk::PipelineStageFlags destination_stages);
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+// A memory dependency between everything recorded so far and everything recorded after it. This
+// is the barrier ShaderHazardTracker defers; it subsumes the write-hazard and access barriers
+// that used to bracket every dispatch.
+void ShaderHazardBarrier(vk::CommandBuffer vk_buffer);
 
 } // namespace Libs::Graphics
 

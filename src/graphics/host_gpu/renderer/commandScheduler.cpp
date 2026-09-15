@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -353,6 +355,8 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
+	// A render pass may sample or target what a dispatch just wrote.
+	FlushShaderHazards();
 	Current().BeginRendering(state);
 }
 
@@ -360,6 +364,21 @@ void CommandScheduler::EndRendering() {
 	if (Active() && !m_command.IsInvalid()) {
 		Current().EndRendering();
 	}
+	// Everything that records through the scheduler -- image transfers, tiling, blits, the fault
+	// buffer -- ends rendering first, so this is the choke point where non-dispatch work becomes
+	// visible to the deferred barrier.
+	FlushShaderHazards();
+}
+
+void CommandScheduler::FlushShaderHazards() {
+	if (!m_shader_hazards.HasPendingWork() || m_command.IsInvalid()) {
+		return;
+	}
+	// Dispatches end the render pass before recording, so pending shader work always means no
+	// render pass is open and the barrier may be recorded here.
+	m_command.EndRendering();
+	ShaderHazardBarrier(m_command.Handle());
+	m_shader_hazards.Clear();
 }
 
 void CommandScheduler::Flush() {
@@ -548,6 +567,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	// The submission must not end with a dependency still deferred: nothing after it would
+	// carry the barrier.
+	FlushShaderHazards();
 	// Guest memory the CPU reads every frame rides back with the work that dirtied it.
 	m_context.GetBufferCache().RecordPendingReadbacks();
 
