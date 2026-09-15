@@ -73,6 +73,7 @@ struct RenderDepthInfo {
 	// Host attachment size: the guest size times the internal render scale.
 	[[nodiscard]] vk::Extent2D Extent() const { return desc.info.HostExtent2D(); }
 	[[nodiscard]] bool         IsScaled() const { return desc.info.IsScaled(); }
+	[[nodiscard]] float        ScaleFactor() const { return desc.info.ScaleFactor(); }
 };
 
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {

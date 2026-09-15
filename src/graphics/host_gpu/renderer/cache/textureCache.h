@@ -163,6 +163,9 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	// Host allocation factor for one image, taken from its fidelity class (see the policy in
+	// textureCache.cpp). Must be called with m_lock held: it reads the learned display extent.
+	[[nodiscard]] float ResolveImageScale(const ImageInfo& info, BindingType binding) const;
 	[[nodiscard]] bool               SafeToDownload(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
@@ -229,6 +232,9 @@ private:
 	// One scaling report per guest range and binding class, so the log describes the policy
 	// and not the traffic.
 	std::set<std::pair<uint64_t, BindingType>>        m_scale_logged;
+	// Guest video-out extent, learned from the scanout surface and only ever grown. The
+	// fidelity classes are defined relative to it; until it is known every target is primary.
+	vk::Extent2D                                      m_display_extent {};
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

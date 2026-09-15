@@ -72,6 +72,14 @@ RtMode GetRtMode() {
 	return g_config->graphics.rt_mode;
 }
 
+float GetPostScale() {
+	const float scale = g_config->graphics.post_scale;
+	if (!std::isfinite(scale)) {
+		return 1.0F;
+	}
+	return std::clamp(scale, 0.1F, 4.0F);
+}
+
 uint32_t GetConsoleLanguage() {
 	return g_config->console_language;
 }

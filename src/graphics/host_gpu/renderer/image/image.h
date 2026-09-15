@@ -156,6 +156,7 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 	[[nodiscard]] bool     IsScaled() const noexcept { return info.IsScaled(); }
+	[[nodiscard]] float    ScaleFactor() const noexcept { return info.ScaleFactor(); }
 
 	// Internal resolution scaling pairs a scaled image with one native-resolution companion, the
 	// scale twin. Compute shaders address storage images in absolute guest texels, so a storage

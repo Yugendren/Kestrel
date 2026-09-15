@@ -326,18 +326,18 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	// Guest-space framebuffer size: guest scissor rectangles are clamped against it, and the
 	// result is converted to host space afterwards.
 	vk::Extent2D framebuffer_extent {};
-	bool         scaled_targets = false;
+	float        target_scale = 1.0F;
 	if (color_count > 0 && colors[0].image_id) {
 		framebuffer_extent = colors[0].GuestExtent();
-		scaled_targets     = colors[0].IsScaled();
+		target_scale       = colors[0].ScaleFactor();
 	} else if (depth.image_id) {
 		framebuffer_extent = depth.GuestExtent();
-		scaled_targets     = depth.IsScaled();
+		target_scale       = depth.ScaleFactor();
 	} else {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		framebuffer_extent = {limits.maxFramebufferWidth, limits.maxFramebufferHeight};
 	}
-	const RenderScale::Mapping mapping {scaled_targets};
+	const RenderScale::Mapping mapping {target_scale};
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -1050,28 +1050,37 @@ void RenderExecutor::UnifyRenderTargetScale(CommandBuffer& buffer, DrawRenderSta
 	if (!RenderScale::Enabled()) {
 		return;
 	}
-	bool any_scaled = false;
-	bool any_native = false;
+	bool  mixed         = false;
+	bool  have_factor   = false;
+	float common_factor = 1.0F;
+	const auto observe = [&](float factor) {
+		if (!have_factor) {
+			have_factor   = true;
+			common_factor = factor;
+		} else if (factor != common_factor) {
+			mixed = true;
+		}
+	};
 	for (uint32_t i = 0; i < state.color_count; i++) {
-		(state.color_info[i].IsScaled() ? any_scaled : any_native) = true;
+		observe(state.color_info[i].ScaleFactor());
 	}
 	if (state.depth_info.image_id) {
-		(state.depth_info.IsScaled() ? any_scaled : any_native) = true;
+		observe(state.depth_info.ScaleFactor());
 	}
-	if (!any_scaled || !any_native) {
+	if (!mixed) {
 		return;
 	}
 	auto& cache = buffer.GetContext().GetTextureCache();
 	for (uint32_t i = 0; i < state.color_count; i++) {
 		auto& target = state.color_info[i];
 		if (target.image_id) {
-			target.image_id         = cache.DenyImageScale(target.image_id);
-			target.desc.info.scaled = false;
+			target.image_id        = cache.DenyImageScale(target.image_id);
+			target.desc.info.scale = 1.0F;
 		}
 	}
 	if (state.depth_info.image_id) {
-		state.depth_info.image_id         = cache.DenyImageScale(state.depth_info.image_id);
-		state.depth_info.desc.info.scaled = false;
+		state.depth_info.image_id        = cache.DenyImageScale(state.depth_info.image_id);
+		state.depth_info.desc.info.scale = 1.0F;
 	}
 }
 

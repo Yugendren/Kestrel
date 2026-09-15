@@ -27,7 +27,8 @@ struct RenderColorInfo {
 	}
 	// Host attachment size: the guest size times the internal render scale.
 	[[nodiscard]] vk::Extent2D Extent() const { return desc.info.HostExtent2D(guest_mip_level); }
-	[[nodiscard]] bool IsScaled() const { return desc.info.IsScaled(); }
+	[[nodiscard]] bool  IsScaled() const { return desc.info.IsScaled(); }
+	[[nodiscard]] float ScaleFactor() const { return desc.info.ScaleFactor(); }
 };
 
 } // namespace Libs::Graphics

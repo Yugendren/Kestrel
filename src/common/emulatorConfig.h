@@ -48,6 +48,11 @@ enum class RtMode { Full, Reduced, Off };
 struct GraphicsSettings {
 	float  render_scale = 1.0F;
 	RtMode rt_mode      = RtMode::Full;
+
+	// Per-pass fidelity. post_scale multiplies the render scale of auxiliary colour targets
+	// (the reduced-resolution buffers a game allocates for its post chain); 1.0 leaves them at
+	// the base render scale.
+	float    post_scale     = 1.0F;
 };
 
 struct ConfigOptions {
@@ -99,6 +104,7 @@ bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
 float GetRenderScale();
 RtMode GetRtMode();
+float    GetPostScale();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
