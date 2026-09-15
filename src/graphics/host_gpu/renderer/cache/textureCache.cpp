@@ -269,7 +269,14 @@ constexpr uint32_t SCALE_MIN_EDGE = 64;
 //              that buffer below display resolution - the bloom/downsample chain, half
 //              resolution effect buffers, composite scratch - so --post-scale reduces it
 //              further.
-enum class FidelityClass { Primary, Auxiliary };
+//   Offscreen  a depth target that is not display sized: depth rendered in order to be
+//              sampled, that is a shadow or projected depth map. --shadow-max caps its host
+//              edge.
+//
+// Splitting the depth classes on the display extent is what keeps a render pass uniform: the
+// scene depth buffer shares a pass with colour targets and must keep their factor, while an
+// off-screen depth target is the only attachment of its own pass.
+enum class FidelityClass { Primary, Auxiliary, Offscreen };
 
 [[nodiscard]] FidelityClass ClassifyImage(const ImageInfo& info, TextureCache::BindingType binding,
                                           vk::Extent2D display) {
@@ -277,6 +284,11 @@ enum class FidelityClass { Primary, Auxiliary };
 	// primary rather than guess a lower fidelity for a target that may be the scene itself.
 	if (display.width == 0 || display.height == 0) {
 		return FidelityClass::Primary;
+	}
+	if (binding == TextureCache::BindingType::DepthTarget) {
+		const bool display_sized =
+		    info.extent.width == display.width && info.extent.height == display.height;
+		return display_sized ? FidelityClass::Primary : FidelityClass::Offscreen;
 	}
 	const bool smaller = info.extent.width < display.width || info.extent.height < display.height;
 	return binding == TextureCache::BindingType::RenderTarget && smaller ? FidelityClass::Auxiliary
@@ -297,6 +309,15 @@ float TextureCache::ResolveImageScale(const ImageInfo& info, BindingType binding
 		case FidelityClass::Auxiliary: {
 			const float post = Config::GetPostScale();
 			return post == 1.0F ? base : base * post;
+		}
+		case FidelityClass::Offscreen: {
+			const uint32_t cap  = Config::GetShadowMax();
+			const uint32_t edge = std::max(info.extent.width, info.extent.height);
+			if (cap == 0 || edge == 0) {
+				return base;
+			}
+			// The cap bounds the longest host edge, so it only ever lowers the factor.
+			return std::min(base, static_cast<float>(cap) / static_cast<float>(edge));
 		}
 		case FidelityClass::Primary: break;
 	}

@@ -70,6 +70,8 @@ static void PrintUsage() {
 	         "                                       intersection report a miss. Default: full.\n");
 	::printf("  --post-scale <float>                 Extra scale for auxiliary post-process\n"
 	         "                                       targets (0.1-4.0). Default: 1.0.\n");
+	::printf("  --shadow-max <pixels>                Cap the longest host edge of off-screen\n"
+	         "                                       depth targets. 0 = no cap. Default: 0.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -212,6 +214,21 @@ static bool ParseRtMode(const std::string& value, Config::RtMode& out) {
 	}
 
 	return false;
+}
+
+static bool ParseShadowMax(const std::string& value, uint32_t& out) {
+	uint32_t   shadow_max = 0;
+	auto [end, error]     = std::from_chars(value.data(), value.data() + value.size(), shadow_max);
+	if (error != std::errc {} || end != value.data() + value.size()) {
+		return false;
+	}
+
+	if (shadow_max != 0 && (shadow_max < 64 || shadow_max > 16384)) {
+		return false;
+	}
+
+	out = shadow_max;
+	return true;
 }
 
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
@@ -370,6 +387,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.graphics.post_scale = parsed;
+		} else if (arg == "--shadow-max") {
+			if (!ParseShadowMax(value, options.config.graphics.shadow_max)) {
+				::printf("invalid shadow max: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());

@@ -92,6 +92,11 @@ float GetPostScale() {
 	return std::clamp(scale, 0.1F, 4.0F);
 }
 
+uint32_t GetShadowMax() {
+	const uint32_t cap = g_config->graphics.shadow_max;
+	return cap == 0 ? 0 : std::clamp(cap, 64u, 16384u);
+}
+
 uint32_t GetConsoleLanguage() {
 	return g_config->console_language;
 }
