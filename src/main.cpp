@@ -64,6 +64,10 @@ static void PrintUsage() {
 	         "                                       --render-scale if both are given.\n");
 	::printf("  --rt-mode <full|reduced|off>         Ray tracing fidelity. off makes every BVH\n"
 	         "                                       intersection report a miss. Default: full.\n");
+	::printf("  --anisotropy <0|1|2|4|8|16>          Cap the anisotropic filter ratio. 0 follows\n"
+	         "                                       the guest descriptor. Default: 0.\n");
+	::printf("  --lod-bias <float>                   Added to the guest mip LOD bias (-4..4).\n"
+	         "                                       Positive is blurrier, cheaper. Default: 0.\n");
 	::printf("  --post-scale <float>                 Extra scale for auxiliary post-process\n"
 	         "                                       targets (0.1-4.0). Default: 1.0.\n");
 	::printf("  --shadow-max <pixels>                Cap the longest host edge of off-screen\n"
@@ -211,6 +215,24 @@ static bool ParseRtMode(const std::string& value, Config::RtMode& out) {
 	return false;
 }
 
+static bool ParseAnisotropy(const std::string& value, uint32_t& out) {
+	uint32_t   anisotropy = 0;
+	auto [end, error]     = std::from_chars(value.data(), value.data() + value.size(), anisotropy);
+	if (error != std::errc {} || end != value.data() + value.size()) {
+		return false;
+	}
+
+	switch (anisotropy) {
+		case 0:
+		case 1:
+		case 2:
+		case 4:
+		case 8:
+		case 16: out = anisotropy; return true;
+		default: return false;
+	}
+}
+
 static bool ParseShadowMax(const std::string& value, uint32_t& out) {
 	uint32_t   shadow_max = 0;
 	auto [end, error]     = std::from_chars(value.data(), value.data() + value.size(), shadow_max);
@@ -352,6 +374,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid rt mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--anisotropy") {
+			if (!ParseAnisotropy(value, options.config.graphics.max_anisotropy)) {
+				::printf("invalid anisotropy: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--lod-bias") {
+			float parsed = 0.0F;
+			if (!ParseFloat(value, parsed, -4.0F, 4.0F)) {
+				::printf("invalid lod bias: %s\n", value.c_str());
+				return false;
+			}
+			options.config.graphics.lod_bias = parsed;
 		} else if (arg == "--post-scale") {
 			float parsed = 0.0F;
 			if (!ParseFloat(value, parsed, 0.1F, 4.0F)) {

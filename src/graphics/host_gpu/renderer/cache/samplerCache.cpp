@@ -1,9 +1,13 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+
+#include <algorithm>
 
 namespace Libs::Graphics {
 
@@ -48,7 +52,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		return vk::Filter::eNearest;
 	};
 
-	const bool aniso = is_aniso_filter(mag_filter) || is_aniso_filter(min_filter);
+	bool aniso = is_aniso_filter(mag_filter) || is_aniso_filter(min_filter);
 	if (aniso) {
 		switch (static_cast<Prospero::SamplerAnisoRatio>(r.MaxAnisoRatio())) {
 			case Prospero::SamplerAnisoRatio::kOne: aniso_ratio = 1.0f; break;
@@ -60,6 +64,17 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 				EXIT("unknown ratio: %d dwords=%08x,%08x,%08x,%08x\n",
 				     static_cast<int>(r.MaxAnisoRatio()), r.fields[0], r.fields[1], r.fields[2],
 				     r.fields[3]);
+		}
+	}
+
+	// --anisotropy caps the guest's anisotropic ratio. It can only lower the filtering cost,
+	// never raise it above what the guest asked for, so the image the guest composed is never
+	// sharpened beyond its intent; a cap of 1 turns anisotropic filtering off entirely.
+	if (const uint32_t cap = Config::GetMaxAnisotropy(); cap != 0) {
+		aniso_ratio = std::min(aniso_ratio, static_cast<float>(cap));
+		if (aniso_ratio <= 1.0f) {
+			aniso       = false;
+			aniso_ratio = 1.0f;
 		}
 	}
 
@@ -125,8 +140,17 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	sampler_info.addressModeU = to_vk_address_mode(r.ClampX());
 	sampler_info.addressModeV = to_vk_address_mode(r.ClampY());
 	sampler_info.addressModeW = to_vk_address_mode(r.ClampZ());
-	sampler_info.mipLodBias =
+
+	// --lod-bias shifts every sampler towards lower-detail mips. It is added to the guest bias
+	// rather than replacing it, so the guest's own per-sampler intent is preserved, and it is
+	// clamped to the device limit only when it is actually in use.
+	float lod_bias =
 	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
+	if (const float override_bias = Config::GetLodBias(); override_bias != 0.0F) {
+		const float limit = m_graphics.GetPhysicalDeviceProperties().limits.maxSamplerLodBias;
+		lod_bias          = std::clamp(lod_bias + override_bias, -limit, limit);
+	}
+	sampler_info.mipLodBias = lod_bias;
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);

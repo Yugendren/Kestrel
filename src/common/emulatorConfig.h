@@ -49,6 +49,12 @@ struct GraphicsSettings {
 	float  render_scale = 1.0F;
 	RtMode rt_mode      = RtMode::Full;
 
+	// Sampler-translation overrides. max_anisotropy 0 follows the guest descriptor; any other
+	// value is an upper bound on the anisotropic ratio. lod_bias is added to the guest's mip
+	// LOD bias, so 0.0 is the guest's own choice.
+	uint32_t max_anisotropy = 0;
+	float    lod_bias       = 0.0F;
+
 	// Per-pass fidelity. post_scale multiplies the render scale of auxiliary colour targets
 	// (the reduced-resolution buffers a game allocates for its post chain); 1.0 leaves them at
 	// the base render scale. shadow_max caps the longest host edge of an off-screen depth
@@ -106,6 +112,8 @@ bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
 float GetRenderScale();
 RtMode GetRtMode();
+uint32_t GetMaxAnisotropy();
+float    GetLodBias();
 float    GetPostScale();
 uint32_t GetShadowMax();
 uint32_t GetConsoleLanguage();

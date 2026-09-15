@@ -72,6 +72,19 @@ RtMode GetRtMode() {
 	return g_config->graphics.rt_mode;
 }
 
+uint32_t GetMaxAnisotropy() {
+	const uint32_t cap = g_config->graphics.max_anisotropy;
+	return cap == 0 ? 0 : std::clamp(cap, 1u, 16u);
+}
+
+float GetLodBias() {
+	const float bias = g_config->graphics.lod_bias;
+	if (!std::isfinite(bias)) {
+		return 0.0F;
+	}
+	return std::clamp(bias, -4.0F, 4.0F);
+}
+
 float GetPostScale() {
 	const float scale = g_config->graphics.post_scale;
 	if (!std::isfinite(scale)) {

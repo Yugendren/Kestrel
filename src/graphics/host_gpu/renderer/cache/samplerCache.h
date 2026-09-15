@@ -27,6 +27,9 @@ public:
 	vk::Sampler GetSampler(const ShaderSamplerResource& r);
 
 private:
+	// The key is the guest descriptor alone. The --anisotropy / --lod-bias overrides are global
+	// and Config is immutable after startup, so every sampler in a run is built under the same
+	// override and the guest dwords still identify a sampler uniquely.
 	using SamplerKey = std::array<uint32_t, 4>;
 
 	struct SamplerKeyHash {
