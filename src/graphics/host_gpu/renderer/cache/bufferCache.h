@@ -64,6 +64,10 @@ public:
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	// Newest scheduler tick at which any cached buffer overlapping this range was used, or 0 when
+	// the range is not cached at all. Lets a caller that must know the GPU has finished with a
+	// range wait for that submission instead of for everything queued.
+	[[nodiscard]] uint64_t LastUseTick(uint64_t vaddr, uint64_t size);
 	// True when ObtainBuffer() can serve this range without newly registering guest memory for
 	// write tracking: either a cached buffer already covers it, or it is small and host-resident
 	// enough for the streaming shortcut. Callers that only read a few bytes use this to stay off

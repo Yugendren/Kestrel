@@ -108,9 +108,26 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	}
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
+			// Releasing the host mapping must not leave queued work pointing at it. Only work
+			// that actually referenced this range matters, and it was all recorded at or before
+			// the last tick the caches were handed one of its buffers, so wait for that
+			// submission rather than draining everything the scheduler has queued. An image
+			// overlapping the range has no such per-range tick, so it still forces the
+			// conservative wait. Nothing can record new references meanwhile: this runs on the
+			// command-processor thread, which is the only thread that records.
+			const auto current = m_command_scheduler.CurrentTick();
+			auto       tick    = m_buffer_cache.LastUseTick(vaddr, size);
+			if (m_texture_cache.FindImageFromRange(vaddr, size, false)) {
+				tick = current;
+			}
+			if (tick != 0 && !m_command_scheduler.IsFree(tick)) {
+				if (tick == current) {
+					m_command_scheduler.Finish();
+				} else {
+					m_command_scheduler.Wait(tick);
+				}
+			}
+			m_command_scheduler.WaitPriorityOperations(tick == 0 ? current : tick);
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
