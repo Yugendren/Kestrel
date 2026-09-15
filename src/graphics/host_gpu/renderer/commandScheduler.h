@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderHazardTracker.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
@@ -59,6 +60,11 @@ public:
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
+	// Shader work whose memory dependency has not been published yet. The recorder adds every
+	// dispatch here and the scheduler emits the deferred barrier at the points where something
+	// other than another dispatch may observe those writes.
+	[[nodiscard]] ShaderHazardTracker& ShaderHazards() noexcept { return m_shader_hazards; }
+	void                               FlushShaderHazards();
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
@@ -127,6 +133,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	ShaderHazardTracker          m_shader_hazards;
 };
 
 } // namespace Libs::Graphics

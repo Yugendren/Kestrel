@@ -58,20 +58,6 @@ vk::MemoryBarrier MakeShaderWriteDependency() {
 	return barrier;
 }
 
-vk::MemoryBarrier MakeShaderAccessDependency() {
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	return barrier;
-}
-
-vk::MemoryBarrier MakeShaderWriteHazardDependency() {
-	vk::MemoryBarrier barrier {};
-	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-	return barrier;
-}
-
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 	EXIT_IF(buffer == nullptr);
 
@@ -108,25 +94,14 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	return has_writes;
 }
 
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages,
-                         bool writes_memory) {
-	EXIT_IF(vk_buffer == nullptr || !source_stages);
-	if (!writes_memory) {
-		vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
-		                          vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 0, nullptr);
-		return;
-	}
-	const auto barrier = MakeShaderAccessDependency();
-	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
-}
-
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
-                              vk::PipelineStageFlags destination_stages) {
-	EXIT_IF(vk_buffer == nullptr || !destination_stages);
-	const auto barrier = MakeShaderWriteHazardDependency();
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
-	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+void ShaderHazardBarrier(vk::CommandBuffer vk_buffer) {
+	EXIT_IF(vk_buffer == nullptr);
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlags {}, 1,
+	                          &barrier, 0, nullptr, 0, nullptr);
 }
 
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

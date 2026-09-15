@@ -463,31 +463,49 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
-	has_storage_writes =
-	    std::any_of(program.info.images.begin(), program.info.images.end(),
-	                [](const auto& image) {
-		                return image.written &&
-		                       image.resource_class ==
-		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
-	                }) ||
-	    has_storage_writes;
-	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// Classify what this dispatch touches so the scheduler can tell whether it depends on the
+	// work recorded before it. Anything the materialisation could not resolve to a guest range,
+	// and every access the host cannot reason about -- atomics, GDS, DMA, indirect arguments
+	// (see DispatchIndirect) -- is reported as unbounded and takes the conservative barrier.
+	ShaderHazardAccess reads;
+	ShaderHazardAccess writes;
+	for (uint32_t i = 0; i < bindings.buffer_sources.size(); i++) {
+		const auto& resource = program.info.buffers[i];
+		const auto& source   = bindings.buffer_sources[i];
+		auto&       access   = resource.written ? writes : reads;
+		if (resource.atomic || source.address == 0 || source.size == 0) {
+			access.everything = true;
+			continue;
+		}
+		access.buffers.emplace_back(source.address, source.size);
+	}
+	for (uint32_t i = 0; i < bindings.images.size(); i++) {
+		if (i >= program.info.images.size()) {
+			reads.everything = true;
+			break;
+		}
+		const auto& resource = program.info.images[i];
+		auto&       access   = resource.written ? writes : reads;
+		if (resource.atomic) {
+			access.everything = true;
+		}
+		access.images.push_back(bindings.images[i].image_id);
+	}
+	if (program.info.uses_dma || bindings.gds.buffer != nullptr) {
+		reads.everything  = true;
+		writes.everything = true;
+	}
+	auto& hazards = m_context.GetCommandScheduler().ShaderHazards();
+	if (hazards.NeedsBarrier(reads, writes)) {
+		ShaderHazardBarrier(vk_buffer);
+		hazards.Clear();
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
-	// Read-only dispatches need ordering, but no memory visibility operation.
-	const bool writes_memory =
-	    has_storage_writes || program.info.uses_dma || bindings.gds.buffer != nullptr ||
-	    std::any_of(program.info.buffers.begin(), program.info.buffers.end(),
-	                [](const auto& resource) { return resource.written || resource.atomic; }) ||
-	    std::any_of(program.info.images.begin(), program.info.images.end(),
-	                [](const auto& resource) { return resource.written || resource.atomic; });
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, writes_memory);
+	// The dependency this dispatch creates is published by the next item that needs it, or by
+	// the scheduler when anything else may observe it.
+	hazards.Record(reads, writes);
 	ResetBindings();
 }
 
@@ -534,13 +552,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	const bool has_storage_writes = HasShaderBufferWrites(input_info.stage) ||
-	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.written && image.resource_class ==
-		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
-	    });
-	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// The dispatch size comes out of guest memory, so this dispatch cannot be bounded: it takes
+	// the conservative barrier against pending shader work and is recorded as touching everything.
+	ShaderHazardAccess unbounded;
+	unbounded.everything = true;
+	auto& hazards        = m_context.GetCommandScheduler().ShaderHazards();
+	if (hazards.NeedsBarrier(unbounded, unbounded)) {
+		ShaderHazardBarrier(vk_buffer);
+		hazards.Clear();
 	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
@@ -552,7 +571,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// Published by the next item that needs it, or by the scheduler, as for DispatchDirect.
+	hazards.Record(unbounded, unbounded);
 	ResetBindings();
 }
 
