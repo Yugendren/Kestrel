@@ -71,6 +71,10 @@ public:
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
 	int    stream_score = 0;
+	// Scheduler tick at which this buffer was last handed to a command. Work that references it
+	// was recorded at or before that tick, so waiting for it is enough to know the buffer is no
+	// longer in use -- far less than waiting for everything the scheduler has queued.
+	uint64_t last_use_tick = 0;
 	size_t lru_id       = 0;
 
 protected:

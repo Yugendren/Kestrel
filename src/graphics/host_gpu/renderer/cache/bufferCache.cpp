@@ -109,7 +109,24 @@ void BufferCache::ChangeRegister(BufferId id) {
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		const_cast<Buffer&>(buffer).last_use_tick = m_scheduler.CurrentTick();
 	}
+}
+
+uint64_t BufferCache::LastUseTick(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	uint64_t tick = 0;
+	for (auto it = m_buffers.lower_bound(vaddr + size); it != m_buffers.begin();) {
+		--it;
+		const auto& buffer = m_slot_buffers[it->second];
+		if (it->first + buffer.Size() <= vaddr) {
+			break;
+		}
+		tick = std::max(tick, buffer.last_use_tick);
+	}
+	return tick;
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
