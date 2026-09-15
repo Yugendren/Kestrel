@@ -68,6 +68,8 @@ static void PrintUsage() {
 	         "                                       --render-scale if both are given.\n");
 	::printf("  --rt-mode <full|reduced|off>         Ray tracing fidelity. off makes every BVH\n"
 	         "                                       intersection report a miss. Default: full.\n");
+	::printf("  --post-scale <float>                 Extra scale for auxiliary post-process\n"
+	         "                                       targets (0.1-4.0). Default: 1.0.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -361,6 +363,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid rt mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--post-scale") {
+			float parsed = 0.0F;
+			if (!ParseFloat(value, parsed, 0.1F, 4.0F)) {
+				::printf("invalid post scale: %s\n", value.c_str());
+				return false;
+			}
+			options.config.graphics.post_scale = parsed;
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());

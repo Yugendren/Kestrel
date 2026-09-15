@@ -341,7 +341,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	MarkScaledNewest();
-	if (IsScaled() != source.IsScaled() && backing.samples == 1 &&
+	if (ScaleFactor() != source.ScaleFactor() && backing.samples == 1 &&
 	    source.backing.extent != backing.extent) {
 		// One side is resolution-scaled: resample instead of a same-size copy.
 		BlitScaled(source);
@@ -407,7 +407,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	        source_range.base_layer >= source.backing.layers ||
 	        destination_range.base_layer >= backing.layers);
 	MarkScaledNewest();
-	if (IsScaled() != source.IsScaled()) {
+	if (ScaleFactor() != source.ScaleFactor()) {
 		// Multisample images are never scaled, so a scaled resolve target must be resolved at
 		// its native footprint first and then upscaled over exactly the resolved subresource.
 		auto& native = GuestAlias();
@@ -478,7 +478,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	MarkScaledNewest();
-	if (IsScaled() != source.IsScaled()) {
+	if (ScaleFactor() != source.ScaleFactor()) {
 		// This is a byte-for-byte reinterpretation through a scratch buffer, so both sides must
 		// have the same footprint. Stage the scaled side at its native resolution.
 		if (source.IsScaled()) {
@@ -592,7 +592,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 	const auto aspects                             = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
-	if (IsScaled() != source.IsScaled() && backing.image_type == vk::ImageType::e2D &&
+	if (ScaleFactor() != source.ScaleFactor() && backing.image_type == vk::ImageType::e2D &&
 	    source.backing.image_type == vk::ImageType::e2D) {
 		// Scaled images are single-level, so only one side can carry a mip chain here.
 		EXIT_IF(source.backing.mip_levels != 1 && backing.mip_levels != 1);
@@ -794,7 +794,7 @@ Image& Image::GuestAlias() {
 	}
 	if (!m_guest_alias) {
 		ImageInfo alias        = info;
-		alias.scaled           = false;
+		alias.scale            = 1.0F;
 		alias.data             = {};
 		alias.stencil          = {};
 		alias.metadata         = {};

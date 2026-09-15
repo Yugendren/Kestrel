@@ -258,7 +258,50 @@ constexpr uint32_t SCALE_MIN_EDGE = 64;
 	return (features & required) == required;
 }
 
+// Fidelity class of a render-target-class image. The class follows from the image itself, so a
+// guest range is classified the same way on every lookup and a live image never has to be
+// rebuilt because its classification moved.
+//
+//   Primary    the scene targets and the scanout surface: the video-out image, any colour
+//              target at least as large as the guest display, and the depth target that
+//              matches the display, which is the scene depth buffer.
+//   Auxiliary  a colour target smaller than the guest display. The game itself chose to run
+//              that buffer below display resolution - the bloom/downsample chain, half
+//              resolution effect buffers, composite scratch - so --post-scale reduces it
+//              further.
+enum class FidelityClass { Primary, Auxiliary };
+
+[[nodiscard]] FidelityClass ClassifyImage(const ImageInfo& info, TextureCache::BindingType binding,
+                                          vk::Extent2D display) {
+	// Before the first video-out image the display extent is unknown. Classify everything as
+	// primary rather than guess a lower fidelity for a target that may be the scene itself.
+	if (display.width == 0 || display.height == 0) {
+		return FidelityClass::Primary;
+	}
+	const bool smaller = info.extent.width < display.width || info.extent.height < display.height;
+	return binding == TextureCache::BindingType::RenderTarget && smaller ? FidelityClass::Auxiliary
+	                                                                     : FidelityClass::Primary;
+}
+
 } // namespace
+
+// Host allocation factor for one image. Every fidelity setting beyond the base render scale is
+// resolved here, so the rest of the renderer only ever sees ImageInfo::scale. A class can only
+// lower the factor the base render scale would have produced, never raise it beyond it.
+float TextureCache::ResolveImageScale(const ImageInfo& info, BindingType binding) const {
+	if (!ShouldScaleImage(m_graphics, info, binding)) {
+		return 1.0F;
+	}
+	const float base = RenderScale::Factor();
+	switch (ClassifyImage(info, binding, m_display_extent)) {
+		case FidelityClass::Auxiliary: {
+			const float post = Config::GetPostScale();
+			return post == 1.0F ? base : base * post;
+		}
+		case FidelityClass::Primary: break;
+	}
+	return base;
+}
 
 TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	if (image.info.IsDepth()) {
@@ -854,7 +897,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (m_scale_denied.contains(info.data.address)) {
-		info.scaled = false;
+		info.scale = 1.0F;
 	}
 	if (retain_cached_layout) {
 		info.data       = cached.info.data;
@@ -1464,8 +1507,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	{
 		std::scoped_lock lock {m_lock};
 		if (RenderScale::Enabled()) {
-			desc.info.scaled = ShouldScaleImage(m_graphics, desc.info, desc.type) &&
-			                   !m_scale_denied.contains(desc.info.data.address);
+			if (desc.type == BindingType::VideoOut) {
+				// The guest display extent anchors the fidelity classes. Learn it from the
+				// scanout surface and only ever grow it, so the class of a range is stable
+				// once the display is up.
+				const auto& guest       = desc.info.extent;
+				m_display_extent.width  = std::max(m_display_extent.width, guest.width);
+				m_display_extent.height = std::max(m_display_extent.height, guest.height);
+			}
+			desc.info.scale = m_scale_denied.contains(desc.info.data.address)
+			                      ? 1.0F
+			                      : ResolveImageScale(desc.info, desc.type);
 		}
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
@@ -1551,7 +1603,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		auto& bound = m_slot_images[result];
 		// The lookup may have matched, recreated or twinned an image with a different scale
 		// decision; the caller sizes its attachments from desc.info, so report what it got.
-		desc.info.scaled         = bound.info.scaled;
+		desc.info.scale           = bound.info.scale;
 		// Report the decision the range ended up with rather than the one the binding asked
 		// for: a lookup can deny a scale the request wanted, or hand back a native twin.
 		if (ReportImageScale(bound.info, desc.type)) {
@@ -1620,8 +1672,8 @@ ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
 		}
 		if (!CanTwinScale(image.info)) {
 			m_scale_denied.insert(image.info.data.address);
-			auto native   = image.info;
-			native.scaled = false;
+			auto native  = image.info;
+			native.scale = 1.0F;
 			return ExpandImage(native, id);
 		}
 		return AcquireScaleTwin(id);
@@ -1635,8 +1687,8 @@ ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
 	    !ShouldScaleImage(m_graphics, image.info, desc.type)) {
 		return id;
 	}
-	auto scaled   = image.info;
-	scaled.scaled = true;
+	auto scaled  = image.info;
+	scaled.scale = ResolveImageScale(image.info, desc.type);
 	return ExpandImage(scaled, id);
 }
 
@@ -1648,7 +1700,7 @@ ImageId TextureCache::AcquireScaleTwin(ImageId owner_id) {
 		// lookups, invalidation and the garbage collector must keep seeing exactly one image
 		// there. Everything that reaches the twin reaches it through the owner.
 		auto info             = owner.info;
-		info.scaled           = false;
+		info.scale            = 1.0F;
 		info.data             = {};
 		info.stencil          = {};
 		info.metadata         = {};
@@ -1742,8 +1794,8 @@ ImageId TextureCache::DenyImageScale(ImageId id) {
 	if (!image.info.IsScaled()) {
 		return id;
 	}
-	auto native   = image.info;
-	native.scaled = false;
+	auto native  = image.info;
+	native.scale = 1.0F;
 	return ExpandImage(native, id);
 }
 

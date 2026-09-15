@@ -72,21 +72,26 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
-	// Internal render-resolution scaling: the host allocation is Factor()-times the guest
-	// extent. Guest-visible geometry (extent, pitch, data, mip_layout) always stays native.
-	bool                         scaled          = false;
+	// Internal render-resolution scaling: the host allocation is scale times the guest extent.
+	// Guest-visible geometry (extent, pitch, data, mip_layout) always stays native. A factor of
+	// 1.0 means the image is allocated exactly at its guest footprint. The factor is chosen per
+	// image when it is first classified and never changes for a live image.
+	float                        scale           = 1.0F;
 	std::array<ImageMipInfo, 16> mip_layout {};
 
-	[[nodiscard]] bool IsScaled() const noexcept { return scaled && RenderScale::Enabled(); }
+	[[nodiscard]] float ScaleFactor() const noexcept { return scale; }
+	// A factor other than 1.0 is only ever assigned while scaling is enabled, so there is no
+	// need to separately check RenderScale::Enabled() here.
+	[[nodiscard]] bool  IsScaled() const noexcept { return scale != 1.0F; }
 	// Host allocation extent. Array/volume depth is never scaled.
 	[[nodiscard]] vk::Extent3D HostExtent() const noexcept {
-		return IsScaled() ? RenderScale::Apply(extent) : extent;
+		return RenderScale::Apply(extent, scale);
 	}
 	// Host extent of one mip level as a 2D attachment size.
 	[[nodiscard]] vk::Extent2D HostExtent2D(uint32_t level = 0) const noexcept {
 		const vk::Extent2D guest {std::max(extent.width >> level, 1u),
 		                          std::max(extent.height >> level, 1u)};
-		return IsScaled() ? RenderScale::Apply(guest) : guest;
+		return RenderScale::Apply(guest, scale);
 	}
 
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }

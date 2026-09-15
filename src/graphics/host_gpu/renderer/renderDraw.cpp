@@ -325,8 +325,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	// Guest-space framebuffer size: guest scissor rectangles are clamped against it, and the
 	// result is converted to host space afterwards.
 	const vk::Extent2D framebuffer_extent {rendering.guest_width, rendering.guest_height};
-	const bool         scaled_targets = rendering.scaled;
-	const RenderScale::Mapping mapping {scaled_targets};
+	const RenderScale::Mapping mapping {rendering.scale};
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
 	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
@@ -535,7 +534,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		state.guest_width       = std::min(state.guest_width, guest_extent.width);
 		state.guest_height      = std::min(state.guest_height, guest_extent.height);
 		if (i == 0) {
-			state.scaled = target.IsScaled();
+			state.scale = target.ScaleFactor();
 		}
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
@@ -637,7 +636,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		state.guest_width         = std::min(state.guest_width, depth.GuestExtent().width);
 		state.guest_height        = std::min(state.guest_height, depth.GuestExtent().height);
 		if (color_count == 0) {
-			state.scaled = depth.IsScaled();
+			state.scale = depth.ScaleFactor();
 		}
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
@@ -1006,28 +1005,37 @@ void RenderExecutor::UnifyRenderTargetScale(CommandBuffer& buffer, DrawRenderSta
 	if (!RenderScale::Enabled()) {
 		return;
 	}
-	bool any_scaled = false;
-	bool any_native = false;
+	bool  mixed         = false;
+	bool  have_factor   = false;
+	float common_factor = 1.0F;
+	const auto observe = [&](float factor) {
+		if (!have_factor) {
+			have_factor   = true;
+			common_factor = factor;
+		} else if (factor != common_factor) {
+			mixed = true;
+		}
+	};
 	for (uint32_t i = 0; i < state.color_count; i++) {
-		(state.color_info[i].IsScaled() ? any_scaled : any_native) = true;
+		observe(state.color_info[i].ScaleFactor());
 	}
 	if (state.depth_info.image_id) {
-		(state.depth_info.IsScaled() ? any_scaled : any_native) = true;
+		observe(state.depth_info.ScaleFactor());
 	}
-	if (!any_scaled || !any_native) {
+	if (!mixed) {
 		return;
 	}
 	auto& cache = buffer.GetContext().GetTextureCache();
 	for (uint32_t i = 0; i < state.color_count; i++) {
 		auto& target = state.color_info[i];
 		if (target.image_id) {
-			target.image_id         = cache.DenyImageScale(target.image_id);
-			target.desc.info.scaled = false;
+			target.image_id        = cache.DenyImageScale(target.image_id);
+			target.desc.info.scale = 1.0F;
 		}
 	}
 	if (state.depth_info.image_id) {
-		state.depth_info.image_id         = cache.DenyImageScale(state.depth_info.image_id);
-		state.depth_info.desc.info.scaled = false;
+		state.depth_info.image_id        = cache.DenyImageScale(state.depth_info.image_id);
+		state.depth_info.desc.info.scale = 1.0F;
 	}
 }
 
