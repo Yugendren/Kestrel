@@ -602,6 +602,10 @@ struct Program: ResourcePlan {
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
+	// Mirrors CompileOptions::bvh_always_miss (--rt-mode off).
+	bool                          bvh_always_miss = false;
+	// Mirrors CompileOptions::bvh_reduced (--rt-mode reduced).
+	bool                          bvh_reduced = false;
 
 };
 

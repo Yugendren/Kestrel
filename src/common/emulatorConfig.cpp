@@ -73,11 +73,15 @@ uint32_t GetVblankFrequency() {
 }
 
 float GetRenderScale() {
-	const float scale = g_config->render_scale;
+	const float scale = g_config->graphics.render_scale;
 	if (!std::isfinite(scale)) {
 		return 1.0F;
 	}
 	return std::clamp(scale, 0.1F, 4.0F);
+}
+
+RtMode GetRtMode() {
+	return g_config->graphics.rt_mode;
 }
 
 uint32_t GetConsoleLanguage() {

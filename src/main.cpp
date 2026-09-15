@@ -66,6 +66,8 @@ static void PrintUsage() {
 	::printf("  --internal-resolution <value>        Internal resolution preset: native, 2160p,\n"
 	         "                                       1440p, 1080p, 720p, 540p. Overridden by\n"
 	         "                                       --render-scale if both are given.\n");
+	::printf("  --rt-mode <full|reduced|off>         Ray tracing fidelity. off makes every BVH\n"
+	         "                                       intersection report a miss. Default: full.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -182,6 +184,27 @@ static bool ParseInternalResolution(const std::string& value, float& out) {
 	for (const auto& preset: PRESETS) {
 		if (Common::EqualNoCase(value, preset.name)) {
 			out = preset.scale;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool ParseRtMode(const std::string& value, Config::RtMode& out) {
+	struct Mode {
+		const char*    name;
+		Config::RtMode mode;
+	};
+	static constexpr Mode MODES[] = {
+	    {"full", Config::RtMode::Full},
+	    {"reduced", Config::RtMode::Reduced},
+	    {"off", Config::RtMode::Off},
+	};
+
+	for (const auto& mode: MODES) {
+		if (Common::EqualNoCase(value, mode.name)) {
+			out = mode.mode;
 			return true;
 		}
 	}
@@ -325,14 +348,19 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid render scale: %s\n", value.c_str());
 				return false;
 			}
-			options.config.render_scale = parsed;
+			options.config.graphics.render_scale = parsed;
 		} else if (arg == "--internal-resolution") {
 			float mapped = 0.0F;
 			if (!ParseInternalResolution(value, mapped)) {
 				::printf("invalid internal resolution: %s\n", value.c_str());
 				return false;
 			}
-			options.config.render_scale = mapped;
+			options.config.graphics.render_scale = mapped;
+		} else if (arg == "--rt-mode") {
+			if (!ParseRtMode(value, options.config.graphics.rt_mode)) {
+				::printf("invalid rt mode: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
