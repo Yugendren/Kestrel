@@ -113,6 +113,10 @@ private:
 	};
 	static constexpr uint64_t READBACK_WINDOW_SIZE   = 512 * 1024;
 	static constexpr uint64_t READBACK_WINDOW_BUDGET = 4 * 1024 * 1024;
+	// A download is recorded per submission for every hot window, so the pending set grows
+	// whenever the GPU falls behind the command processor. Nothing needs it settled promptly;
+	// this bound only keeps the bookkeeping, and the linear scans over it, from growing.
+	static constexpr size_t   MAX_PENDING_DOWNLOADS  = 64;
 
 	// A download recorded before the guest asked for it. Between recording and retirement the
 	// bytes are in flight: the range has left m_gpu_modified_ranges, but the tracker still marks
@@ -135,7 +139,9 @@ private:
 	// and publishes every download that has completed since.
 	void ResolvePendingDownloads(uint64_t vaddr, uint64_t size);
 	void RetireCompletedDownloads();
-	void FinishPendingDownloads();
+	// Settles the oldest downloads when too many are outstanding. Never waits for the newest
+	// submission: that is the one the command processor has just recorded.
+	void BoundPendingDownloads();
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);

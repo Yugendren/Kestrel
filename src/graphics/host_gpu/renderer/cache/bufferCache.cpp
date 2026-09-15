@@ -354,17 +354,20 @@ void BufferCache::ResolvePendingDownloads(uint64_t vaddr, uint64_t size) {
 	RetireCompletedDownloads();
 }
 
-void BufferCache::FinishPendingDownloads() {
-	if (m_pending_downloads.empty()) {
-		return;
+void BufferCache::BoundPendingDownloads() {
+	while (m_pending_downloads.size() > MAX_PENDING_DOWNLOADS) {
+		uint64_t oldest = m_pending_downloads.front().tick;
+		for (const auto& pending: m_pending_downloads) {
+			oldest = std::min(oldest, pending.tick);
+		}
+		m_scheduler.Wait(oldest);
+		m_scheduler.WaitPriorityOperations(oldest);
+		const auto outstanding = m_pending_downloads.size();
+		RetireCompletedDownloads();
+		// Everything recorded at or before the tick just waited for has completed, and at least
+		// one entry carried it, so the set always shrinks and this cannot spin.
+		EXIT_IF(m_pending_downloads.size() >= outstanding);
 	}
-	uint64_t newest = 0;
-	for (const auto& pending: m_pending_downloads) {
-		newest = std::max(newest, pending.tick);
-	}
-	m_scheduler.Wait(newest);
-	m_scheduler.WaitPriorityOperations(newest);
-	RetireCompletedDownloads();
 }
 
 void BufferCache::RecordPendingReadbacks() {
@@ -752,9 +755,16 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
-	// The collector inspects GPU-dirty ownership buffer by buffer, so no download may still be in
-	// flight with its bytes unpublished.
-	FinishPendingDownloads();
+	// Publish the downloads the GPU has already finished, and never wait for the rest: collecting
+	// buffers is housekeeping, and draining the queue for it serialises the command processor
+	// against the GPU once per frame. An unpublished download leaves its range out of
+	// m_gpu_modified_ranges while the tracker still marks its pages, so the ownership check below
+	// cannot interpret those buffers; the walk skips them until a later pass finds them settled.
+	// Nothing observes stale bytes meanwhile: HasGpuDirtyBytes() reports an in-flight range as
+	// dirty, and a guest read of one goes through ResolvePendingDownloads(), which waits for
+	// exactly the submission that produced it.
+	RetireCompletedDownloads();
+	BoundPendingDownloads();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -772,6 +782,12 @@ void BufferCache::RunGarbageCollector() {
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (HasPendingDownload(buffer.CpuAddress(), buffer.Size())) {
+			// Its bytes are already on their way to the guest mapping and its dirty-page
+			// bookkeeping is mid-transfer, so neither the ownership check nor a second download
+			// would mean anything yet.
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
