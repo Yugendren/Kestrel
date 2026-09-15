@@ -18,6 +18,14 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	// --rt-mode off: every IMAGE_BVH_INTERSECT_RAY reports a miss, so RT-dependent passes take
+	// their no-hit branch. Not title-gated; Config is immutable after startup, so a program
+	// compiled under one value is never reused under another.
+	bool                        bvh_always_miss            = false;
+	// --rt-mode reduced: an intersected box node reports only its nearest child, so the guest's
+	// traversal loop descends one branch per node instead of up to four. Independent of
+	// bvh_always_miss, which removes the traversal entirely.
+	bool                        bvh_reduced                = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

@@ -13,6 +13,7 @@
 // plus LoadAddressU32 already give per-lane 64-bit addressed reads, so a node fetch is sixteen
 // loads and everything after it is plain arithmetic the existing backend lowers.
 
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 namespace {
@@ -154,6 +155,16 @@ void Translator::BvhSortHits(BvhHit hits[4]) {
 }
 
 bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	// --rt-mode off. Reporting a miss is the hardware's own no-hit encoding, so the shader's
+	// existing miss branch runs unmodified; emitting it here also removes every node fetch this
+	// instruction would otherwise perform.
+	if (program.bvh_always_miss) {
+		for (uint32_t component = 0; component < 4u; component++) {
+			WriteOperand(OffsetOperand(inst.dst, component), IR::U32(IR::Value(BvhInvalidNode)));
+		}
+		return true;
+	}
+
 	const bool wide = inst.opcode == Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY;
 	const auto u    = [&](uint32_t value) { return IR::U32(IR::Value(value)); };
 
@@ -265,10 +276,15 @@ bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
 	// keeps traversal terminating rather than following an undecoded leaf.
 	const auto is_box = IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThan32, {kind, IR::Value(1u)}));
 	const auto miss   = IR::U32(IR::Value(BvhInvalidNode));
+	// --rt-mode reduced keeps only the nearest intersected child; BvhSortHits has already
+	// ordered them by distance, so reporting a miss for the other three leaves the guest with a
+	// single branch to descend per node. That cuts the node fetches its traversal loop issues,
+	// at the cost of the geometry only the discarded branches would have reached.
+	const uint32_t kept = program.bvh_reduced ? 1u : 4u;
 	// DMASK is always 0xf here, so the four results land in consecutive destination registers.
 	for (uint32_t component = 0; component < 4u; component++) {
 		WriteOperand(OffsetOperand(inst.dst, component),
-		             ir.Select(is_box, hits[component].child, miss));
+		             component < kept ? ir.Select(is_box, hits[component].child, miss) : miss);
 	}
 	return true;
 }

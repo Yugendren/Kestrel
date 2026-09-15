@@ -38,6 +38,18 @@ constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 	return user_id >= 0 && user_id != USER_ID_EVERYONE && user_id != USER_ID_SYSTEM;
 }
 
+// Ray-tracing fidelity. Full runs the recompiled BVH traversal as the guest wrote it; Reduced
+// keeps the traversal but lets the renderer run BVH-consuming work at a lower scale; Off makes
+// every BVH intersection report a miss so RT-dependent passes take their no-hit branch.
+enum class RtMode { Full, Reduced, Off };
+
+// Host-side graphics fidelity knobs. Every default reproduces the guest's intent exactly, so a
+// default-constructed GraphicsSettings leaves every code path unchanged.
+struct GraphicsSettings {
+	float  render_scale = 1.0F;
+	RtMode rt_mode      = RtMode::Full;
+};
+
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
@@ -47,7 +59,7 @@ struct ConfigOptions {
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
-	float                  render_scale                = 1.0F;
+	GraphicsSettings       graphics;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -86,6 +98,7 @@ int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
 float GetRenderScale();
+RtMode GetRtMode();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 

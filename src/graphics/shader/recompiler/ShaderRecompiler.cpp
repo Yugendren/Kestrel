@@ -626,6 +626,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .user_data_base      = options.user_data_base,
 	    .user_data_count     = static_cast<uint32_t>(options.user_data.size()),
 	    .dispatcher_fallback = dispatcher_fallback,
+	    .bvh_always_miss     = options.bvh_always_miss,
+	    .bvh_reduced         = options.bvh_reduced,
 	    .cfg_failure_kind    = cfg.failure_kind,
 	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
 	                                                    : dispatcher_reason,
