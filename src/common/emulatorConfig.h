@@ -51,8 +51,10 @@ struct GraphicsSettings {
 
 	// Per-pass fidelity. post_scale multiplies the render scale of auxiliary colour targets
 	// (the reduced-resolution buffers a game allocates for its post chain); 1.0 leaves them at
-	// the base render scale.
+	// the base render scale. shadow_max caps the longest host edge of an off-screen depth
+	// target in pixels; 0 means no cap.
 	float    post_scale     = 1.0F;
+	uint32_t shadow_max     = 0;
 };
 
 struct ConfigOptions {
@@ -105,6 +107,7 @@ uint32_t GetVblankFrequency();
 float GetRenderScale();
 RtMode GetRtMode();
 float    GetPostScale();
+uint32_t GetShadowMax();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 

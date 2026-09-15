@@ -21,7 +21,7 @@ namespace Libs::Graphics::RenderScale {
 // after startup.
 [[nodiscard]] inline bool Enabled() {
 	static const bool enabled =
-	    Factor() != 1.0F || Config::GetPostScale() != 1.0F;
+	    Factor() != 1.0F || Config::GetPostScale() != 1.0F || Config::GetShadowMax() != 0;
 	return enabled;
 }
 
