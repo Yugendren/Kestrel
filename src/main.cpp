@@ -72,6 +72,8 @@ static void PrintUsage() {
 	         "                                       targets (0.1-4.0). Default: 1.0.\n");
 	::printf("  --shadow-max <pixels>                Cap the longest host edge of off-screen\n"
 	         "                                       depth targets. 0 = no cap. Default: 0.\n");
+	::printf("  --frame-cap <fps>                    Cap presented frames per second without\n"
+	         "                                       changing guest vblank. 0 = off. Default: 0.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
@@ -248,6 +250,21 @@ static bool ParseShadowMax(const std::string& value, uint32_t& out) {
 	return true;
 }
 
+static bool ParseFrameCap(const std::string& value, uint32_t& out) {
+	uint32_t    frame_cap = 0;
+	auto [end, error]     = std::from_chars(value.data(), value.data() + value.size(), frame_cap);
+	if (error != std::errc {} || end != value.data() + value.size()) {
+		return false;
+	}
+
+	if (frame_cap > 480) {
+		return false;
+	}
+
+	out = frame_cap;
+	return true;
+}
+
 static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
 	show_help = false;
 
@@ -396,6 +413,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--shadow-max") {
 			if (!ParseShadowMax(value, options.config.graphics.shadow_max)) {
 				::printf("invalid shadow max: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--frame-cap") {
+			if (!ParseFrameCap(value, options.config.graphics.frame_cap)) {
+				::printf("invalid frame cap: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--console-language") {

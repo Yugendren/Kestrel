@@ -98,6 +98,11 @@ uint32_t GetShadowMax() {
 	return cap == 0 ? 0 : std::clamp(cap, 64u, 16384u);
 }
 
+uint32_t GetFrameCap() {
+	const uint32_t cap = g_config->graphics.frame_cap;
+	return cap == 0 ? 0 : std::clamp(cap, 1u, 480u);
+}
+
 uint32_t GetConsoleLanguage() {
 	return g_config->console_language;
 }

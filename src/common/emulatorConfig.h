@@ -61,6 +61,10 @@ struct GraphicsSettings {
 	// target in pixels; 0 means no cap.
 	float    post_scale     = 1.0F;
 	uint32_t shadow_max     = 0;
+
+	// Host frame pacing. 0 presents on every vblank. Any other value is the maximum number of
+	// flips per second; guest-visible vblank timing is unaffected.
+	uint32_t frame_cap      = 0;
 };
 
 struct ConfigOptions {
@@ -116,6 +120,7 @@ uint32_t GetMaxAnisotropy();
 float    GetLodBias();
 float    GetPostScale();
 uint32_t GetShadowMax();
+uint32_t GetFrameCap();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 

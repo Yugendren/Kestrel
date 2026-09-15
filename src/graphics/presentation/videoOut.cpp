@@ -780,6 +780,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	EXIT_IF(frequency == 0);
 
 	int64_t total_wait = 0;
+	// Timestamp of the last vblank on which a flip was allowed. 0 lets the first vblank flip.
+	uint64_t last_flip = 0;
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
@@ -797,6 +799,19 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
 		const auto period  = std::max(frequency / refresh, uint64_t {1});
 
+		// --frame-cap paces the flip queue without touching guest-visible timing. The vblank
+		// counters, the vblank events and the reported refresh rate all stay on
+		// --vblank-frequency, which the guest observes; only the rate at which queued flips are
+		// consumed is capped, so a title that waits for flip completion throttles itself to the
+		// cap instead of rendering frames that are never shown. A cap at or above the vblank
+		// frequency cannot pace anything and is ignored.
+		const auto frame_cap  = Config::GetFrameCap();
+		bool       allow_flip = true;
+		if (frame_cap != 0 && frame_cap < refresh) {
+			const auto flip_period = std::max(frequency / frame_cap, uint64_t {1});
+			allow_flip = frame_begin - last_flip >= flip_period;
+		}
+
 		if (m_presenter.IsGuestPaused()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
@@ -808,8 +823,12 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 
 		VblankBegin();
-		bool presented = m_flip_queue.Flip(0);
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+		bool presented = false;
+		if (allow_flip) {
+			last_flip = frame_begin;
+			presented = m_flip_queue.Flip(0);
+		}
+		if (allow_flip && !presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
 				presented = true;
@@ -826,7 +845,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				presented = true;
 			}
 		}
-		if (!presented && total_wait < 0) {
+		if (allow_flip && !presented && total_wait < 0) {
 			bool     any_open = false;
 			uint32_t width    = 0;
 			uint32_t height   = 0;
