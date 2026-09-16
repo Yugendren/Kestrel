@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -799,6 +800,7 @@ Image& Image::GuestAlias() {
 		alias.metadata         = {};
 		alias.htile_clear_mask = UINT32_MAX;
 		m_guest_alias          = std::make_unique<Image>(m_graphics, m_scheduler, alias);
+		m_guest_alias->SetResampler(m_resampler);
 	}
 	return *m_guest_alias;
 }
@@ -817,6 +819,12 @@ void Image::BlitScaled(Image& source, const ImageSubresourceRange& source_range,
 	        destination_range.base_layer + destination_range.layer_count > backing.layers);
 	const auto aspects = FullAspectMask(backing.format);
 	EXIT_IF(aspects != FullAspectMask(source.backing.format));
+	if (m_resampler != nullptr && m_resampler->CanResampleDepth(info)) {
+		// A depth surface cannot be moved between resolutions by a transfer here -- the formats
+		// a render target uses are not blittable -- so it is redrawn instead.
+		m_resampler->ResampleDepth(source, *this, source_range, destination_range);
+		return;
+	}
 	m_scheduler.EndRendering();
 
 	// Depth/stencil blits are nearest-only; colour is filtered so downscales average.

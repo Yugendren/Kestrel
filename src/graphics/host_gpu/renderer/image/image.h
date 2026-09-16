@@ -17,6 +17,7 @@
 
 namespace Libs::Graphics {
 
+class BlitHelper;
 class Buffer;
 class CommandScheduler;
 struct ImageTestAccess;
@@ -65,6 +66,10 @@ public:
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
+	// The transfer that resamples this image is not usable for depth/stencil surfaces, so the
+	// cache hands every image the helper that redraws them instead. Set once, at creation.
+	void SetResampler(BlitHelper* resampler) noexcept { m_resampler = resampler; }
+
 	// Resamples a compatible image across a resolution-scale difference. The subresource
 	// ranges select matching source and destination levels/layers; the whole-image overload
 	// covers every level and layer the two images have in common.
@@ -204,6 +209,7 @@ private:
 	[[nodiscard]] Image& GuestAlias();
 
 	std::unique_ptr<Image> m_guest_alias;
+	BlitHelper*            m_resampler = nullptr;
 	// Borrowed from the texture cache, which owns the twin's slot and frees it with this image.
 	Image*            m_scale_twin = nullptr;
 	ImageId           m_scale_twin_id {};
