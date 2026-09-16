@@ -85,6 +85,11 @@ public:
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 
+	// Bumped whenever an image is created, destroyed, (un)registered or flagged for rebind, i.e.
+	// whenever a descriptor that resolved to some image on an earlier draw could now resolve
+	// somewhere else. A caller that cached a resolution only has to compare this.
+	[[nodiscard]] uint64_t Generation() const { return m_generation; }
+
 private:
 	enum class TransferDirection { Upload, Download };
 	struct TextureTransfer;
@@ -232,6 +237,9 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// See Generation(). Starts at 1 so a default-constructed cached value of 0 always compares
+	// as stale.
+	uint64_t         m_generation             = 1;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
