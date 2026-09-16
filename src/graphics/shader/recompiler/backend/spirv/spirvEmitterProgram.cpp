@@ -802,20 +802,6 @@ void EmitProgram(EmitterState& state) {
 			break;
 		}
 	}
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			if (inst.GetOpcode() != IR::ValueOpcode::IndexedVectorLoad || inst.NumArgs() < 2) {
-				continue;
-			}
-			const auto count = static_cast<uint32_t>(inst.NumArgs() - 1u);
-			ctx.indexed_vector_arrays.emplace(&inst,
-			                                  std::pair {state.builder.AllocateId(), count});
-			if (state.lane_count == 2) {
-				high.indexed_vector_arrays.emplace(
-				    &inst, std::pair {state.builder.AllocateId(), count});
-			}
-		}
-	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
@@ -862,11 +848,6 @@ void EmitProgram(EmitterState& state) {
 			state.builder.AddFunction(spv::OpVariable,
 			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
-		}
-		for (const auto& [inst, entry]: lane.indexed_vector_arrays) {
-			(void)inst;
-			state.builder.AddFunction(spv::OpVariable, TypeU32ArrayPointer(state, spv::StorageClassFunction, entry.second),
-			     entry.first, spv::StorageClassFunction);
 		}
 	}
 	if (state.gds_variable != 0) {

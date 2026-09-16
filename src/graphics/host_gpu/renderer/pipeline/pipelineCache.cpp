@@ -399,11 +399,6 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
-		static const bool kLowerWideMovrels = [] {
-			std::string id;
-			return Loader::SystemContentParamSfoGetString("TITLE_ID", &id) && id == "PPSA21564";
-		}();
-		options.lower_wide_movrels = kLowerWideMovrels;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 

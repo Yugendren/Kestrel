@@ -28,7 +28,6 @@ struct TranslateOptions {
 	uint32_t                      user_data_base      = 0;
 	uint32_t                      user_data_count     = 64;
 	bool                          dispatcher_fallback = false;
-	bool                          lower_wide_movrels  = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string_view              fallback_reason;
 	ShaderStageInputInfo          input_info;
