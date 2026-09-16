@@ -221,6 +221,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
+	MarkScaledNewest();
 	if (IsScaled()) {
 		// The guest-memory layout describes native-resolution texels; stage and upscale.
 		auto& alias = GuestAlias();
@@ -269,9 +270,13 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
                      uint64_t offset, uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	if (IsScaled()) {
-		// Guest memory must receive native-resolution texels.
+		// Guest memory must receive native-resolution texels. When a compute shader wrote the
+		// twin last it already holds them, and resampling back through the scaled half would
+		// both cost a blit and lose detail the guest is entitled to see.
 		auto& alias = GuestAlias();
-		alias.BlitScaled(*this);
+		if (!m_twin_newest) {
+			alias.BlitScaled(*this);
+		}
 		alias.Download(copies, buffer, offset, size);
 		return;
 	}
@@ -334,6 +339,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
+	MarkScaledNewest();
 	if (IsScaled() != source.IsScaled() && backing.samples == 1 &&
 	    source.backing.extent != backing.extent) {
 		// One side is resolution-scaled: resample instead of a same-size copy.
@@ -399,6 +405,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	        destination_range.base_level >= backing.mip_levels ||
 	        source_range.base_layer >= source.backing.layers ||
 	        destination_range.base_layer >= backing.layers);
+	MarkScaledNewest();
 	if (IsScaled() != source.IsScaled()) {
 		// Multisample images are never scaled, so a scaled resolve target must be resolved at
 		// its native footprint first and then upscaled over exactly the resolved subresource.
@@ -469,6 +476,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
+	MarkScaledNewest();
 	if (IsScaled() != source.IsScaled()) {
 		// This is a byte-for-byte reinterpretation through a scratch buffer, so both sides must
 		// have the same footprint. Stage the scaled side at its native resolution.
@@ -575,6 +583,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
+	MarkScaledNewest();
 	m_scheduler.EndRendering();
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);
@@ -747,7 +756,25 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 }
 
+void Image::AdoptScaleTwin(Image& twin, ImageId twin_id) {
+	EXIT_IF(!IsScaled() || twin.IsScaled() || !twin_id || m_scale_twin != nullptr);
+	m_scale_twin    = &twin;
+	m_scale_twin_id = twin_id;
+	// The twin is a native-resolution copy of this range, which is exactly what a staging alias
+	// is; keeping both would double the memory cost of every storage-bound target.
+	m_guest_alias.reset();
+}
+
+void Image::DropScaleTwin() noexcept {
+	m_scale_twin    = nullptr;
+	m_scale_twin_id = {};
+	m_twin_newest   = false;
+}
+
 Image& Image::GuestAlias() {
+	if (m_scale_twin != nullptr) {
+		return *m_scale_twin;
+	}
 	if (!m_guest_alias) {
 		ImageInfo alias        = info;
 		alias.scaled           = false;

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <set>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -163,6 +164,16 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	// Internal resolution scaling: see ResolveScaleBinding for how the two halves of a scaled
+	// range divide the work between rasterisation and compute.
+	[[nodiscard]] bool        ReportImageScale(const ImageInfo& info, BindingType binding);
+	[[nodiscard]] static bool CanTwinScale(const ImageInfo& info);
+	[[nodiscard]] ImageId     ResolveScaleBinding(const ImageDesc& desc, ImageId id);
+	[[nodiscard]] ImageId     AcquireScaleTwin(ImageId owner_id);
+	void                      PrepareScaleTwinBinding(ImageId owner_id, const ImageDesc& desc);
+	void                      SyncTwinContents(ImageId owner_id);
+	void                      SyncScaledContents(ImageId owner_id);
+	void                      FreeScaleTwin(Image& owner);
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
 	void                        InitializeImage(ImageId id);
@@ -202,8 +213,12 @@ private:
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
-	// Guest addresses whose images must stay at native resolution (storage-bound targets).
+	// Guest addresses whose images must stay at native resolution: a render pass mixed scaled
+	// and native attachments, or compute bound a range that cannot carry a native twin.
 	std::unordered_set<uint64_t>                      m_scale_denied;
+	// One scaling report per guest range and binding class, so the log describes the policy
+	// and not the traffic.
+	std::set<std::pair<uint64_t, BindingType>>        m_scale_logged;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

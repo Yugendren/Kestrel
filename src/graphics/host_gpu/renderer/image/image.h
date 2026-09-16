@@ -152,6 +152,23 @@ public:
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 	[[nodiscard]] bool     IsScaled() const noexcept { return info.IsScaled(); }
 
+	// Internal resolution scaling pairs a scaled image with one native-resolution companion, the
+	// scale twin. Compute shaders address storage images in absolute guest texels, so a storage
+	// binding of this range is served by the twin while rasterisation keeps the scaled image.
+	// The twin doubles as the staging alias for guest-memory transfers, so a range never carries
+	// two native allocations.
+	void                  AdoptScaleTwin(Image& twin, ImageId twin_id);
+	void                  DropScaleTwin() noexcept;
+	[[nodiscard]] ImageId ScaleTwinId() const noexcept { return m_scale_twin_id; }
+	// Set on the twin itself; empty on every other image.
+	[[nodiscard]] ImageId ScaleTwinOwner() const noexcept { return m_scale_twin_owner; }
+	void SetScaleTwinOwner(ImageId owner) noexcept { m_scale_twin_owner = owner; }
+	// Which half of the pair holds the newest contents. Only the two halves can be out of date
+	// with respect to each other; guest memory is tracked by the existing dirty flags.
+	[[nodiscard]] bool IsTwinNewest() const noexcept { return m_twin_newest; }
+	void               MarkTwinNewest() noexcept { m_twin_newest = true; }
+	void               MarkScaledNewest() noexcept { m_twin_newest = false; }
+
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
@@ -178,6 +195,11 @@ private:
 	[[nodiscard]] Image& GuestAlias();
 
 	std::unique_ptr<Image> m_guest_alias;
+	// Borrowed from the texture cache, which owns the twin's slot and frees it with this image.
+	Image*            m_scale_twin = nullptr;
+	ImageId           m_scale_twin_id {};
+	ImageId           m_scale_twin_owner {};
+	bool              m_twin_newest = false;
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
