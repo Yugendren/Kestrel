@@ -158,11 +158,25 @@ public:
 	// Set on the twin itself; empty on every other image.
 	[[nodiscard]] ImageId ScaleTwinOwner() const noexcept { return m_scale_twin_owner; }
 	void SetScaleTwinOwner(ImageId owner) noexcept { m_scale_twin_owner = owner; }
-	// Which half of the pair holds the newest contents. Only the two halves can be out of date
-	// with respect to each other; guest memory is tracked by the existing dirty flags.
+	// Which half of the pair the other one is missing contents from. Only the two halves can be
+	// out of date with respect to each other; guest memory keeps its own dirty flags.
 	[[nodiscard]] bool IsTwinNewest() const noexcept { return m_twin_newest; }
-	void               MarkTwinNewest() noexcept { m_twin_newest = true; }
-	void               MarkScaledNewest() noexcept { m_twin_newest = false; }
+	[[nodiscard]] bool IsTwinStale() const noexcept { return m_twin_stale; }
+	// The scaled half is about to be written, so the twin stops matching it.
+	void MarkScaledNewest() noexcept {
+		m_twin_newest = false;
+		m_twin_stale  = true;
+	}
+	// A guest-texel binding is about to write the twin, so the scaled half stops matching it.
+	void MarkTwinNewest() noexcept {
+		m_twin_newest = true;
+		m_twin_stale  = false;
+	}
+	// A resample copied one half onto the other; they now hold the same contents.
+	void MarkTwinSynced() noexcept {
+		m_twin_newest = false;
+		m_twin_stale  = false;
+	}
 
 	ImageInfo        info;
 	VulkanImage      backing;
@@ -195,6 +209,7 @@ private:
 	ImageId           m_scale_twin_id {};
 	ImageId           m_scale_twin_owner {};
 	bool              m_twin_newest = false;
+	bool              m_twin_stale  = false;
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;

@@ -130,6 +130,10 @@ struct ImageResource {
 	uint32_t                      shader_swizzle    = ShaderImageIdentitySwizzle;
 	bool                          read              = false;
 	bool                          written           = false;
+	// At least one access reaches this image without a sampler -- IMAGE_LOAD/IMAGE_STORE, an
+	// atomic, or IMAGE_GET_RESINFO. Those address it in absolute texels and measure its extent
+	// in texels, so the host image behind such a binding has to be the guest-sized one.
+	bool                          texel_addressed   = false;
 	bool                          atomic            = false;
 	bool                          depth_compare     = false;
 	bool                          cube              = false;

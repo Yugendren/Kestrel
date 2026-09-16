@@ -37,6 +37,10 @@ public:
 		ImageInfo     info;
 		ImageViewInfo view_info;
 		BindingType   type = BindingType::Texture;
+		// The shader reaches this image without a sampler, so it addresses it in absolute guest
+		// texels. True for every storage binding and for sampled bindings that are texel-fetched
+		// or queried for their extent.
+		bool          texel_addressed = false;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
@@ -165,7 +169,8 @@ private:
 	[[nodiscard]] ImageId     ResolveScaleBinding(const ImageDesc& desc, ImageId id);
 	[[nodiscard]] ImageId     AcquireScaleTwin(ImageId owner_id);
 	void                      PrepareScaleTwinBinding(ImageId owner_id);
-	void                      SyncTwinContents(ImageId owner_id);
+	void                      PrepareScaleTwinRead(ImageId owner_id);
+	void                      RefreshTwinContents(ImageId owner_id);
 	void                      SyncScaledContents(ImageId owner_id);
 	void                      FreeScaleTwin(Image& owner);
 	void                        RefreshImage(ImageId id);

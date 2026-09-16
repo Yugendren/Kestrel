@@ -1780,13 +1780,15 @@ private:
 	}
 
 	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
-		const auto access  = ImageOpcodeInfoOf(op).access;
-		const bool atomic  = access == ImageAccess::Atomic;
-		const bool write   = access == ImageAccess::Write || atomic;
+		const auto info    = ImageOpcodeInfoOf(op);
+		const bool atomic  = info.access == ImageAccess::Atomic;
+		const bool write   = info.access == ImageAccess::Write || atomic;
 		image.first_use_pc = std::min(image.first_use_pc, pc);
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
+		image.texel_addressed =
+		    image.texel_addressed || (info.access != ImageAccess::None && !info.needs_sampler);
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

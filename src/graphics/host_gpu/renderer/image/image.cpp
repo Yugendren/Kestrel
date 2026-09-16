@@ -766,6 +766,9 @@ void Image::AdoptScaleTwin(Image& twin, ImageId twin_id) {
 	EXIT_IF(!IsScaled() || twin.IsScaled() || !twin_id || m_scale_twin != nullptr);
 	m_scale_twin    = &twin;
 	m_scale_twin_id = twin_id;
+	// The fresh twin holds nothing yet, so the first binding that reads it has to be given the
+	// scaled half's contents.
+	m_twin_stale    = true;
 	// The twin is a native-resolution copy of this range, which is exactly what a staging alias
 	// is; keeping both would double the memory cost of every storage-bound target.
 	m_guest_alias.reset();
@@ -775,6 +778,7 @@ void Image::DropScaleTwin() noexcept {
 	m_scale_twin    = nullptr;
 	m_scale_twin_id = {};
 	m_twin_newest   = false;
+	m_twin_stale    = false;
 }
 
 Image& Image::GuestAlias() {
