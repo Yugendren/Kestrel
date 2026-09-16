@@ -635,42 +635,54 @@ uint32_t EmitAnyLane(ValueEmitContext& ctx, IR::Value predicate) {
 	return result;
 }
 
-// v_movrels_b32: pick element inst.Arg(0) from inst.Arg(1..N). Build the candidate list as
-// one array value, store it into a Function-local variable, then index it dynamically -- an
-// N-deep select ladder is what blows the composite/tonemap pixel shaders past the module
-// size limit.
+// v_movrels_b32: pick element inst.Arg(0) from inst.Arg(1..N). The index is wave-uniform in
+// practice (it comes from m0), so branch on it: an OpSwitch with one case per candidate and a
+// phi at the merge costs a handful of compares per read. The alternatives both fail on wide
+// windows: an N-deep select ladder is O(N) ALU per read (Astro's composite pixel shaders read
+// ~50-register windows dozens of times per pixel), and a dynamically indexed Function array
+// is spilled to local memory by the driver and stored in full on every read.
 uint32_t EmitIndexedVectorLoad(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state = ctx.state;
-	const auto found = ctx.indexed_vector_arrays.find(&inst);
-	if (found == ctx.indexed_vector_arrays.end() || inst.NumArgs() < 2) {
-		ctx.Fail(inst, "IndexedVectorLoad has no array variable");
+	auto& state = ctx.state;
+	if (inst.NumArgs() < 2) {
+		ctx.Fail(inst, "IndexedVectorLoad has no candidates");
 	}
-	const auto var   = found->second.first;
-	const auto count = found->second.second;
-	const auto array_type =
-	    state.builder.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, count));
-	std::vector<uint32_t> compose {spv::OpCompositeConstruct, array_type,
-	                               state.builder.AllocateId()};
+	const auto count = static_cast<uint32_t>(inst.NumArgs() - 1u);
+	// Candidates are plain register reads; define them before the branch so every case block
+	// is dominated by their definitions.
+	std::vector<uint32_t> candidates(count);
 	for (uint32_t i = 0; i < count; i++) {
-		compose.push_back(ctx.Arg(inst, i + 1u));
+		candidates[i] = ctx.Arg(inst, i + 1u);
 	}
-	state.builder.AddFunction(compose);
-	state.builder.AddFunction(spv::OpStore, var, compose[2]);
-	// Match the old select-ladder: an index past the enumerated range falls back to element 0
-	// (never an out-of-bounds Function-array access, which is UB / a GPU fault).
-	const auto raw_index = ctx.Arg(inst, 0);
-	const auto in_range  = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_range, raw_index,
-	                          ConstantU32(state, count));
-	const auto index = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), index, in_range, raw_index,
-	                          ConstantU32(state, 0));
-	const auto elem_ptr = TypePointer(state, spv::StorageClassFunction, TypeU32(state));
-	const auto ptr      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, elem_ptr, ptr, var, index);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, ptr);
-	return result;
+	const auto index = ctx.Arg(inst, 0);
+	if (count == 1) {
+		return candidates[0];
+	}
+	// Like the hardware (and the previous ladder), an index past the window yields element 0.
+	const auto            default_label = state.builder.AllocateId();
+	const auto            merge_label   = state.builder.AllocateId();
+	std::vector<uint32_t> labels(count - 1u);
+	std::vector<uint32_t> switch_words {spv::OpSwitch, index, default_label};
+	for (uint32_t candidate = 1; candidate < count; candidate++) {
+		labels[candidate - 1u] = state.builder.AllocateId();
+		switch_words.push_back(candidate);
+		switch_words.push_back(labels[candidate - 1u]);
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(switch_words);
+	std::vector<uint32_t> phi_words {spv::OpPhi, TypeU32(state), state.builder.AllocateId()};
+	EmitLabel(state, default_label);
+	phi_words.push_back(candidates[0]);
+	phi_words.push_back(default_label);
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	for (uint32_t candidate = 1; candidate < count; candidate++) {
+		EmitLabel(state, labels[candidate - 1u]);
+		phi_words.push_back(candidates[candidate]);
+		phi_words.push_back(labels[candidate - 1u]);
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+	}
+	EmitLabel(state, merge_label);
+	state.builder.AddFunction(phi_words);
+	return phi_words[2];
 }
 
 uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index) {

@@ -341,31 +341,18 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	                                IR::U32(IR::Value(0xffu)));
 	const auto count =
 	    current_vector_limit > base + 1u ? current_vector_limit - base : 1u;
-	// Wide indexed reads (Astro Bot's composite/tonemap pixel shaders use v_movrels over ~40
-	// registers, dozens of times) blow the module past the SPIR-V size limit as a select
-	// ladder. Lower those to one IndexedVectorLoad -> Function-array + dynamic OpAccessChain.
-	// Narrow ones keep the ladder: it is small, and the ladder form has proven behaviour where
-	// a lane's source register was never written.
-	if (count >= 16u && program.lower_wide_movrels) {
-		std::vector<IR::Value> values;
-		values.reserve(count);
-		for (uint32_t i = 0; i < count; i++) {
-			values.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(base + i)));
-		}
-		const auto handle = ir.Emit(IR::ValueOpcode::IndexedVectorLoad, {m0});
-		auto*      node   = handle.TryInstruction();
-		for (uint32_t i = 0; i < count; i++) {
-			node->SetArg(1u + i, values[i]);
-		}
-		WriteOperand(DestinationOperand(inst), IR::U32(handle));
-		return;
+	// One IndexedVectorLoad over the register window; the backend branches on the index.
+	std::vector<IR::Value> values;
+	values.reserve(count);
+	for (uint32_t i = 0; i < count; i++) {
+		values.push_back(ir.GetVectorReg(static_cast<IR::VectorReg>(base + i)));
 	}
-	auto selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
-	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
-		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+	const auto handle = ir.Emit(IR::ValueOpcode::IndexedVectorLoad, {m0});
+	auto*      node   = handle.TryInstruction();
+	for (uint32_t i = 0; i < count; i++) {
+		node->SetArg(1u + i, values[i]);
 	}
-	WriteOperand(DestinationOperand(inst), selected);
+	WriteOperand(DestinationOperand(inst), IR::U32(handle));
 }
 
 void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
