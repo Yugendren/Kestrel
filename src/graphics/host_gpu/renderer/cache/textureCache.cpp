@@ -288,6 +288,9 @@ bool TextureCache::SafeToDownload(const Image& image) {
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_slot_images[id].SetResampler(&m_blit_helper);
+	// Conservatively bump on every new slot, registered or not (e.g. null images), rather than
+	// rely on RegisterImage() alone.
+	++m_generation;
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -339,6 +342,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
+	++m_generation;
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
@@ -365,6 +369,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	++m_generation;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -869,6 +874,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+		++m_generation;
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
 		const bool copy_supported =
@@ -995,7 +1001,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (!merged_id) {
 			return {ExpandImage(requested, cached_id)};
 		}
-		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		if (cached.binding.is_bound || cached.binding.is_target) {
+			cached.binding.needs_rebind = true;
+			++m_generation;
+		}
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
@@ -1016,6 +1025,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	expanded.usage         = source.usage;
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
+		++m_generation;
 	}
 	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
