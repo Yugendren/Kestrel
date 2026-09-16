@@ -10,7 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
-#include <unordered_map>
+#include <memory>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -625,6 +625,127 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+// Scratch one Evaluator needs for a walk: the memo of already-evaluated instructions and the
+// recursion stack. Both used to be a std::unordered_map and a std::vector sized to the whole plan
+// and built from scratch for every Evaluator, which put a malloc and a bucket-array memset on the
+// path of every draw. The storage is pooled per thread instead, and the memo is emptied by
+// bumping a generation stamp rather than by clearing cells.
+class EvaluatorScratch {
+public:
+	// Sizes the table so `capacity` distinct instructions never exceed half of it, then drops
+	// everything the previous walk left behind.
+	void Begin(size_t capacity) {
+		size_t cells = 16;
+		while (cells < capacity * 2u && cells < MaxCells) {
+			cells *= 2u;
+		}
+		if (m_cells.size() < cells) {
+			m_cells.assign(cells, Cell {});
+			m_stamp = 0;
+		}
+		m_mask  = m_cells.size() - 1u;
+		m_count = 0;
+		if (++m_stamp == 0u) {
+			// A stamp of zero is what an untouched cell carries, so a wrap has to clear.
+			std::ranges::fill(m_cells, Cell {});
+			m_stamp = 1u;
+		}
+		m_visiting.clear();
+	}
+
+	[[nodiscard]] bool Find(const Inst* inst, uint64_t& value) const {
+		for (auto index = Start(inst);; index = (index + 1u) & m_mask) {
+			const auto& cell = m_cells[index];
+			if (cell.stamp != m_stamp) {
+				return false;
+			}
+			if (cell.key == inst) {
+				value = cell.value;
+				return true;
+			}
+		}
+	}
+
+	void Insert(const Inst* inst, uint64_t value) {
+		// Half full is the limit: probing relies on an empty cell always being reachable, and
+		// memoisation is only ever an optimisation, so an oversized walk simply stops recording.
+		if (m_count * 2u >= m_cells.size()) {
+			return;
+		}
+		for (auto index = Start(inst);; index = (index + 1u) & m_mask) {
+			auto& cell = m_cells[index];
+			if (cell.stamp != m_stamp) {
+				cell = {.key = inst, .value = value, .stamp = m_stamp};
+				m_count++;
+				return;
+			}
+			if (cell.key == inst) {
+				cell.value = value;
+				return;
+			}
+		}
+	}
+
+	[[nodiscard]] std::vector<const Inst*>& Visiting() { return m_visiting; }
+
+private:
+	struct Cell {
+		const Inst* key   = nullptr;
+		uint64_t    value = 0;
+		uint32_t    stamp = 0;
+	};
+
+	// Upper bound on the table so a very large plan cannot turn the pooled buffer into megabytes.
+	static constexpr size_t MaxCells = 1u << 16u;
+
+	[[nodiscard]] size_t Start(const Inst* inst) const {
+		// Instructions come from one std::list, so the low pointer bits carry no entropy.
+		const auto bits = reinterpret_cast<uintptr_t>(inst) >> 4u;
+		return static_cast<size_t>((bits * 0x9e3779b97f4a7c15ull) >> 32u) & m_mask;
+	}
+
+	std::vector<Cell>        m_cells;
+	std::vector<const Inst*> m_visiting;
+	size_t                   m_mask  = 0;
+	size_t                   m_count = 0;
+	uint32_t                 m_stamp = 0;
+};
+
+// Evaluators nest -- a walk with the clean-memory reader runs alongside the ordinary one -- so the
+// scratch buffers live in a per-thread free list rather than in a single slot.
+thread_local std::vector<std::unique_ptr<EvaluatorScratch>> g_scratch_storage;
+thread_local std::vector<EvaluatorScratch*>                 g_scratch_free;
+
+class ScratchLease {
+public:
+	ScratchLease() = default;
+
+	~ScratchLease() {
+		if (m_scratch != nullptr) {
+			g_scratch_free.push_back(m_scratch);
+		}
+	}
+
+	ScratchLease(const ScratchLease&)            = delete;
+	ScratchLease& operator=(const ScratchLease&) = delete;
+
+	EvaluatorScratch& Acquire(size_t capacity) {
+		if (m_scratch == nullptr) {
+			if (g_scratch_free.empty()) {
+				g_scratch_storage.push_back(std::make_unique<EvaluatorScratch>());
+				g_scratch_free.push_back(g_scratch_storage.back().get());
+			}
+			m_scratch = g_scratch_free.back();
+			g_scratch_free.pop_back();
+			m_scratch->Begin(capacity);
+		}
+		return *m_scratch;
+	}
+
+private:
+	EvaluatorScratch* m_scratch = nullptr;
+};
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -666,33 +787,31 @@ private:
 		if (inst == nullptr) {
 			return false;
 		}
-		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
-			m_reserved = true;
+		if (m_memo == nullptr) {
+			m_memo = &m_scratch.Acquire(m_program.value_storage.size());
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
-			result = found->second;
+		if (m_memo->Find(inst, result)) {
 			return true;
 		}
-		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
+		auto& visiting = m_memo->Visiting();
+		if (std::ranges::find(visiting, inst) != visiting.end()) {
 			return false;
 		}
-		m_visiting.push_back(inst);
-		uint64_t out = 0;
+		visiting.push_back(inst);
+		uint64_t   out       = 0;
 		const bool evaluated = EvaluateInst(*inst, out);
-		m_visiting.pop_back();
+		visiting.pop_back();
 		if (!evaluated) {
 			if (m_diag_first_fail == nullptr) {
 				m_diag_first_fail = inst;
 			}
 			return false;
 		}
-		m_cache.emplace(inst, out);
+		m_memo->Insert(inst, out);
 		result = out;
 		return true;
 	}
@@ -1173,9 +1292,8 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
-	std::vector<const Inst*>                  m_visiting;
-	bool                                      m_reserved = false;
+	ScratchLease                              m_scratch;
+	EvaluatorScratch*                         m_memo = nullptr;
 
 public:
 	// Deepest instruction whose EvaluateInst returned false during the last Evaluate() call.
