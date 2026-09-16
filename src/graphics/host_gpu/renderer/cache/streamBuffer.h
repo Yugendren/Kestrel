@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -112,6 +113,24 @@ public:
 	// in-flight watch bookkeeping, so a later reservation still waits on whatever last read this
 	// range instead of racing it.
 	[[nodiscard]] uint64_t Reserve(uint64_t size, uint64_t alignment = 0);
+
+	// A download that landed either in the shared ring, or -- when it does not fit the ring at
+	// all -- in a dedicated buffer sized just for it. `overflow` is null in the former case; in
+	// the latter it owns the buffer `destination` points at, so the caller must move it into
+	// whatever deferred operation reads `mapped`/`destination` afterwards. That operation running
+	// is what releases it: nothing else keeps it alive.
+	struct DownloadAllocation {
+		uint8_t*                 mapped      = nullptr;
+		uint64_t                 offset      = 0;
+		Buffer*                  destination = nullptr;
+		std::unique_ptr<Buffer>  overflow;
+	};
+
+	// Usage() must be MemoryUsage::Download. Behaves like Map() for a download that fits the
+	// ring. A download too large for the ring itself (an oversize render target readback, for
+	// example) would never fit no matter how the ring rotates, so this allocates a one-shot
+	// buffer for it instead of failing the whole download.
+	[[nodiscard]] DownloadAllocation AcquireDownload(uint64_t size, uint64_t alignment = 0);
 
 private:
 	friend struct StreamBufferTestAccess;

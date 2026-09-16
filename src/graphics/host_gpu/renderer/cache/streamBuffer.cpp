@@ -320,6 +320,20 @@ uint64_t StreamBuffer::Reserve(uint64_t size, uint64_t alignment) {
 	return offset;
 }
 
+StreamBuffer::DownloadAllocation StreamBuffer::AcquireDownload(uint64_t size, uint64_t alignment) {
+	EXIT_IF(Usage() != MemoryUsage::Download);
+	auto [mapped, offset] = Map(size, alignment);
+	if (mapped != nullptr) {
+		return {mapped, offset, this, nullptr};
+	}
+	// The ring rejected it, and nothing about a ring rotates its way into more capacity than it
+	// was built with, so give this one download a buffer of its own rather than fail it outright.
+	auto overflow = std::make_unique<Buffer>(Graphics(), Scheduler(), MemoryUsage::Download, 0,
+	                                         AllFlags, size);
+	auto* const destination = overflow.get();
+	return {destination->Mapped().data(), 0, destination, std::move(overflow)};
+}
+
 bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
                                          std::optional<size_t>     invalidation_mark,
                                          uint64_t requested_upper_bound, bool allow_wait,

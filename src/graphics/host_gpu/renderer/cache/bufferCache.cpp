@@ -160,11 +160,19 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
-	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	if (mapped == nullptr) {
-		EXIT("BufferCache: download exceeds 32 MiB staging buffer capacity\n");
+	// A hot window's dirty bytes can still exceed the ring (ReadbackWindowFor widens to cover the
+	// whole read); AcquireDownload gives such a download a buffer of its own rather than failing
+	// every readback sharing the ring.
+	auto allocation = m_download_buffer.AcquireDownload(total_size, 64);
+	if (allocation.mapped == nullptr) {
+		EXIT("BufferCache: failed to allocate download staging\n");
 	}
-	m_download_buffer.Commit();
+	auto&      download = *allocation.destination;
+	const auto offset   = allocation.offset;
+	const auto mapped   = allocation.mapped;
+	if (allocation.overflow == nullptr) {
+		m_download_buffer.Commit();
+	}
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
@@ -183,22 +191,23 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
-	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+	native.copyBuffer(buffer.Handle(), download.Handle(),
 	                  static_cast<uint32_t>(copies.size()), copies.data());
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	after.buffer        = m_download_buffer.Handle();
+	after.buffer        = download.Handle();
 	after.offset        = offset;
 	after.size          = total_size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
-	                                    copies = std::move(copies)] {
-		m_download_buffer.Invalidate(offset, total_size);
+	m_scheduler.DeferPriorityOperation([&download, mapped, offset, total_size, buffer_address,
+	                                    copies   = std::move(copies),
+	                                    overflow = std::move(allocation.overflow)] {
+		download.Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);

@@ -2035,14 +2035,21 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!transfer.valid || !SafeToDownload(image)) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
-	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+	const auto range = image.info.data;
+	auto&      ring  = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	// A surface can outgrow the ring (a 4K RGBA16F target already does); AcquireDownload gives
+	// such a download a buffer of its own rather than failing every download sharing the ring.
+	auto       allocation =
+	    ring.AcquireDownload(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	if (allocation.mapped == nullptr) {
+		EXIT("TextureCache: failed to allocate download staging\n");
 	}
-	download.Commit();
+	auto&      download = *allocation.destination;
+	const auto offset   = allocation.offset;
+	const auto mapped   = allocation.mapped;
+	if (allocation.overflow == nullptr) {
+		ring.Commit();
+	}
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
@@ -2062,7 +2069,8 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset,
+	                                    overflow = std::move(allocation.overflow)] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
