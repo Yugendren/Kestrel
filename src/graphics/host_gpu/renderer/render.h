@@ -230,6 +230,21 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	// Consecutive draws on a stage present the same materialised image and sampler descriptors
+	// about nine times out of ten, and resolving an image descriptor searches the texture cache
+	// for every image of every draw. The previous resolution is kept per stage and reused while
+	// the descriptors, the program and the texture cache generation are all unchanged; the
+	// per-draw half of binding an image -- refreshing its contents, LRU, download tracking --
+	// still runs, in RebindImages().
+	struct StageTextures {
+		const ShaderRecompiler::IR::CompiledShaderInfo*    program = nullptr;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> image_values;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> sampler_values;
+		std::vector<TextureBinding>                        images;
+		std::vector<vk::Sampler>                           samplers;
+		uint64_t                                           texture_generation = 0;
+	};
+
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
@@ -274,6 +289,9 @@ private:
 	// GPU; see meshDrawArgs.h. Owned here because ExecutePreparedDraw() is its only caller.
 	MeshDrawArgsBuilder                   m_mesh_draw_args_builder;
 	std::vector<ImageId>                  m_bound_images;
+	// Indexed by ShaderType, which ends with the tessellation stages.
+	std::array<StageTextures, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1>
+	                                      m_stage_textures;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
