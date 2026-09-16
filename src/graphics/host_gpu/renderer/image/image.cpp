@@ -770,7 +770,13 @@ void Image::AdoptScaleTwin(Image& twin, ImageId twin_id) {
 	// scaled half's contents.
 	m_twin_stale    = true;
 	// The twin is a native-resolution copy of this range, which is exactly what a staging alias
-	// is; keeping both would double the memory cost of every storage-bound target.
+	// is; keeping both would double the memory cost of every storage-bound target. The alias
+	// cannot simply be dropped here: a transfer recorded against it may still be in flight, and
+	// destroying an image the GPU still names is exactly what the spec forbids. Retire it
+	// through the scheduler, which frees it once that work has completed.
+	if (m_guest_alias && m_scheduler.Active()) {
+		m_scheduler.DeferOperation([alias = std::move(m_guest_alias)]() mutable { alias.reset(); });
+	}
 	m_guest_alias.reset();
 }
 
