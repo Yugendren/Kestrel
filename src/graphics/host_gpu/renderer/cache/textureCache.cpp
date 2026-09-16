@@ -1557,11 +1557,12 @@ bool TextureCache::ReportImageScale(const ImageInfo& info, BindingType binding) 
 }
 
 bool TextureCache::CanTwinScale(const ImageInfo& info) {
-	// A twin must be able to back a storage descriptor and to resample against its owner.
-	// Depth/stencil host formats carry neither storage usage nor a meaningful filtered blit, so
-	// a compute binding of a depth range keeps the permanent denial instead.
-	return !info.IsDepth() && !info.IsBlock() && info.samples == 1 && info.resources.levels == 1 &&
-	       info.type == Prospero::ImageType::kColor2D;
+	// A twin has to hold the whole range in one subresource and resample against its owner,
+	// which rules out mip chains, multisample surfaces and block formats. Depth is excluded
+	// because vkCmdBlitImage cannot resample a depth/stencil surface here; a guest-texel
+	// binding of a depth range keeps the permanent denial instead.
+	return !info.IsDepth() && !info.IsBlock() && info.samples == 1 &&
+	       info.resources.levels == 1 && info.type == Prospero::ImageType::kColor2D;
 }
 
 // Internal resolution scaling would otherwise have to pick a single resolution per guest range.
@@ -1573,10 +1574,13 @@ bool TextureCache::CanTwinScale(const ImageInfo& info) {
 // what a permanent denial used to buy.
 ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
 	auto& image = m_slot_images[id];
-	if (desc.type == BindingType::Storage) {
+	if (desc.type == BindingType::Storage || desc.texel_addressed) {
 		if (!image.info.IsScaled()) {
 			return id;
 		}
+		// Host depth/stencil formats carry no storage usage, so a compute shader cannot write a
+		// depth twin and that range has to give up scaling for good. Reading one is fine: a
+		// sampled or transfer view of a depth twin is no different from its owner's.
 		if (!CanTwinScale(image.info)) {
 			m_scale_denied.insert(image.info.data.address);
 			auto native   = image.info;
@@ -1616,19 +1620,19 @@ ImageId TextureCache::AcquireScaleTwin(ImageId owner_id) {
 		owner.AdoptScaleTwin(m_slot_images[twin_id], twin_id);
 		m_slot_images[twin_id].SetScaleTwinOwner(owner_id);
 	}
-	m_slot_images[twin_id].usage.storage = true;
 	return twin_id;
 }
 
 // The two halves hold one logical surface, so a binding that reads one of them must first
-// receive whatever the other was given last.
-void TextureCache::SyncTwinContents(ImageId owner_id) {
+// receive whatever the other was given last. Which direction is needed is tracked per half, so
+// a run of bindings on the same side costs no resamples.
+void TextureCache::RefreshTwinContents(ImageId owner_id) {
 	auto& owner = m_slot_images[owner_id];
-	if (owner.IsTwinNewest()) {
+	if (!owner.IsTwinStale()) {
 		return;
 	}
 	m_slot_images[owner.ScaleTwinId()].BlitScaled(owner);
-	owner.MarkTwinNewest();
+	owner.MarkTwinSynced();
 }
 
 void TextureCache::SyncScaledContents(ImageId owner_id) {
@@ -1637,7 +1641,7 @@ void TextureCache::SyncScaledContents(ImageId owner_id) {
 		return;
 	}
 	owner.BlitScaled(m_slot_images[owner.ScaleTwinId()]);
-	owner.MarkScaledNewest();
+	owner.MarkTwinSynced();
 }
 
 // A compute shader is about to write the twin, which means it is about to write the guest range
@@ -1651,9 +1655,21 @@ void TextureCache::PrepareScaleTwinBinding(ImageId owner_id, const ImageDesc& de
 	// for this range has to be materialised here, exactly as an untwinned storage binding would.
 	PrepareDccClear(owner_id, desc);
 	RefreshImage(owner_id);
-	SyncTwinContents(owner_id);
+	RefreshTwinContents(owner_id);
+	owner.MarkTwinNewest();
 	CommitGpuWrite(owner);
 	TrackImageDownload(owner_id, owner);
+	owner.tick_accessed_last = m_scheduler.CurrentTick();
+}
+
+// A texel-addressed read only needs the twin to hold the range's current pixels. The scaled half
+// stays the one that owns them, so nothing has to be copied back once the shader is done.
+void TextureCache::PrepareScaleTwinRead(ImageId owner_id) {
+	auto& owner = m_slot_images[owner_id];
+	TouchImage(owner);
+	owner.usage.texture = true;
+	RefreshImage(owner_id);
+	RefreshTwinContents(owner_id);
 	owner.tick_accessed_last = m_scheduler.CurrentTick();
 }
 
@@ -1760,7 +1776,11 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	switch (desc.type) {
-		case BindingType::Texture: break;
+		case BindingType::Texture:
+			if (const auto owner = image.ScaleTwinOwner()) {
+				PrepareScaleTwinRead(owner);
+			}
+			break;
 		case BindingType::Storage:
 			if (const auto owner = image.ScaleTwinOwner()) {
 				PrepareScaleTwinBinding(owner, desc);
@@ -1791,6 +1811,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	PrepareDccClear(id, desc);
 	RefreshImage(id);
 	SyncScaledContents(id);
+	image.MarkScaledNewest();
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
 	const auto view = image.FindView(desc.view_info);
@@ -1812,6 +1833,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.usage.depth_target = true;
 	RefreshImage(id);
 	SyncScaledContents(id);
+	image.MarkScaledNewest();
 	if (desc.info.HasMetadata()) {
 		image.info.metadata = desc.info.metadata;
 		auto [metadata, inserted] =
@@ -1922,6 +1944,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
 	// surface has to be there first.
 	SyncScaledContents(id);
 	auto& image = m_slot_images[id];
+	image.MarkScaledNewest();
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
 	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
