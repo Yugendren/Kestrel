@@ -1038,6 +1038,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
+	m_context.GetBufferCache().BeginBufferScope();
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		FindBuffers(*stage);

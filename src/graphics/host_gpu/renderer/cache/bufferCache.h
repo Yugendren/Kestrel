@@ -42,6 +42,13 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+
+	// Opens the reuse scope for the descriptors of one draw or dispatch. Consecutive slots, and
+	// the two stages of a draw, routinely ask ObtainBuffer() for the same guest range: half of all
+	// requests repeat one of the last sixteen. Everything ObtainBuffer() does for a range -- the
+	// stream re-upload, the LRU touch, the synchronisation, the GPU-modified bookkeeping -- is
+	// idempotent within one scope, so repeats are answered from a small table instead.
+	void BeginBufferScope();
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
@@ -165,6 +172,29 @@ private:
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	// See BeginBufferScope(). A scope only survives while the command buffer it was opened on is
+	// still recording, because a stream-buffer offset from an earlier one must never be reused.
+	struct BufferScopeEntry {
+		uint64_t vaddr   = 0;
+		uint64_t size    = 0;
+		uint64_t offset  = 0;
+		BufferId id;
+		bool     stream  = false;
+		bool     written = false;
+		bool     texel   = false;
+	};
+
+	static constexpr size_t MaxBufferScopeEntries = 16;
+
+	[[nodiscard]] const BufferScopeEntry* FindInScope(uint64_t vaddr, uint64_t size,
+	                                                  bool is_written, bool is_texel_buffer);
+	void RememberInScope(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer,
+	                     BufferId id, uint64_t offset, bool stream);
+
+	std::array<BufferScopeEntry, MaxBufferScopeEntries> m_buffer_scope {};
+	size_t                                            m_buffer_scope_count = 0;
+	uint64_t                                          m_buffer_scope_tick  = 0;
+
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;

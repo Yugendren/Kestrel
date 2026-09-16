@@ -451,6 +451,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	m_context.GetBufferCache().BeginBufferScope();
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
@@ -536,6 +537,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
+	m_context.GetBufferCache().BeginBufferScope();
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
