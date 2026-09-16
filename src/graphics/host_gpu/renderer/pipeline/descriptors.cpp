@@ -856,15 +856,37 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	const auto& snapshot = runtime.resources;
 	PreparedBindings prepared;
 	prepared.runtime = &runtime;
-	prepared.images.reserve(program.info.images.size());
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		prepared.images.push_back(std::move(binding));
-	}
-	prepared.samplers.reserve(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+	auto&      last       = m_stage_textures[static_cast<size_t>(program.stage)];
+	const auto generation = m_context.GetTextureCache().Generation();
+	// Only the search for the host image behind a descriptor is carried over. Everything the
+	// binding itself does per draw still happens: BindImage() below, and the content refresh and
+	// download tracking that RebindImages() drives through the texture cache.
+	if (last.program == &program && last.texture_generation == generation &&
+	    std::ranges::equal(last.image_values, snapshot.images) &&
+	    std::ranges::equal(last.sampler_values, snapshot.samplers)) {
+		prepared.images   = last.images;
+		prepared.samplers = last.samplers;
+		for (const auto& binding: prepared.images) {
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		}
+	} else {
+		prepared.images.reserve(program.info.images.size());
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			prepared.images.push_back(std::move(binding));
+		}
+		prepared.samplers.reserve(program.info.samplers.size());
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
+		}
+		last.program = &program;
+		last.image_values.assign(snapshot.images.begin(), snapshot.images.end());
+		last.sampler_values.assign(snapshot.samplers.begin(), snapshot.samplers.end());
+		last.images   = prepared.images;
+		last.samplers = prepared.samplers;
+		// Resolving can itself create images, so record the generation it ended at.
+		last.texture_generation = m_context.GetTextureCache().Generation();
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
