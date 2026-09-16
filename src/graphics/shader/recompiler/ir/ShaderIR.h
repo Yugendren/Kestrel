@@ -550,7 +550,10 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
-	std::list<Inst>                     value_storage;
+	// A deque rather than a list: evaluating one draw walks these instructions through Inst*
+	// operands, and every hop was landing on a separately allocated node. Element addresses stay
+	// stable across the appends ExtractResourcePlan makes, which is all a Value needs.
+	std::deque<Inst>                    value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
