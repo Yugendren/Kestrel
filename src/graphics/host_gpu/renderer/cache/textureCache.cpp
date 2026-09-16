@@ -222,8 +222,9 @@ namespace {
 constexpr uint32_t SCALE_MIN_EDGE = 64;
 
 // Render-target-class images may be allocated at a scaled host resolution: they are produced
-// by rasterisation and consumed through normalised sampling or same-scale blits. Sampled and
-// storage textures are addressed with absolute guest texel coordinates, so they stay native.
+// by rasterisation and consumed through normalised sampling, same-scale blits or -- for storage
+// bindings -- a native twin. Sampled and storage bindings never create a scaled image
+// themselves, because on their own they carry no evidence that the range is rasterised.
 [[nodiscard]] bool ShouldScaleImage(GraphicContext& graphics, const ImageInfo& info,
                                     TextureCache::BindingType binding) {
 	if (!RenderScale::Enabled()) {
@@ -370,6 +371,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
+	FreeScaleTwin(*image);
 	if (!image->depth_id) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
@@ -629,6 +631,7 @@ void TextureCache::PrepareImageCopy(Image& image) {
 void TextureCache::RefreshCopySource(ImageId id) {
 	auto& image = m_slot_images[id];
 	RefreshImage(id);
+	SyncScaledContents(id);
 	if (image.IsDefinitelyCpuDirty()) {
 		EXIT("TextureCache: image copy source remained CPU-dirty after refresh\n");
 	}
@@ -1446,28 +1449,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	ImageId dcc_id {};
 	{
 		std::scoped_lock lock {m_lock};
 		if (RenderScale::Enabled()) {
-			if (desc.type == BindingType::Storage) {
-				// Compute shaders address storage images with absolute guest texel coordinates
-				// and are dispatched with guest-sized workgroup counts, so this range can never
-				// be scaled. The denial is permanent; otherwise a range that alternates between
-				// a render-target and a storage binding would be recreated every frame.
-				m_scale_denied.insert(desc.info.data.address);
-			}
 			desc.info.scaled = ShouldScaleImage(m_graphics, desc.info, desc.type) &&
 			                   !m_scale_denied.contains(desc.info.data.address);
-		}
-		if (desc.info.scaled) {
-			static std::atomic<uint32_t> logged_scale {0};
-			if (logged_scale.fetch_add(1, std::memory_order_relaxed) < 32) {
-				const auto host = desc.info.HostExtent();
-				LOGF("TextureCache: internal resolution scaling binding=%u addr=0x%016" PRIx64
-				     " %ux%u -> %ux%u\n",
-				     static_cast<uint32_t>(desc.type), desc.info.data.address, desc.info.extent.width,
-				     desc.info.extent.height, host.width, host.height);
-			}
 		}
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
@@ -1504,15 +1491,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 
-		if (result && desc.type == BindingType::Storage && RenderScale::Enabled() &&
-		    m_slot_images[result].info.IsScaled()) {
-			// The range was scaled while it was only a render target. Sampled textures are fine
-			// scaled because they are addressed with normalised coordinates, but a storage
-			// binding is not: rebuild it natively and resample the existing contents.
-			auto native   = m_slot_images[result].info;
-			native.scaled = false;
-			result        = ExpandImage(native, result);
-		}
 		if (result) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
@@ -1556,13 +1534,33 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
-		// The lookup may have matched or recreated an image with a different scale decision;
-		// the caller sizes its attachments from desc.info, so report what it actually got.
-		desc.info.scaled         = image.info.scaled;
-		image.tick_accessed_last = m_scheduler.CurrentTick();
-		TouchImage(image);
+		if (RenderScale::Enabled()) {
+			result = ResolveScaleBinding(desc, result);
+		}
+		auto& bound = m_slot_images[result];
+		// The lookup may have matched, recreated or twinned an image with a different scale
+		// decision; the caller sizes its attachments from desc.info, so report what it got.
+		desc.info.scaled         = bound.info.scaled;
+		// Report the decision the range ended up with rather than the one the binding asked
+		// for: a lookup can deny a scale the request wanted, or hand back a native twin.
+		if (ReportImageScale(bound.info, desc.type)) {
+			const auto host = bound.info.HostExtent();
+			LOGF("TextureCache: internal resolution scaling binding=%u addr=0x%016" PRIx64
+			     " %ux%u -> %ux%u\n",
+			     static_cast<uint32_t>(desc.type), bound.info.data.address, bound.info.extent.width,
+			     bound.info.extent.height, host.width, host.height);
+		}
+		bound.tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(bound);
+		// A native twin carries no metadata of its own; a fast clear still pending for the range
+		// belongs to its owner, exactly as it would for an untwinned storage binding.
+		if (const auto owner = bound.ScaleTwinOwner()) {
+			dcc_id = owner;
+		} else {
+			dcc_id = result;
+		}
 	}
-	MaterializeDccClear(result, desc, metadata_base_layer);
+	MaterializeDccClear(dcc_id, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};
@@ -1576,6 +1574,130 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 	}
 	return result;
+}
+
+bool TextureCache::ReportImageScale(const ImageInfo& info, BindingType binding) {
+	if (!info.IsScaled() || info.data.Empty()) {
+		return false;
+	}
+	return m_scale_logged.emplace(info.data.address, binding).second;
+}
+
+bool TextureCache::CanTwinScale(const ImageInfo& info) {
+	// A twin must be able to back a storage descriptor and to resample against its owner.
+	// Depth/stencil host formats carry neither storage usage nor a meaningful filtered blit, so
+	// a compute binding of a depth range keeps the permanent denial instead.
+	return !info.IsDepth() && !info.IsBlock() && info.samples == 1 && info.resources.levels == 1 &&
+	       info.type == Prospero::ImageType::kColor2D;
+}
+
+// Internal resolution scaling would otherwise have to pick a single resolution per guest range.
+// Rasterisation wants the scaled image; a compute shader addressing the same range as a storage
+// image wants guest texels, because it indexes absolute coordinates and is dispatched with
+// guest-sized workgroup counts. Keep both halves: the scaled image stays the cached entry and
+// owns the guest range, and storage bindings are served by a native twin that lives exactly as
+// long as its owner. The pair resamples on the transitions instead of reallocating, which is
+// what a permanent denial used to buy.
+ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
+	auto& image = m_slot_images[id];
+	if (desc.type == BindingType::Storage) {
+		if (!image.info.IsScaled()) {
+			return id;
+		}
+		if (!CanTwinScale(image.info)) {
+			m_scale_denied.insert(image.info.data.address);
+			auto native   = image.info;
+			native.scaled = false;
+			return ExpandImage(native, id);
+		}
+		return AcquireScaleTwin(id);
+	}
+	// A range whose first binding was a storage image was created native, because a storage
+	// binding alone is no evidence that anything rasterises into it. Once a render target
+	// binding supplies that evidence, promote it; the twin keeps the storage bindings working,
+	// so this costs one recreation per range rather than one per frame.
+	if (desc.type != BindingType::RenderTarget || image.info.IsScaled() ||
+	    m_scale_denied.contains(image.info.data.address) || !CanTwinScale(image.info) ||
+	    !ShouldScaleImage(m_graphics, image.info, desc.type)) {
+		return id;
+	}
+	auto scaled   = image.info;
+	scaled.scaled = true;
+	return ExpandImage(scaled, id);
+}
+
+ImageId TextureCache::AcquireScaleTwin(ImageId owner_id) {
+	auto& owner   = m_slot_images[owner_id];
+	auto  twin_id = owner.ScaleTwinId();
+	if (!twin_id) {
+		// The twin carries no guest range of its own: its owner owns the range, and region
+		// lookups, invalidation and the garbage collector must keep seeing exactly one image
+		// there. Everything that reaches the twin reaches it through the owner.
+		auto info             = owner.info;
+		info.scaled           = false;
+		info.data             = {};
+		info.stencil          = {};
+		info.metadata         = {};
+		info.htile_clear_mask = UINT32_MAX;
+		twin_id               = InsertImage(info);
+		owner.AdoptScaleTwin(m_slot_images[twin_id], twin_id);
+		m_slot_images[twin_id].SetScaleTwinOwner(owner_id);
+	}
+	m_slot_images[twin_id].usage.storage = true;
+	return twin_id;
+}
+
+// The two halves hold one logical surface, so a binding that reads one of them must first
+// receive whatever the other was given last.
+void TextureCache::SyncTwinContents(ImageId owner_id) {
+	auto& owner = m_slot_images[owner_id];
+	if (owner.IsTwinNewest()) {
+		return;
+	}
+	m_slot_images[owner.ScaleTwinId()].BlitScaled(owner);
+	owner.MarkTwinNewest();
+}
+
+void TextureCache::SyncScaledContents(ImageId owner_id) {
+	auto& owner = m_slot_images[owner_id];
+	if (!owner.IsTwinNewest()) {
+		return;
+	}
+	owner.BlitScaled(m_slot_images[owner.ScaleTwinId()]);
+	owner.MarkScaledNewest();
+}
+
+// A compute shader is about to write the twin, which means it is about to write the guest range
+// of the owner even though the owner's own image is untouched. Account for that write on the
+// owner, which is the image the rest of the cache knows about.
+void TextureCache::PrepareScaleTwinBinding(ImageId owner_id) {
+	auto& owner = m_slot_images[owner_id];
+	TouchImage(owner);
+	owner.usage.storage = true;
+	RefreshImage(owner_id);
+	SyncTwinContents(owner_id);
+	CommitGpuWrite(owner);
+	TrackImageDownload(owner_id, owner);
+	owner.tick_accessed_last = m_scheduler.CurrentTick();
+}
+
+// The twin is half of its owner's contents rather than a cache entry of its own, so it is freed
+// with the owner. A descriptor still holding its id sees the slot go away and rediscovers.
+void TextureCache::FreeScaleTwin(Image& owner) {
+	const auto twin_id = owner.ScaleTwinId();
+	if (!twin_id) {
+		return;
+	}
+	owner.DropScaleTwin();
+	auto& twin = m_slot_images[twin_id];
+	twin.ClearGpuModified();
+	twin.SetScaleTwinOwner({});
+	twin.binding.needs_rebind = true;
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferOperation([this, twin_id] { m_slot_images.erase(twin_id); });
+	} else {
+		m_slot_images.erase(twin_id);
+	}
 }
 
 ImageId TextureCache::DenyImageScale(ImageId id) {
@@ -1595,6 +1717,9 @@ void TextureCache::UpdateImage(ImageId id) {
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
 	RefreshImage(id);
+	// This is the acquisition path for the consumers that read the host image directly -- the
+	// video-out scanout and the depth/stencil copy -- so the scaled half has to be current.
+	SyncScaledContents(id);
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
@@ -1664,11 +1789,18 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				}
 			}
 		}
+		if (desc.type == BindingType::Texture) {
+			// Sampling is fine against the scaled half because it uses normalised coordinates,
+			// but that half must first receive anything compute left in the twin.
+			SyncScaledContents(id);
+		}
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
-			if (!image.info.data.Empty()) {
+			if (const auto owner = image.ScaleTwinOwner()) {
+				PrepareScaleTwinBinding(owner);
+			} else if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
 			}
 			TrackImageDownload(id, image);
@@ -1691,6 +1823,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id);
+	SyncScaledContents(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
 	return image.FindView(desc.view_info);
@@ -1716,6 +1849,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                                      .clear_mask = image.info.htile_clear_mask});
 	}
 	RefreshImage(id);
+	SyncScaledContents(id);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil));
@@ -1812,6 +1946,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
+	// The clear lands on the scaled half and may cover only part of it, so the rest of the
+	// surface has to be there first.
+	SyncScaledContents(id);
 	auto& image = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;

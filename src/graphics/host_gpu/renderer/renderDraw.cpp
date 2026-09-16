@@ -998,9 +998,10 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 }
 
 // A Vulkan render pass has a single render area, so every attachment of a pass must share one
-// scale. Discovery can produce a mixed group when one attachment range has been denied scaling,
-// for example because a compute shader writes it as a storage image. Converge the whole pass
-// onto the native resolution; the denial is permanent, so later frames discover a uniform group.
+// scale. Discovery can produce a mixed group when one attachment range is not eligible for
+// scaling, for example because it is smaller than the scaling threshold or its format cannot be
+// blitted. Converge the whole pass onto the native resolution; the denial is permanent, so later
+// frames discover a uniform group.
 void RenderExecutor::UnifyRenderTargetScale(CommandBuffer& buffer, DrawRenderState& state) {
 	if (!RenderScale::Enabled()) {
 		return;
