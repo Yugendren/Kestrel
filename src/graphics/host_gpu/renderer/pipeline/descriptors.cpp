@@ -1017,6 +1017,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
+	m_context.GetBufferCache().BeginBufferScope();
 	GraphicsBindings bindings {
 	    .vertex = PrepareBindings(vertex),
 	};

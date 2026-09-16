@@ -632,12 +632,60 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return handle;
 }
 
+void BufferCache::BeginBufferScope() {
+	m_buffer_scope_count = 0;
+	m_buffer_scope_tick  = m_scheduler.CurrentTick();
+}
+
+const BufferCache::BufferScopeEntry* BufferCache::FindInScope(uint64_t vaddr, uint64_t size,
+                                                              bool is_written,
+                                                              bool is_texel_buffer) {
+	if (m_buffer_scope_tick != m_scheduler.CurrentTick()) {
+		// Resource preparation can finish and restart the scheduler part way through a draw.
+		m_buffer_scope_count = 0;
+		return nullptr;
+	}
+	for (size_t i = 0; i < m_buffer_scope_count; i++) {
+		const auto& entry = m_buffer_scope[i];
+		if (entry.vaddr == vaddr && entry.size == size && entry.written == is_written &&
+		    entry.texel == is_texel_buffer) {
+			return &entry;
+		}
+	}
+	return nullptr;
+}
+
+void BufferCache::RememberInScope(uint64_t vaddr, uint64_t size, bool is_written,
+                                  bool is_texel_buffer, BufferId id, uint64_t offset,
+                                  bool stream) {
+	if (m_buffer_scope_count >= MaxBufferScopeEntries) {
+		return;
+	}
+	m_buffer_scope[m_buffer_scope_count++] = {.vaddr   = vaddr,
+	                                          .size    = size,
+	                                          .offset  = offset,
+	                                          .id      = id,
+	                                          .stream  = stream,
+	                                          .written = is_written,
+	                                          .texel   = is_texel_buffer};
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+
+	if (const auto* reused = FindInScope(vaddr, size, is_written, is_texel_buffer);
+	    reused != nullptr) {
+		if (reused->stream) {
+			return {&m_stream_buffer, reused->offset};
+		}
+		if (!IsBufferInvalid(reused->id)) {
+			return {&m_slot_buffers[reused->id], reused->offset};
+		}
 	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
@@ -648,6 +696,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			m_stream_buffer.Commit();
+			RememberInScope(vaddr, size, is_written, is_texel_buffer, {}, offset, true);
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -661,7 +710,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
-	return {&buffer, buffer.Offset(vaddr)};
+	const auto offset = buffer.Offset(vaddr);
+	RememberInScope(vaddr, size, is_written, is_texel_buffer, id, offset, false);
+	return {&buffer, offset};
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
