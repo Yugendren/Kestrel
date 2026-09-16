@@ -171,7 +171,7 @@ private:
 	// Internal resolution scaling: see ResolveScaleBinding for how the two halves of a scaled
 	// range divide the work between rasterisation and compute.
 	[[nodiscard]] bool        ReportImageScale(const ImageInfo& info, BindingType binding);
-	[[nodiscard]] static bool CanTwinScale(const ImageInfo& info);
+	[[nodiscard]] bool        CanTwinScale(const ImageInfo& info) const;
 	[[nodiscard]] ImageId     ResolveScaleBinding(const ImageDesc& desc, ImageId id);
 	[[nodiscard]] ImageId     AcquireScaleTwin(ImageId owner_id);
 	void                      PrepareScaleTwinBinding(ImageId owner_id, const ImageDesc& desc);

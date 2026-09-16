@@ -309,6 +309,7 @@ bool TextureCache::SafeToDownload(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	m_slot_images[id].SetResampler(&m_blit_helper);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -1556,13 +1557,15 @@ bool TextureCache::ReportImageScale(const ImageInfo& info, BindingType binding) 
 	return m_scale_logged.emplace(info.data.address, binding).second;
 }
 
-bool TextureCache::CanTwinScale(const ImageInfo& info) {
+bool TextureCache::CanTwinScale(const ImageInfo& info) const {
 	// A twin has to hold the whole range in one subresource and resample against its owner,
-	// which rules out mip chains, multisample surfaces and block formats. Depth is excluded
-	// because vkCmdBlitImage cannot resample a depth/stencil surface here; a guest-texel
-	// binding of a depth range keeps the permanent denial instead.
-	return !info.IsDepth() && !info.IsBlock() && info.samples == 1 &&
-	       info.resources.levels == 1 && info.type == Prospero::ImageType::kColor2D;
+	// which rules out mip chains, multisample surfaces and block formats. Depth is excluded for
+	// a different reason: copying a depth target from the binding path, while the guest still
+	// holds it as an attachment, stalls the device -- with either a transfer or the resample
+	// pass -- so a guest-texel binding of a depth range keeps the permanent denial.
+	return !info.IsBlock() && info.samples == 1 && info.resources.levels == 1 &&
+	       info.type == Prospero::ImageType::kColor2D &&
+	       (!info.IsDepth() || m_blit_helper.CanResampleDepth(info));
 }
 
 // Internal resolution scaling would otherwise have to pick a single resolution per guest range.
@@ -1578,9 +1581,6 @@ ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
 		if (!image.info.IsScaled()) {
 			return id;
 		}
-		// Host depth/stencil formats carry no storage usage, so a compute shader cannot write a
-		// depth twin and that range has to give up scaling for good. Reading one is fine: a
-		// sampled or transfer view of a depth twin is no different from its owner's.
 		if (!CanTwinScale(image.info)) {
 			m_scale_denied.insert(image.info.data.address);
 			auto native   = image.info;
