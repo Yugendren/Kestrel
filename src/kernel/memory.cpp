@@ -898,6 +898,11 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+	return g_virtual_ranges->ClampRangeSize(vaddr, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

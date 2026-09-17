@@ -7,6 +7,9 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/ir/passes/GpuVertexFetch.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
+
+#include <algorithm>
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -16,6 +19,9 @@
 #include <limits>
 
 namespace Libs::Graphics {
+
+// Bytes registered around a page a shader faulted on, bounded to its guest mapping.
+constexpr uint64_t FaultRegistrationSpan = uint64_t {256} * 1024;
 
 namespace {
 
@@ -142,7 +148,17 @@ void FaultManager::ProcessFaultBuffer() {
 				ShaderVertexTablesDrifted();
 				continue;
 			}
-			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
+			// A shader that walks guest memory itself reads whole meshes, not single pages, so
+			// register the surrounding span of the same mapping and save a fault round per page.
+			const auto page_end = faults[index] + BufferCache::CACHING_PAGESIZE;
+			auto       begin    = faults[index] & ~(FaultRegistrationSpan - 1);
+			if (LibKernel::Memory::TryClampRangeSize(begin, page_end - begin) != page_end - begin) {
+				begin = faults[index];
+			}
+			const auto size =
+			    std::max(LibKernel::Memory::TryClampRangeSize(begin, FaultRegistrationSpan),
+			             page_end - begin);
+			fault_ranges.Add(begin, size);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
