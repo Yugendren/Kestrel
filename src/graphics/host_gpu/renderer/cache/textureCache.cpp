@@ -1719,6 +1719,15 @@ void TextureCache::FreeScaleTwin(Image& owner) {
 	twin.ClearGpuModified();
 	twin.SetScaleTwinOwner({});
 	twin.binding.needs_rebind = true;
+	// A twin is destroyed outside the register/unregister funnels because it never carried a
+	// guest range, so this is the one place an image goes away without Generation() moving. A
+	// descriptor that resolved to this twin on an earlier draw must not be allowed to resolve to
+	// it again: the owner has already dropped it, its owner link is cleared -- so a binding would
+	// no longer pull the owner contents in through PrepareScaleTwinRead -- and the slot itself is
+	// about to be erased. The per-image rebind flag above cannot carry that news across a draw
+	// boundary, because ResetBindings() clears the binding record of every bound image at the end
+	// of each draw.
+	++m_generation;
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, twin_id] { m_slot_images.erase(twin_id); });
 	} else {
