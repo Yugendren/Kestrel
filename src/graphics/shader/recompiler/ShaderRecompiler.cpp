@@ -16,6 +16,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/DynamicBuffer.h"
+#include "graphics/shader/recompiler/ir/passes/GpuVertexFetch.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
@@ -628,6 +629,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .dispatcher_fallback = dispatcher_fallback,
 	    .bvh_always_miss     = options.bvh_always_miss,
 	    .bvh_reduced         = options.bvh_reduced,
+	    .gpu_vertex_fetch    = options.gpu_vertex_fetch,
 	    .cfg_failure_kind    = cfg.failure_kind,
 	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
 	                                                    : dispatcher_reason,
@@ -667,6 +669,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 	if (const auto lowered = IR::LowerDynamicBufferReads(ir); lowered != 0) {
 		LOGF("%s dynamic buffer lowering: stage=%s hash=0x%016" PRIx64 " reads=%" PRIu32 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, lowered);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (const auto lowered = IR::LowerGpuVertexFetch(ir); lowered != 0) {
+		LOGF("%s gpu vertex fetch lowering: stage=%s hash=0x%016" PRIx64 " loads=%" PRIu32 "\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, lowered);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);

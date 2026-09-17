@@ -57,6 +57,8 @@ static void PrintUsage() {
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
+	::printf("  --vertex-fetch <cpu|gpu>             Decode vertex attribute tables on the CPU or in the\n"
+	         "                                       vertex shader (default cpu).\n");
 	::printf("  --render-scale <float>               Internal render resolution scale (0.1-4.0).\n"
 	         "                                       Default: 1.0 (native).\n");
 	::printf("  --internal-resolution <value>        Internal resolution preset: native, 2160p,\n"
@@ -379,6 +381,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.graphics.render_scale = parsed;
+		} else if (arg == "--vertex-fetch") {
+			if (value == "cpu") {
+				options.config.vertex_fetch = Config::VertexFetchMode::Cpu;
+			} else if (value == "gpu") {
+				options.config.vertex_fetch = Config::VertexFetchMode::Gpu;
+			} else {
+				::printf("invalid vertex fetch mode: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--internal-resolution") {
 			float mapped = 0.0F;
 			if (!ParseInternalResolution(value, mapped)) {

@@ -73,6 +73,17 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 	}
 }
 
+// The guest reads its attribute and V# tables with scalar loads from user-data pointers. On the
+// GPU path those loads stay in the shader; marking them keeps the SRT planner from hoisting them
+// onto the CPU, which is the read that stalls on GPU-written tables.
+void Translator::TranslateVertexTableLoad(const Decoder::Instruction& inst) {
+	const auto first = program.memory_info.size();
+	TranslateInstruction(inst);
+	for (auto index = first; index < program.memory_info.size(); index++) {
+		program.memory_info[index].vertex_fetch = IR::VertexFetchRole::Table;
+	}
+}
+
 void Translator::V_INTERP_P1_F32() {}
 
 void Translator::V_INTERP_P2_F32(const Decoder::Instruction& inst) {

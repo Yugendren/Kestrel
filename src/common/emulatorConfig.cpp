@@ -60,6 +60,10 @@ uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }
 
+VertexFetchMode GetVertexFetchMode() {
+	return g_config->vertex_fetch;
+}
+
 float GetRenderScale() {
 	const float scale = g_config->graphics.render_scale;
 	if (!std::isfinite(scale)) {

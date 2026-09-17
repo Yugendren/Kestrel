@@ -970,6 +970,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.cfg_failure_kind    = options.cfg_failure_kind;
 	result.fallback_reason     = options.fallback_reason;
 	if (options.embedded_fetch != nullptr) {
+		result.info.gpu_vertex_fetch     = options.gpu_vertex_fetch;
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
 	}
@@ -1229,6 +1230,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 			if (IsScalarMemoryLoad(instruction.opcode) &&
 			    IsEmbeddedFetchPrologLoad(options.embedded_fetch, instruction.pc)) {
+				if (options.gpu_vertex_fetch) {
+					translator.TranslateVertexTableLoad(instruction);
+				}
 				continue;
 			}
 			const auto* embedded = FindEmbeddedFetchLoad(options.embedded_fetch, instruction.pc);
@@ -1241,9 +1245,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					EXIT("embedded vertex fetch at 0x%08x has no resource for attribute %d",
 					     instruction.pc, embedded->attrib_id);
 				}
-				translator.TranslateEmbeddedFetch(instruction, static_cast<uint32_t>(resource),
-				                                  embedded->components,
-				                                  options.input_info.vertex->resources[resource]);
+				if (options.gpu_vertex_fetch) {
+					translator.TranslateGpuVertexFetch(
+					    instruction, embedded->components,
+					    options.input_info.vertex->resources[resource]);
+				} else {
+					translator.TranslateEmbeddedFetch(
+					    instruction, static_cast<uint32_t>(resource), embedded->components,
+					    options.input_info.vertex->resources[resource]);
+				}
 				continue;
 			}
 			translator.TranslateInstruction(instruction);

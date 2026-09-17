@@ -200,12 +200,10 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	});
 }
 
-uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-	             uint32_t bits) {
-	auto&      state   = ctx.state;
-	const auto address = GuestAddress(ctx, inst, mem);
-	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
-	return EmitValueOrZeroIfCondition(state, active, [&]() {
+// Loads `bits` (8, 16 or 32) at any byte alignment through the BDA page table.
+uint32_t LoadBdaAt(ValueEmitContext& ctx, uint32_t address, uint32_t bits) {
+	auto& state = ctx.state;
+	{
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
 		                            ConstantDeviceAddress(state, ~uint64_t {3}));
 		const auto first   = LoadBdaDword(ctx, aligned);
@@ -235,8 +233,17 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 		return bits == 32u ? merged
 		                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
 		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
-	});
+	}
 }
+
+uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+	             uint32_t bits) {
+	const auto address = GuestAddress(ctx, inst, mem);
+	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
+	return EmitValueOrZeroIfCondition(ctx.state, active,
+	                                  [&]() { return LoadBdaAt(ctx, address, bits); });
+}
+
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
@@ -439,6 +446,40 @@ uint32_t FormattedLoadPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 		    return LoadSubwordPrepared(ctx, inst, RebaseFormattedComponent(mem, info, component),
 		                               resource, bits, sign_extend);
 	    });
+}
+
+// A formatted component read straight from guest memory: the address already points at the
+// record, the format decides the component's byte offset and unpacking. Used by vertex
+// programs that fetch through the page table instead of fixed-function input.
+uint32_t FormattedLoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	auto&      state   = ctx.state;
+	const auto info    = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	const auto address = GuestAddress(ctx, inst, mem);
+	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto at      = [&](uint32_t component) {
+		const auto offset = Format::GetFormatComponentByteOffset(info, component);
+		return offset == 0u ? address
+		                    : Binary(state, spv::OpIAdd, TypeScalarU64(state), address,
+		                             ConstantDeviceAddress(state, offset));
+	};
+	return EmitValueOrZeroIfCondition(state, active, [&]() {
+		if (info.type == Format::ComponentType::Unknown) {
+			return LoadBdaAt(ctx, address, 32u);
+		}
+		return LoadFormattedComponent(
+		    ctx, mem, info, mem.component_index,
+		    [&](uint32_t component) { return LoadBdaAt(ctx, at(component), 32u); },
+		    [&](uint32_t component, uint32_t bits, bool sign_extend) {
+			    const auto value = LoadBdaAt(ctx, at(component), bits);
+			    if (!sign_extend) {
+				    return value;
+			    }
+			    const auto result = state.builder.AllocateId();
+			    state.builder.AddFunction(spv::OpBitFieldSExtract, TypeU32(state), result, value,
+			                              ConstantU32(state, 0), ConstantU32(state, bits));
+			    return result;
+		    });
+	});
 }
 
 uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -1114,6 +1155,9 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
+	else if (address_info.access == IR::AddressAccess::Read &&
+	         mem.kind != IR::ResourceKind::Scratch && mem.formatted && mem.typed)
+		value = FormattedLoadBda(ctx, inst, mem);
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, inst, mem, address_info.data_bits);

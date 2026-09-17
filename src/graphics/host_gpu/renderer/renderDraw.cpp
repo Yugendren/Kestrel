@@ -64,6 +64,12 @@ std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	EXIT_IF(!vs_input_info.stage);
 	const auto& program   = *vs_input_info.stage.program;
 	const auto& resources = vs_input_info.stage.resources;
+	// A program that fetches its own vertices runs the guest's index arithmetic, which adds the
+	// user-data vertex and instance offsets itself; feeding them through the draw as well would
+	// apply them twice. Only the packet's index offset stays with the draw, as on the hardware.
+	if (program.info.gpu_vertex_fetch) {
+		return {vertex_offset, instance_offset};
+	}
 	if (index_offset == 0 &&
 	    program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
 		const auto index =
@@ -770,6 +776,12 @@ struct PreparedIndexBuffer {
 // w happens to be 0). Bound non-indexed draws to the vertices the strided per-vertex buffers
 // actually hold.
 // The highest vertex index the bound V#s can supply, or UINT64_MAX when none of them bounds it.
+// Programs that fetch vertices through the page table bound their reads by NUM_RECORDS in the
+// shader and take no fixed-function vertex input, so nothing is bound or clamped for them.
+static bool UsesGpuVertexFetch(const ShaderVertexInputInfo& info) {
+	return info.stage.program != nullptr && info.stage.program->info.gpu_vertex_fetch;
+}
+
 static uint64_t AutoVertexLimit(const ShaderVertexInputInfo& info) {
 	uint64_t limit = UINT64_MAX;
 	for (int i = 0; i < info.buffers_num; i++) {
@@ -1425,7 +1437,9 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				                      emit.first_instance);
 			} else {
 				const auto vertex_count =
-				    ClampAutoVertexCount(vs_input_info, emit.first_vertex, draw.index_count);
+				    UsesGpuVertexFetch(vs_input_info)
+				        ? draw.index_count
+				        : ClampAutoVertexCount(vs_input_info, emit.first_vertex, draw.index_count);
 				if (vertex_count == 0) {
 					break;
 				}
@@ -1464,7 +1478,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                     bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
 	const bool mesh_active = state.vs_input_info.stage.program->stage == ShaderType::Mesh;
-	if (draw.indirect != nullptr && !draw.IsIndexed() &&
+	if (draw.indirect != nullptr && !draw.IsIndexed() && !UsesGpuVertexFetch(state.vs_input_info) &&
 	    AutoVertexLimit(state.vs_input_info) != UINT64_MAX) {
 		// The vertex count comes out of guest memory, so ClampAutoVertexCount() cannot bound it
 		// to what the V#s hold. Rather than let the GPU fetch vertices past NUM_RECORDS, hand the
@@ -1523,8 +1537,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (!UsesGpuVertexFetch(state.vs_input_info)) {
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vs_input_info);
+		}
+		index_binding = PrepareIndexBuffer(buffer, index_source);
 	}
 	PreparedIndirectArgs indirect_binding;
 	if (draw.indirect != nullptr) {

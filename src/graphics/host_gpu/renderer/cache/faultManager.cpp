@@ -5,6 +5,8 @@
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/ir/passes/GpuVertexFetch.h"
+#include "graphics/shader/shader.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -139,6 +141,12 @@ void FaultManager::ProcessFaultBuffer() {
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
 		for (uint32_t index = 1; index <= count; ++index) {
+			if (faults[index] == ShaderRecompiler::IR::VertexFetchDriftAddress) {
+				// A vertex program found its runtime V# differs from the format it was compiled
+				// against; drop the cached table layouts so the next draw decodes and recompiles.
+				ShaderVertexTablesDrifted();
+				continue;
+			}
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
 		}

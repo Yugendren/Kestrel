@@ -31,6 +31,7 @@ struct TranslateOptions {
 	bool                          dispatcher_fallback = false;
 	bool                          bvh_always_miss     = false;
 	bool                          bvh_reduced         = false;
+	bool                          gpu_vertex_fetch    = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string_view              fallback_reason;
 	ShaderStageInputInfo          input_info;

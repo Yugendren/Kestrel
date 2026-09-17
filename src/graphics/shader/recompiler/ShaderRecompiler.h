@@ -26,6 +26,9 @@ struct CompileOptions {
 	// traversal loop descends one branch per node instead of up to four. Independent of
 	// bvh_always_miss, which removes the traversal entirely.
 	bool                        bvh_reduced                = false;
+	// Vertex stage only: keep the guest's own attribute-table and V# reads and fetch vertex data
+	// through the BDA page table instead of fixed-function vertex input.
+	bool                        gpu_vertex_fetch           = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

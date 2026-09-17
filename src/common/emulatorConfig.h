@@ -66,6 +66,10 @@ struct GraphicsSettings {
 	// flips per second; guest-visible vblank timing is unaffected.
 	uint32_t frame_cap      = 0;
 };
+// Where the vertex attribute and V# tables are decoded. Cpu: the command processor reads
+// them and binds fixed-function vertex input. Gpu: the vertex shader reads them itself
+// through the buffer device address page table, so GPU-written tables never stall the CPU.
+enum class VertexFetchMode { Cpu, Gpu };
 
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
@@ -77,6 +81,7 @@ struct ConfigOptions {
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
 	GraphicsSettings       graphics;
+	VertexFetchMode        vertex_fetch                = VertexFetchMode::Cpu;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
@@ -121,6 +126,7 @@ float    GetLodBias();
 float    GetPostScale();
 uint32_t GetShadowMax();
 uint32_t GetFrameCap();
+VertexFetchMode GetVertexFetchMode();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
