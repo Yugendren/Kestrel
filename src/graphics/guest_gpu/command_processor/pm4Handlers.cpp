@@ -1793,6 +1793,13 @@ KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
 
 	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
+	// Unlike CpOpReleaseMem, this packet used to leave the write batched with no record that a
+	// flush was still owed: ReleaseMemBatch never saw it, so a queue that fell idle right after
+	// (the common case for a lone async-compute completion event) could hold the underlying
+	// command buffer -- and the interrupt or label write recorded into it -- unsubmitted forever.
+	if (!cp.DeferReleaseMemFlush()) {
+		cp.BufferFlush();
+	}
 
 	return 5;
 }
@@ -1816,6 +1823,11 @@ KYTY_CP_OP_PARSER(CpOpEventWriteEos) {
 
 	cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
+	// See CpOpEventWriteEop: without this, ReleaseMemBatch never learns the write is pending and
+	// an idle queue can leave it, and any interrupt it carries, unsubmitted indefinitely.
+	if (!cp.DeferReleaseMemFlush()) {
+		cp.BufferFlush();
+	}
 
 	return 4;
 }
