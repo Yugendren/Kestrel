@@ -91,6 +91,17 @@ public:
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
+	// The guest ranges whose bytes have changed since the set was last drained. A draw whose
+	// program reaches memory through the page table synchronises those ranges and nothing else.
+	void MarkRangeDirty(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.MarkRangeDirty(vaddr, size);
+	}
+	[[nodiscard]] bool HasDirtyRanges() const noexcept { return m_memory_tracker.HasDirtyRanges(); }
+	template <typename Func>
+	void DrainDirtyRanges(Func&& func) {
+		m_memory_tracker.DrainDirtyRanges(std::forward<Func>(func));
+	}
+
 private:
 	friend struct BufferCacheTestAccess;
 

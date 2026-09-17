@@ -59,11 +59,25 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
 		return manager;
 	}
+	// A new region starts out entirely CPU-dirty, so every buffer already cached inside it needs
+	// re-uploading.
+	ScopedDirtyPublish published(*this, index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;
+}
+
+void MemoryTracker::MarkRangeDirty(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0) {
+		return;
+	}
+	{
+		std::scoped_lock lock(m_dirty_mutex);
+		m_dirty.Add(vaddr, size);
+	}
+	m_has_dirty.store(true, std::memory_order_release);
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -84,6 +98,7 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	ScopedDirtyPublish published(*this, vaddr, size);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
@@ -108,6 +123,7 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	ScopedDirtyPublish published(*this, vaddr, size);
 	std::vector<RegionManager*> managers;
 	managers.reserve((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) /
 	                 TRACKER_REGION_SIZE);

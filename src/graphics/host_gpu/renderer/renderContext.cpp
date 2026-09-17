@@ -98,6 +98,9 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	// Buffers cached over this range were marked dirty when it was unmapped, and that publication
+	// was dropped because an unmapped range is never synchronised. Re-arm it.
+	m_buffer_cache.MarkRangeDirty(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -144,11 +147,22 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
 	m_fault_process_pending = true;
+	// Shaders reach guest memory through the buffer-device-address page table, so every cached
+	// buffer has to hold what the guest last wrote. Only the buffers whose bytes have actually
+	// changed since the previous preparation can be out of date, and every point that can change
+	// them publishes its range, so the usual answer is that there is nothing to do at all.
+	if (!m_buffer_cache.HasDirtyRanges()) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_buffer_cache.DrainDirtyRanges([this](uint64_t begin, uint64_t end) {
+		// A cached buffer outlives its guest mapping, and synchronising one would copy from host
+		// memory that has been released, so the walk stays inside the mapped ranges.
+		m_mapped_ranges.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, finish - start);
+		});
+	});
 }
 
 void RenderContext::RunGarbageCollector() {

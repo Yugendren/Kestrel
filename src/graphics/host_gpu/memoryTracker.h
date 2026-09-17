@@ -29,6 +29,49 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Records that the guest bytes in this range may now need re-uploading into whatever buffer
+	// caches them. Thread-safe: guest write faults publish from the thread that faulted.
+	void MarkRangeDirty(uint64_t vaddr, uint64_t size) noexcept;
+	[[nodiscard]] bool HasDirtyRanges() const noexcept {
+		return m_has_dirty.load(std::memory_order_acquire);
+	}
+	// Moves the published set out and reports each range as (begin, end). Ranges published while
+	// the drain runs stay for the next one.
+	template <typename Func>
+	void DrainDirtyRanges(Func&& func) {
+		RangeSet taken;
+		{
+			std::scoped_lock lock(m_dirty_mutex);
+			if (m_dirty.Empty()) {
+				return;
+			}
+			taken = std::move(m_dirty);
+			m_dirty.Clear();
+			m_has_dirty.store(false, std::memory_order_relaxed);
+		}
+		taken.ForEach(func);
+	}
+
+	// Publication has to bracket the state change it describes. A drain running concurrently then
+	// either takes the range before the pages are marked -- and the publication on the way out
+	// arms the next drain -- or takes it after them. Publishing only on the way out would leave a
+	// freshly written page waiting for an extra preparation, because unprotecting it costs an
+	// mprotect and its TLB shootdown; publishing only on the way in would let a drain consume the
+	// range while the marks did not exist yet, and lose it.
+	class ScopedDirtyPublish final {
+	public:
+		ScopedDirtyPublish(MemoryTracker& tracker, uint64_t vaddr, uint64_t size) noexcept
+		    : m_tracker(tracker), m_vaddr(vaddr), m_size(size) {
+			m_tracker.MarkRangeDirty(m_vaddr, m_size);
+		}
+		~ScopedDirtyPublish() { m_tracker.MarkRangeDirty(m_vaddr, m_size); }
+		KYTY_CLASS_NO_COPY(ScopedDirtyPublish);
+
+	private:
+		MemoryTracker& m_tracker;
+		uint64_t       m_vaddr;
+		uint64_t       m_size;
+	};
 	// Removes protection from a range and flushes GPU-owned data when required.
 	// With from_fault the range is a single faulting guest page and the CPU-dirty mark is
 	// widened over its coarse block, which is what keeps a sequential guest write from costing
@@ -37,6 +80,11 @@ public:
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
+		// A write fault marks the whole coarse block its page belongs to (see
+		// RegionManager::MarkCpuModifiedFromFault), so that is what has to be published.
+		constexpr uint64_t block_bytes = TRACKER_FAULT_BLOCK_PAGES * TRACKER_PAGE_SIZE;
+		ScopedDirtyPublish published(*this, from_fault ? (vaddr & ~(block_bytes - 1)) : vaddr,
+		                             from_fault ? block_bytes : size);
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
@@ -159,6 +207,11 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+
+	// The guest ranges whose bytes have changed since the set was last drained.
+	std::mutex        m_dirty_mutex;
+	RangeSet          m_dirty;
+	std::atomic<bool> m_has_dirty {false};
 };
 
 } // namespace Libs::Graphics
