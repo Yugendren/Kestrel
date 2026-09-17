@@ -81,6 +81,11 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
 	if constexpr (insert) {
+		// Nothing has ever been uploaded into the new buffer, and the guest bytes it caches may
+		// have been marked clean long ago for a buffer that no longer exists, so it has to be
+		// offered to the next synchronisation whatever the tracker currently says.
+		MemoryTracker::ScopedDirtyPublish published(m_memory_tracker, buffer.CpuAddress(),
+		                                            buffer.Size());
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
