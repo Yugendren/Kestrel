@@ -13,6 +13,9 @@ struct EmbeddedFetchLoad {
 	uint32_t              pc         = 0;
 	int                   attrib_id  = -1;
 	uint32_t              components = 0;
+	// Scalar loads that read this attribute's table entries. Only --vertex-fetch gpu needs them:
+	// it keeps and marks those reads so the shader fetches the tables itself.
+	std::vector<uint32_t> prolog_loads;
 };
 
 struct EmbeddedFetchPlan {
@@ -30,6 +33,7 @@ struct TranslateOptions {
 	bool                          dispatcher_fallback = false;
 	bool                          bvh_always_miss     = false;
 	bool                          bvh_reduced         = false;
+	bool                          gpu_vertex_fetch    = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string_view              fallback_reason;
 	ShaderStageInputInfo          input_info;

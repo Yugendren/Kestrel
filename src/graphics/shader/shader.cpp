@@ -518,9 +518,79 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	return reg;
 }
 
+// With GPU-side vertex fetch the shader reads the attribute and V# tables itself, so the
+// command processor only needs the table-derived layout once per vertex program: the formats
+// the program was compiled against and the register destinations. Base addresses in the cached
+// V#s go stale and are never used. A drift report from the shader empties the cache.
+namespace {
+
+struct VertexTableLayout {
+	ShaderBufferResource    resources[ShaderVertexInputInfo::RES_MAX];
+	ShaderVertexDestination resources_dst[ShaderVertexInputInfo::RES_MAX];
+	ShaderVertexInputBuffer buffers[ShaderVertexInputInfo::RES_MAX];
+	int                     resources_num = 0;
+	int                     buffers_num   = 0;
+};
+
+class VertexTableCache {
+public:
+	bool Restore(uint64_t shader_hash, ShaderVertexInputInfo& info) {
+		std::scoped_lock lock {m_mutex};
+		const auto       found = m_layouts.find(shader_hash);
+		if (found == m_layouts.end()) {
+			return false;
+		}
+		const auto& layout = found->second;
+		std::copy_n(layout.resources, ShaderVertexInputInfo::RES_MAX, info.resources);
+		std::copy_n(layout.resources_dst, ShaderVertexInputInfo::RES_MAX, info.resources_dst);
+		std::copy_n(layout.buffers, ShaderVertexInputInfo::RES_MAX, info.buffers);
+		info.resources_num = layout.resources_num;
+		info.buffers_num   = layout.buffers_num;
+		return true;
+	}
+
+	void Store(uint64_t shader_hash, const ShaderVertexInputInfo& info) {
+		std::scoped_lock lock {m_mutex};
+		auto&            layout = m_layouts[shader_hash];
+		std::copy_n(info.resources, ShaderVertexInputInfo::RES_MAX, layout.resources);
+		std::copy_n(info.resources_dst, ShaderVertexInputInfo::RES_MAX, layout.resources_dst);
+		std::copy_n(info.buffers, ShaderVertexInputInfo::RES_MAX, layout.buffers);
+		layout.resources_num = info.resources_num;
+		layout.buffers_num   = info.buffers_num;
+	}
+
+	void Clear() {
+		std::scoped_lock lock {m_mutex};
+		m_layouts.clear();
+	}
+
+private:
+	std::mutex                                     m_mutex;
+	std::unordered_map<uint64_t, VertexTableLayout> m_layouts;
+};
+
+VertexTableCache& GetVertexTableCache() {
+	static VertexTableCache cache;
+	return cache;
+}
+
+} // namespace
+
+bool ShaderGpuVertexFetchEnabled() {
+	static const bool enabled =
+	    Config::GetVertexFetchMode() == Config::VertexFetchMode::Gpu;
+	return enabled;
+}
+
+void ShaderVertexTablesDrifted() {
+	GetVertexTableCache().Clear();
+}
+
+// gpu_fetch_hash identifies a vertex program compiled for --vertex-fetch gpu, whose decoded
+// table layout is cached per program; 0 decodes the tables on every call.
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
-                                           const ShaderMappedData& data,
+                                           const ShaderMappedData& data, uint64_t gpu_fetch_hash,
                                            ShaderVertexInputInfo&  info) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -550,6 +620,10 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		info.fetch_attrib_reg = metadata.vertex_attrib_reg;
 		info.fetch_buffer_reg = metadata.vertex_buffer_reg;
 
+		const auto shader_hash = gpu_fetch_hash;
+		if (shader_hash != 0u && GetVertexTableCache().Restore(shader_hash, info)) {
+			return true;
+		}
 		const auto* attrib = reinterpret_cast<const uint32_t*>(
 		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
 		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
@@ -565,6 +639,9 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
 		                           metadata.input_semantics_count, attrib, buffer);
 		ShaderDetectBuffers(info);
+		if (shader_hash != 0u) {
+			GetVertexTableCache().Store(shader_hash, info);
+		}
 	}
 	return true;
 }
@@ -771,7 +848,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    merged ? 8u : 0u);
 	if (!merged) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
-		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
+		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data,
+		                                    ShaderGpuVertexFetchEnabled() ? params.hash : 0u, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
@@ -861,7 +939,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 
 	input_info = {};
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
-	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, 0u, input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;

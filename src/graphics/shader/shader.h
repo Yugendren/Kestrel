@@ -302,6 +302,13 @@ struct ShaderMappedData {
 };
 
 void ShaderInit();
+// Forget the vertex tables decoded for GPU-side vertex fetch; the next draw of each vertex
+// program reads its tables again. Called when a shader reports that its runtime V# no
+// longer matches the format it was compiled against.
+void ShaderVertexTablesDrifted();
+// True when vertex programs fetch their attributes through the page table, so the command
+// processor neither decodes the tables per draw nor binds fixed-function vertex input.
+bool ShaderGpuVertexFetchEnabled();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

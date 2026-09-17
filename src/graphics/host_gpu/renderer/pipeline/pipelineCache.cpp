@@ -402,6 +402,8 @@ struct PipelineCache::ProgramCache {
 		options.bvh_always_miss    = Config::GetRtMode() == Config::RtMode::Off;
 		options.bvh_reduced        = Config::GetRtMode() == Config::RtMode::Reduced;
 		options.dump_label  = label;
+		options.gpu_vertex_fetch =
+		    stage == ShaderType::Vertex && Config::GetVertexFetchMode() == Config::VertexFetchMode::Gpu;
 		options.input_info  = stage_input;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -838,7 +840,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
 
-	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
+	if (vs_input_info.stage.program->stage != ShaderType::Mesh &&
+	    !vs_input_info.stage.program->info.gpu_vertex_fetch) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
 		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
 		        vs_input_info.resources_num < 0 ||

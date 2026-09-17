@@ -1,5 +1,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ir/passes/GpuVertexFetch.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
@@ -468,6 +470,48 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 			WriteOperand(OffsetOperand(inst.dst, component),
 			             ir.CompositeExtract(loaded, component));
 		}
+	}
+}
+
+// Formatted vertex load whose V# is only known on the GPU. The format and destination select
+// are baked from the V# the command processor decoded when the program was compiled; the
+// lowering pass computes the address from the runtime V# and checks those bits still match.
+void Translator::TranslateGpuVertexFetch(const Decoder::Instruction& inst,
+                                         uint32_t component_count,
+                                         const ShaderBufferResource& resource) {
+	const auto buffer_format = resource.Format();
+	const auto format        = Format::GetFormatInfo(buffer_format);
+	auto       memory        = MemoryInfoFromDecoded(inst);
+	memory.typed             = true;
+	memory.formatted         = true;
+	memory.data_format       = static_cast<uint32_t>(buffer_format) & 0xfu;
+	memory.number_format     = static_cast<uint32_t>(buffer_format) >> 4u;
+	memory.vertex_fetch      = IR::VertexFetchRole::Attribute;
+	memory.vertex_check      = resource.fields[3] & IR::VertexFetchCheckMask;
+	memory.data_dwords       = 1u;
+	memory.component_count   = 1u;
+	const auto handle  = GetBufferResource(memory);
+	const auto address = ReadBufferAddress(inst, 0);
+	for (uint32_t component = 0; component < component_count; component++) {
+		auto source = Format::FormattedSource {Format::FormattedSourceKind::Memory, component};
+		if (inst.formatted && !inst.typed) {
+			source = Format::ResolveFormattedSource(
+			    format, GetDstSel(resource.DstSelXYZW(), component));
+			if (source.kind == Format::FormattedSourceKind::Invalid) {
+				EXIT("invalid formatted vertex input at pc 0x%08x", inst.pc);
+			}
+		}
+		IR::Value value;
+		if (source.kind == Format::FormattedSourceKind::Memory) {
+			auto scalar            = memory;
+			scalar.component_index = source.component;
+			value = ir.Emit(IR::ValueOpcode::LoadBufferU32,
+			                {handle, address.index, address.offset, address.soffset, ir.GetExec()},
+			                AddMemoryInfo(scalar, inst.pc));
+		} else {
+			value = IR::Value(Format::FormattedConstantBits(format, source.kind));
+		}
+		WriteOperand(OffsetOperand(inst.dst, component), value);
 	}
 }
 

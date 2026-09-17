@@ -43,6 +43,8 @@ enum class ResourceKind {
 	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
 }
 
+enum class VertexFetchRole : uint8_t { None, Table, Attribute };
+
 struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
 	uint32_t                resource                 = 0;
@@ -69,6 +71,11 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	// In-shader vertex fetch: Table marks a guest read of the attribute or V# table, Attribute
+	// marks one formatted component load whose V# is only known on the GPU. vertex_check holds
+	// the V# dword-3 format and destination-select bits the shader was compiled against.
+	VertexFetchRole         vertex_fetch                                          = VertexFetchRole::None;
+	uint32_t                vertex_check                                          = 0;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		return !formatted && !typed && data_bits == 32u &&
@@ -456,6 +463,7 @@ struct ShaderInfo {
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;
+	bool                             gpu_vertex_fetch   = false;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
 

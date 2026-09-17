@@ -797,6 +797,15 @@ const EmbeddedFetchLoad* FindEmbeddedFetchLoad(const EmbeddedFetchPlan* plan, ui
 	return found != plan->loads.end() ? &*found : nullptr;
 }
 
+bool IsEmbeddedFetchPrologLoad(const EmbeddedFetchPlan* plan, uint32_t pc) {
+	if (plan == nullptr) {
+		return false;
+	}
+	return std::ranges::any_of(plan->loads, [pc](const auto& load) {
+		return std::ranges::find(load.prolog_loads, pc) != load.prolog_loads.end();
+	});
+}
+
 int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo& input,
                                  const EmbeddedFetchLoad&     load) {
 	if (load.attrib_id >= 0 && load.attrib_id < input.resources_num &&
@@ -816,6 +825,22 @@ int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo& input,
 		}
 	}
 	return -1;
+}
+
+bool IsScalarMemoryLoad(Decoder::Opcode opcode) {
+	switch (opcode) {
+		case Decoder::Opcode::S_LOAD_DWORD:
+		case Decoder::Opcode::S_LOAD_DWORDX2:
+		case Decoder::Opcode::S_LOAD_DWORDX4:
+		case Decoder::Opcode::S_LOAD_DWORDX8:
+		case Decoder::Opcode::S_LOAD_DWORDX16:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORD:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX2:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return true;
+		default: return false;
+	}
 }
 
 bool IsBufferDwordLoad(Decoder::Opcode opcode) {
@@ -950,6 +975,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.cfg_failure_kind    = options.cfg_failure_kind;
 	result.fallback_reason     = options.fallback_reason;
 	if (options.embedded_fetch != nullptr) {
+		result.info.gpu_vertex_fetch     = options.gpu_vertex_fetch;
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
 	}
@@ -1260,6 +1286,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
 				continue;
 			}
+			if (options.gpu_vertex_fetch && IsScalarMemoryLoad(instruction.opcode) &&
+			    IsEmbeddedFetchPrologLoad(options.embedded_fetch, instruction.pc)) {
+				translator.TranslateVertexTableLoad(instruction);
+				continue;
+			}
 			const auto* embedded = FindEmbeddedFetchLoad(options.embedded_fetch, instruction.pc);
 			if (embedded != nullptr && IsBufferDwordLoad(instruction.opcode) &&
 			    instruction.data_dwords == embedded->components &&
@@ -1270,9 +1301,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 					EXIT("embedded vertex fetch at 0x%08x has no resource for attribute %d",
 					     instruction.pc, embedded->attrib_id);
 				}
-				translator.TranslateEmbeddedFetch(instruction, static_cast<uint32_t>(resource),
-				                                  embedded->components,
-				                                  options.input_info.vertex->resources[resource]);
+				if (options.gpu_vertex_fetch) {
+					translator.TranslateGpuVertexFetch(
+					    instruction, embedded->components,
+					    options.input_info.vertex->resources[resource]);
+				} else {
+					translator.TranslateEmbeddedFetch(
+					    instruction, static_cast<uint32_t>(resource), embedded->components,
+					    options.input_info.vertex->resources[resource]);
+				}
 				continue;
 			}
 			translator.TranslateInstruction(instruction);
