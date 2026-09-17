@@ -478,6 +478,16 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state);
 		return;
 	}
+	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		    return output.kind == IR::StageOutputKind::Position;
+	    })) {
+		// Reserve one clip plane to cull vertices whose position came back all-zero, which is
+		// what an out-of-range fetch yields; the hardware never rasterises such a primitive.
+		state.invalid_position_clip_distance = clip_distance_count++;
+		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
+		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
+	}
 	const auto BuiltIn = [&](uint32_t& variable, uint32_t type, const char* name,
 	                         spv::BuiltIn builtin) {
 		if (variable == 0) {
