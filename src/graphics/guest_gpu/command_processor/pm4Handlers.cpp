@@ -2357,7 +2357,11 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01) {
+		// Flush regardless of which interrupt selector carried the event: 0x02/0x04 queue an
+		// interrupt through TriggerEopEventAtEndOfPipe exactly like 0x01 does, and skipping the
+		// flush for them left the write -- and the interrupt, on an async-compute queue that
+		// then goes idle -- unsubmitted indefinitely.
+		if (!cp.DeferReleaseMemFlush()) {
 			cp.BufferFlush();
 		}
 
@@ -2382,6 +2386,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                      data_sel, dst_gpu_addr, value, interrupt_selector, interrupt_context_id);
+	// This branch (data_sel 2/3) had no flush at all: unlike every other RELEASE_MEM path above,
+	// the write -- and any interrupt interrupt_selector requested -- was left in the command
+	// buffer with nothing to ever submit it once the issuing queue ran out of further PM4.
+	if (!cp.DeferReleaseMemFlush()) {
+		cp.BufferFlush();
+	}
 
 	return 7;
 }
