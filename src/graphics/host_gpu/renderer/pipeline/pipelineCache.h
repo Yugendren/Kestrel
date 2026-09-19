@@ -10,11 +10,14 @@
 #include "graphics/shader/shader.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <xxhash.h>
@@ -174,10 +177,33 @@ public:
 	                             const ShaderProgram&          compute_program);
 
 private:
-	// Body shared by Save() (which takes m_mutex) and MaybeSaveLocked() (called with m_mutex
-	// already held), so the locking is split out into the public Save() wrapper below.
-	void SaveLocked();
 	[[nodiscard]] size_t PipelineCountLocked() const;
+
+	// getPipelineCacheData() + the temp-file write, with none of m_mutex held: it touches only
+	// state that is fixed once InitializeDriverCache() returns from the constructor
+	// (m_graphics.device, m_driver_cache, m_driver_cache_path) and is never written again, so it
+	// is safe to call from the background saver thread and from Save() alike. A VkPipelineCache
+	// created without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT (see
+	// InitializeDriverCache()) is internally synchronised by the driver, so this may run
+	// concurrently with vkCreateGraphicsPipelines/vkCreateComputePipelines against the same
+	// cache on the command-processor thread. m_save_io_mutex only serialises this method against
+	// itself, so a background save and a shutdown Save() never write the temp file at once.
+	void SerializeAndWrite();
+	std::mutex m_save_io_mutex;
+
+	// Background saver: MaybeSaveLocked() (command-processor thread, m_mutex held) only flips
+	// m_save_requested and wakes this thread; the actual multi-megabyte serialise-and-write runs
+	// here, off the draw thread and without m_mutex. The thread is started lazily by the first
+	// RequestBackgroundSave() and is therefore never created while m_driver_cache == nullptr
+	// (cache disabled). Guarded by m_saver_mutex/m_saver_cv, never by m_mutex -- this thread must
+	// never block on m_mutex, since that would reintroduce the hitch this design removes.
+	void SaverThreadLoop();
+	void RequestBackgroundSave();
+	std::mutex              m_saver_mutex;
+	std::condition_variable m_saver_cv;
+	bool                    m_save_requested = false;
+	bool                    m_saver_stop     = false;
+	std::thread             m_saver_thread;
 
 	struct ProgramCache;
 
@@ -253,16 +279,19 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
-	// Pipeline count and wall-clock time as of the last SaveLocked() attempt, used by
+	// Pipeline count and wall-clock time as of the last background-save request, used by
 	// MaybeSaveLocked() to decide whether a new save is worth its cost.
 	size_t                                m_pipeline_count_at_last_save = 0;
-	// Pipelines covered by the blob currently on disk, so a save with nothing new is skipped.
+	// Pipelines covered by the blob currently on disk (or, for a request still in flight on the
+	// saver thread, optimistically assumed to be covered once it lands -- see MaybeSaveLocked()),
+	// so a save with nothing new is skipped.
 	size_t m_persisted_pipeline_count = 0;
 	std::chrono::steady_clock::time_point m_last_save_time;
 
 	void InitializeDriverCache();
 	// Saves periodically as new pipelines are created; called with m_mutex already held by the
-	// pipeline getters, so it must not take the lock itself.
+	// pipeline getters, so it must not take the lock itself. Only records bookkeeping under
+	// m_mutex and hands the actual save off to the background saver thread.
 	void MaybeSaveLocked();
 };
 

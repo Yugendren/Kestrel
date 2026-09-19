@@ -515,6 +515,17 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	// Stop and join the saver thread before anything it touches goes away: SerializeAndWrite()
+	// reads m_graphics.device and m_driver_cache, both of which are destroyed a few lines below,
+	// so the thread must be fully stopped -- not just asked to stop -- before we proceed.
+	if (m_saver_thread.joinable()) {
+		{
+			std::lock_guard<std::mutex> lock(m_saver_mutex);
+			m_saver_stop = true;
+			m_saver_cv.notify_one();
+		}
+		m_saver_thread.join();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -617,27 +628,40 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+// Synchronous shutdown path (WindowRun() and ~PipelineCache()): unlike the periodic saves from
+// MaybeSaveLocked(), this must have actually finished writing before the caller moves on, so it
+// calls SerializeAndWrite() directly instead of going through the background saver thread.
 void PipelineCache::Save() {
+	{
+		Common::LockGuard lock(m_mutex);
+		if (m_driver_cache == nullptr) {
+			return;
+		}
+		// The driver cache object stays alive for the whole session so it can be written again as
+		// more pipelines appear; re-serialising a blob that already matches what is on disk would
+		// only cost time, which is what a shutdown save right after a background one would
+		// otherwise do.
+		if (m_persisted_pipeline_count == PipelineCountLocked()) {
+			return;
+		}
+	}
+	SerializeAndWrite();
 	Common::LockGuard lock(m_mutex);
-	SaveLocked();
+	m_persisted_pipeline_count = PipelineCountLocked();
 }
 
-// Body of the old Save(), split out so MaybeSaveLocked() (called from the pipeline getters,
-// which already hold m_mutex) can reuse it without locking m_mutex a second time.
 size_t PipelineCache::PipelineCountLocked() const {
 	return m_graphics_pipelines.size() + m_compute_pipelines.size();
 }
 
-void PipelineCache::SaveLocked() {
+void PipelineCache::SerializeAndWrite() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
-	// The driver cache object stays alive for the whole session so it can be written again as more
-	// pipelines appear; re-serialising a blob that already matches what is on disk would only cost
-	// time, which is what the shutdown save after a periodic one would otherwise do.
-	if (m_persisted_pipeline_count == PipelineCountLocked()) {
-		return;
-	}
+	// Guards only against another SerializeAndWrite() call (background saver vs. a shutdown
+	// Save()) racing to the same temp file -- see the declaration comment in the header for why
+	// this needs no other lock.
+	std::lock_guard<std::mutex> io_lock(m_save_io_mutex);
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -688,11 +712,15 @@ void PipelineCache::SaveLocked() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_persisted_pipeline_count = PipelineCountLocked();
+	// m_persisted_pipeline_count is not updated here: it is a m_mutex-protected member and this
+	// method must not touch m_mutex (see the header). MaybeSaveLocked() sets it optimistically at
+	// request time, and Save() sets it itself after calling this method directly -- see both.
 }
 
 // Called from the pipeline getters right after a new pipeline is inserted, with m_mutex already
-// held by that getter's own LockGuard -- hence SaveLocked() rather than Save().
+// held by that getter's own LockGuard, so this may only touch m_mutex-protected members directly
+// and must hand the actual save off to the background saver thread instead of calling
+// SerializeAndWrite() itself.
 void PipelineCache::MaybeSaveLocked() {
 	if (m_driver_cache == nullptr) {
 		return;
@@ -706,11 +734,44 @@ void PipelineCache::MaybeSaveLocked() {
 	    now - m_last_save_time < kMaxSaveInterval) {
 		return;
 	}
-	SaveLocked();
-	// Recorded even when SaveLocked() failed, so a save that keeps failing (e.g. disk full) is
-	// retried once per interval instead of on every single new pipeline.
+	// Recorded optimistically here rather than once the background write actually completes:
+	// the write happens asynchronously, off this thread and outside m_mutex, so there is nothing
+	// to wait on. If the write later fails, the only consequence is that the retry waits for the
+	// next threshold crossing -- the same failure policy a failed synchronous save already had.
+	m_persisted_pipeline_count    = pipeline_count;
 	m_pipeline_count_at_last_save = pipeline_count;
 	m_last_save_time              = now;
+	RequestBackgroundSave();
+}
+
+// Starts the saver thread lazily on first use (never while m_driver_cache == nullptr, since
+// MaybeSaveLocked() -- the only caller -- already returns before reaching here in that case) and
+// wakes it for one more pass. Several requests that land while a save is already in flight
+// collapse into the same m_save_requested flag, so at most one further save follows -- never a
+// queue.
+void PipelineCache::RequestBackgroundSave() {
+	std::lock_guard<std::mutex> lock(m_saver_mutex);
+	if (!m_saver_thread.joinable()) {
+		m_saver_thread = std::thread([this] { SaverThreadLoop(); });
+	}
+	m_save_requested = true;
+	m_saver_cv.notify_one();
+}
+
+void PipelineCache::SaverThreadLoop() {
+	for (;;) {
+		std::unique_lock<std::mutex> lock(m_saver_mutex);
+		m_saver_cv.wait(lock, [this] { return m_save_requested || m_saver_stop; });
+		if (m_saver_stop) {
+			return;
+		}
+		m_save_requested = false;
+		// Unlocked before the (potentially multi-millisecond) serialise-and-write, so a request
+		// that arrives while this is running only sets the flag above and is picked up by the
+		// next loop iteration instead of blocking the requester.
+		lock.unlock();
+		SerializeAndWrite();
+	}
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
