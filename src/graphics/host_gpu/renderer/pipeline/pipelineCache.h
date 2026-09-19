@@ -190,6 +190,12 @@ private:
 	// itself, so a background save and a shutdown Save() never write the temp file at once.
 	void SerializeAndWrite();
 	std::mutex m_save_io_mutex;
+	// Hash of the payload written by the most recent successful SerializeAndWrite(), guarded by
+	// m_save_io_mutex like the rest of that method's state (never m_mutex). Lets a save whose
+	// blob is byte-identical to what is already on disk -- e.g. a periodic save that landed right
+	// after a shutdown save, or a save cycle where every new pipeline was a cache hit -- return
+	// before touching the temp file, at the cost of one XXH3 pass over an in-memory buffer.
+	uint64_t m_last_written_payload_hash = 0;
 
 	// Background saver: MaybeSaveLocked() (command-processor thread, m_mutex held) only flips
 	// m_save_requested and wakes this thread; the actual multi-megabyte serialise-and-write runs

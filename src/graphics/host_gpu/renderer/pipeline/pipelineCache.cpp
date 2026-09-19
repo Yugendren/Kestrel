@@ -39,15 +39,25 @@ namespace Libs::Graphics {
 
 namespace {
 
-// The driver pipeline cache blob is tens of megabytes for a large title, and serialising it
-// (getPipelineCacheData + a temp-file write) costs tens of milliseconds, so MaybeSaveLocked()
-// must not run it on every new pipeline. Saving too rarely, though, means a crash or force-quit
-// loses more freshly-compiled pipelines and the next launch recompiles them from scratch, which
-// is exactly what this whole mechanism exists to avoid. These two thresholds -- whichever is
-// reached first -- balance that: enough new pipelines to make the save worthwhile, or enough
-// elapsed time that a long play session is not left unsaved.
-constexpr size_t                kMinNewPipelinesToSave = 16;
-constexpr std::chrono::seconds  kMaxSaveInterval {60};
+// The driver pipeline cache blob is tens of megabytes for a large title -- field data from a
+// real single-HDD system (driver, game dump, and asset streaming all sharing one disk) measured
+// 24.8-27.0 MB, written five times within a few minutes of play -- and serialising it
+// (getPipelineCacheData + a temp-file write) costs tens of milliseconds, competing with asset
+// streaming for the same disk and visibly worsening loading hitches (e.g. the boot splash). So
+// MaybeSaveLocked() must not run it on every new pipeline, or even every few seconds. Saving too
+// rarely, though, means a crash or force-quit loses more freshly-compiled pipelines and the next
+// launch recompiles them from scratch, which is exactly what this whole mechanism exists to
+// avoid. Vulkan has no incremental/delta pipeline-cache serialisation -- vkGetPipelineCacheData
+// always returns the entire blob -- so the only lever here is cadence (this trio of thresholds)
+// plus skipping a write whose payload turns out identical (see m_last_written_payload_hash).
+//   - kMinSaveInterval is a hard floor between two writes, whatever else happens: without it, a
+//     burst of new pipelines (e.g. loading into a new area) can still trigger back-to-back
+//     multi-megabyte writes.
+//   - kMinNewPipelinesToSave / kMaxSaveInterval are "enough new pipelines, or enough elapsed
+//     time" -- whichever is reached first, same as before, just tuned far less eager.
+constexpr std::chrono::seconds kMinSaveInterval {180};
+constexpr size_t               kMinNewPipelinesToSave = 64;
+constexpr std::chrono::seconds kMaxSaveInterval {600};
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
@@ -663,6 +673,11 @@ void PipelineCache::SerializeAndWrite() {
 	// this needs no other lock.
 	std::lock_guard<std::mutex> io_lock(m_save_io_mutex);
 
+	// "serialise" below is both vkGetPipelineCacheData calls (the size query and the actual
+	// copy, across every eIncomplete retry); "write" is the temp-file create+write+flush+rename.
+	// Reported in the success log line so a slow HDD write is visible without a profiler attach.
+	const auto serialize_start = std::chrono::steady_clock::now();
+
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -686,8 +701,19 @@ void PipelineCache::SerializeAndWrite() {
 		return;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	const auto payload_hash   = XXH3_64bits(payload.data(), payload.size());
+	const auto serialize_end  = std::chrono::steady_clock::now();
+
+	// The driver cache only grows as new pipelines compile in, but two consecutive periodic
+	// saves can still see an identical blob -- e.g. every draw between them hit a pipeline the
+	// previous save already covered. One XXH3 pass over the in-memory payload is negligible next
+	// to a multi-megabyte HDD write, so skip the write (before the temp file is even touched)
+	// rather than rewrite bytes already on disk.
+	if (payload_hash == m_last_written_payload_hash) {
+		return;
+	}
+
+	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
@@ -710,8 +736,13 @@ void PipelineCache::SerializeAndWrite() {
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
+	const auto write_end = std::chrono::steady_clock::now();
+	m_last_written_payload_hash = payload_hash;
+	const auto serialize_ms =
+	    std::chrono::duration<double, std::milli>(serialize_end - serialize_start).count();
+	const auto write_ms = std::chrono::duration<double, std::milli>(write_end - serialize_end).count();
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {} (serialise {:.1f} ms, write {:.1f} ms)",
+	                 payload.size(), Common::PathToString(m_driver_cache_path), serialize_ms, write_ms);
 	// m_persisted_pipeline_count is not updated here: it is a m_mutex-protected member and this
 	// method must not touch m_mutex (see the header). MaybeSaveLocked() sets it optimistically at
 	// request time, and Save() sets it itself after calling this method directly -- see both.
@@ -729,9 +760,15 @@ void PipelineCache::MaybeSaveLocked() {
 	if (pipeline_count <= m_pipeline_count_at_last_save) {
 		return;
 	}
-	const auto now = std::chrono::steady_clock::now();
+	const auto now     = std::chrono::steady_clock::now();
+	const auto elapsed = now - m_last_save_time;
+	// Hard floor first, independent of how many pipelines just landed -- see kMinSaveInterval's
+	// declaration comment for why a burst of new pipelines must not bypass it.
+	if (elapsed < kMinSaveInterval) {
+		return;
+	}
 	if (pipeline_count - m_pipeline_count_at_last_save < kMinNewPipelinesToSave &&
-	    now - m_last_save_time < kMaxSaveInterval) {
+	    elapsed < kMaxSaveInterval) {
 		return;
 	}
 	// Recorded optimistically here rather than once the background write actually completes:
