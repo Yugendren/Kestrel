@@ -41,25 +41,22 @@ vk::PrimitiveTopology  RepresentativeTopology(PipelineTopologyClass topology_cla
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
-	bool                       negative_one_to_one      = false;
-	bool                       depth_clip_enable        = true;
-	PipelineTopologyClass      topology_class           = PipelineTopologyClass::Point;
-	uint32_t                   samples                  = 1;
-	bool                       sample_shading_enable    = false;
-	bool                       depth_bounds_test_enable = false;
-	float                      depth_min_bounds         = 0.0f;
-	float                      depth_max_bounds         = 0.0f;
-	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       provoking_vtx_last                                 = false;
-	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
-	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	uint8_t                    alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	bool                   negative_one_to_one                                = false;
+	bool                   depth_clip_enable                                  = true;
+	PipelineTopologyClass  topology_class                                     = PipelineTopologyClass::Point;
+	uint32_t               samples                                            = 1;
+	bool                   sample_shading_enable                              = false;
+	uint32_t               color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
+	bool                   provoking_vtx_last                                 = false;
+	vk::PolygonMode        polygon_mode                                       = vk::PolygonMode::eFill;
+	uint8_t                color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t                color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t                color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	uint8_t                alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t                alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t                alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	bool                   separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool                   blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -69,7 +66,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 118);
+static_assert(sizeof(PipelineStaticParameters) == 109);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};

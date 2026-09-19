@@ -847,19 +847,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 	}
 
-	const auto& clip_control               = ctx.GetClipControl();
-	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
-	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
-	static_params.topology_class           = TopologyClassOf(topology);
-	static_params.samples                  = attachment_samples;
+	const auto& clip_control          = ctx.GetClipControl();
+	static_params.negative_one_to_one = !clip_control.dx_clip_space;
+	static_params.depth_clip_enable   = clip_control.IsZClipEnabled();
+	static_params.topology_class      = TopologyClassOf(topology);
+	static_params.samples             = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	// Cull mode is dynamic per draw (see SetGraphicsDynamicParams), but the pipeline's fixed
 	// polygon mode still depends on which face(s) are visible, so ResolvePolygonMode needs the
 	// same flags as locals instead of static_params members.

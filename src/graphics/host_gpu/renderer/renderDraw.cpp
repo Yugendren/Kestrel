@@ -405,6 +405,14 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+#if defined(__APPLE__)
+	// MoltenVK lacks the depthBounds feature; depth-bounds testing stays disabled and the bounds
+	// themselves are never set (see the matching guard in CreatePipelineInternal).
+	vk_buffer.setDepthBoundsTestEnable(VK_FALSE);
+#else
+	vk_buffer.setDepthBoundsTestEnable(depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
+	vk_buffer.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+#endif
 
 	const auto& mode = ctx.GetModeControl();
 
@@ -445,17 +453,19 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
+	// Every pipeline declares the stencil op, masks and reference dynamic, and Vulkan requires
+	// each declared dynamic state to be set in the command buffer before a draw even when the
+	// stencil test is off. With the test disabled the depth info keeps value-initialised faces
+	// (KEEP ops, zero masks), which are inert.
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
-	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
-		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
-	}
+	const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+		vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
+		vk_buffer.setStencilCompareMask(face, state.compareMask);
+		vk_buffer.setStencilWriteMask(face, state.writeMask);
+		vk_buffer.setStencilReference(face, state.reference);
+	};
+	set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
+	set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
 
 #if defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the

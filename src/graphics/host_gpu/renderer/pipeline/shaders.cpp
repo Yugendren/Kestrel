@@ -466,15 +466,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
+	// Depth-bounds test enable, stencil test enable and every stencil op are dynamic per draw
+	// (see SetGraphicsDynamicParams), so nothing here needs to come from static_params anymore.
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
-	depth_stencil_info.depthBoundsTestEnable =
-#if defined(__APPLE__)
-	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
-#else
-	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-#endif
-	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
@@ -485,6 +479,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eDepthTestEnable,
 	    vk::DynamicState::eDepthWriteEnable,
 	    vk::DynamicState::eDepthCompareOp,
+	    vk::DynamicState::eDepthBoundsTestEnable,
 	    vk::DynamicState::eDepthBiasEnable,
 	    vk::DynamicState::eDepthBias,
 	    vk::DynamicState::eStencilTestEnable,
@@ -500,6 +495,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		dynamic_states.push_back(vk::DynamicState::ePrimitiveRestartEnable);
 	}
 #if !defined(__APPLE__)
+	// MoltenVK lacks the depthBounds feature; SetGraphicsDynamicParams keeps depthBoundsTestEnable
+	// false and skips setDepthBounds on that platform instead of declaring this dynamic state.
+	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
