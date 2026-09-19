@@ -1,3 +1,4 @@
+#include <atomic>
 #include "common/abi.h"
 #include "common/dateTime.h"
 #include "common/file.h"
@@ -1369,6 +1370,15 @@ static int ExecuteAprCommandBuffer(uint64_t command_buffer, int32_t* execution_r
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);
+				{
+					static std::atomic_uint32_t logged = 0;
+					if (logged.fetch_add(1) < 400000u || result != OK || bytes_read != command.size) {
+						LOGF("\tAPR ReadFile: id=0x%08x path=%s off=0x%llx size=0x%llx dst=0x%llx read=0x%llx result=0x%x\n",
+						     command.file_id, host_path.c_str(), (unsigned long long)command.file_offset,
+						     (unsigned long long)command.size, (unsigned long long)command.destination,
+						     (unsigned long long)bytes_read, (unsigned)result);
+					}
+				}
 				if (result != OK) {
 					LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32
 					     ", path=%s\n",

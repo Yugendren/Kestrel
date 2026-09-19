@@ -928,8 +928,10 @@ int KYTY_SYSV_ABI AudioInGetSilentState(int handle) {
 		return AUDIO_IN_ERROR_INVALID_HANDLE;
 	}
 
-	// Audio input has no device backend yet, so every valid port receives silence.
-	return AUDIO_IN_SILENT_STATE_DEVICE_NONE;
+	// Report a connected, non-silent device: the DualSense microphone is always present on a
+	// console, and titles treat DEVICE_NONE as "no microphone" and drop their audio-input
+	// objects. The port itself still delivers silence.
+	return 0;
 }
 
 } // namespace AudioIn

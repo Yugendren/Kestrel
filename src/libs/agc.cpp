@@ -4372,6 +4372,7 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs
 
 int KYTY_SYSV_ABI AgcDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata) {
 	PRINT_NAME();
+	LOGF("\t AgcDriverAddEqEvent: eq = %ld, id = %d (0x%x), udata = %p\n", static_cast<long>(eq), id, id, udata);
 
 	if (eq == LibKernel::EventQueue::KERNEL_EQUEUE_INVALID) {
 		return LibKernel::KERNEL_ERROR_EBADF;

@@ -1,3 +1,4 @@
+#include <atomic>
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/logging/log.h"
@@ -969,6 +970,16 @@ static void KYTY_SYSV_ABI JsonObjectClear(JsonObject* self) {
 
 static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, size_t size) {
 	PRINT_NAME();
+	{
+		static std::atomic_uint32_t logged = 0;
+		if (logged.fetch_add(1) < 40u || size == 0) {
+			static std::atomic_uint32_t empty_logged = 0;
+			if (size != 0 || empty_logged.fetch_add(1) < 12u) {
+				LOGF("\tJsonParserParse: dst=%p src=%p size=%zu head=%.*s\n", static_cast<void*>(dst),
+				     static_cast<const void*>(src), size, static_cast<int>(size < 48 ? size : 48), src != nullptr ? src : "");
+			}
+		}
+	}
 
 	if (dst == nullptr || src == nullptr) {
 		return JSON_ERROR_INVALID_ARGUMENT;
@@ -1020,24 +1031,11 @@ static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, si
 		json = nlohmann::json::parse(cleaned.data(), cleaned.data() + cleaned.size(), nullptr,
 		                             false, true);
 	}
-	if (json.is_discarded()) {
-		// The PS5 parser accepts a bare top-level scalar (an unquoted identifier such as
-		// `ui_title_03`); nlohmann does not. If the input has no JSON container/quote/keyword
-		// lead-in, treat the whole trimmed span as a string value rather than discarding the
-		// document (which would make every later key on it read back absent and trap the
-		// engine's checked-build type asserts).
-		size_t begin = 0;
-		size_t end   = size;
-		while (begin < end && static_cast<unsigned char>(src[begin]) <= ' ') begin++;
-		while (end > begin && static_cast<unsigned char>(src[end - 1]) <= ' ') end--;
-		const bool looks_structured =
-		    begin < end && (src[begin] == '{' || src[begin] == '[' || src[begin] == '"' ||
-		                    src[begin] == '-' || (src[begin] >= '0' && src[begin] <= '9') ||
-		                    src[begin] == 't' || src[begin] == 'f' || src[begin] == 'n');
-		if (begin < end && !looks_structured) {
-			json = nlohmann::json(std::string(src + begin, src + end));
-		}
-	}
+	// A bare unquoted token (`title_bg`, `ui_title_03`) is NOT valid JSON and the PS5 parser
+	// rejects it: Astro's Level-attribute reader (eboot 0x171e560) checks getType() != Null and
+	// only then indexes ["level"]/["loadFromStart"]; on a parse failure it copies the raw
+	// attribute text as the level name. Turning the token into a string value here makes that
+	// reader take the object path, leaving the level name empty, so sub-levels never resolve.
 	if (json.is_discarded() || !JsonValueFromNlohmann(&parsed, json)) {
 		LOGF("JsonParserParse: document discarded (size=%zu, head: %.*s)\n", size,
 		     static_cast<int>(std::min<size_t>(size, 80)), src);

@@ -1,3 +1,4 @@
+#include <atomic>
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
@@ -27,6 +28,21 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+} // namespace
+
+
+namespace {
+std::atomic_uint64_t g_readback_calls {0};
+std::atomic_uint64_t g_readback_bytes {0};
+void LogReadback(uint64_t vaddr, uint64_t size) {
+	const auto calls = g_readback_calls.fetch_add(1) + 1;
+	g_readback_bytes.fetch_add(size);
+	if (calls <= 200 || (calls % 500) == 0) {
+		LOGF("\tGPU->CPU download #%llu: vaddr=0x%llx size=0x%llx total=%llu MB\n",
+		     (unsigned long long)calls, (unsigned long long)vaddr, (unsigned long long)size,
+		     (unsigned long long)(g_readback_bytes.load() >> 20));
+	}
+}
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -112,7 +128,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
-	m_memory_tracker.ForEachDownloadRange<false>(
+	LogReadback(vaddr, size); m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
@@ -249,7 +265,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
+		{
+			static std::atomic<uint32_t> readback_logs {0};
+			const auto n = readback_logs.fetch_add(1, std::memory_order_relaxed);
+			if (n < 96 || (n % 512) == 0) {
+				LOGF("ReadMemory#%u: vaddr=0x%016" PRIx64 " size=0x%" PRIx64 " window=0x%016" PRIx64
+				     "..0x%016" PRIx64 " write=%d buffer=0x%016" PRIx64 "+0x%" PRIx64 "\n",
+				     n, vaddr, size, window_begin, window_end, is_write ? 1 : 0, buffer_begin,
+				     buffer.Size());
+			}
+		}
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+			KYTY_PROFILER_BLOCK("BufferCache::ReadMemory::Drain");
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);

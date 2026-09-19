@@ -382,6 +382,15 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
+	{
+		static std::atomic<uint32_t> table_logs {0};
+		const auto n = table_logs.fetch_add(1, std::memory_order_relaxed);
+		if (n < 64 || (n % 4096) == 0) {
+			LOGF("AttribTables#%u: attrib=%p buffer=%p semantics=%u\n", n,
+			     static_cast<const void*>(attrib), static_cast<const void*>(buffer),
+			     num_input_semantics);
+		}
+	}
 
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
 		const auto& in = input_semantics[i];

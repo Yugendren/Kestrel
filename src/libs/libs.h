@@ -1,6 +1,8 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_LIBS_LIBS_H_
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_LIBS_H_
 
+#include <atomic>
+#include <string_view>
 #include "common/abi.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -47,8 +49,24 @@
 #define LIB_FUNC(n, f) LIB_ADD(n, f, Loader::SymbolType::Func)
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+
+namespace Libs {
+inline bool PrintNameWanted(const char* lib) {
+	static const char* const wanted[] = {"Pad", "Np", "Dialog", "AvPlayer", "NetCtl", "AudioIn",
+	                                     "Http", "UserService", "SystemService", "SaveData",
+	                                     "AppContent", "Rtc", "Sysmodule", "PlayGo", "GameLiveStreaming",
+	                                     "Share", "Ime", "Ampr", "Apr"};
+	for (const auto* w: wanted) {
+		if (std::string_view(lib).find(w) != std::string_view::npos) return true;
+	}
+	return false;
+}
+} // namespace Libs
+
 #define PRINT_NAME()                                                                               \
-	if (PRINT_NAME_ENABLED) {                                                                      \
+	static std::atomic_int print_name_first_calls {0};                                             \
+	if (PRINT_NAME_ENABLED || (Libs::PrintNameWanted(g_library) &&                                \
+	                           print_name_first_calls.fetch_add(1) < 6)) {                         \
 		if (Log::GetDirection() != Log::Direction::Silent) {                                       \
 			const auto print_name_time = Loader::Timer::GetTime().ToString("HH24:MI:SS.FFF");      \
 			LOGF_COLOR(Log::Color::Cyan, "[%d][%s] %s::%s::%s()\n",                                \

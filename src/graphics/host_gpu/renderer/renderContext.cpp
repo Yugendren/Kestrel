@@ -1,3 +1,4 @@
+#include <atomic>
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
@@ -65,6 +66,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
+		static std::atomic<uint32_t> read_fault_logs {0};
+		const auto n = read_fault_logs.fetch_add(1, std::memory_order_relaxed);
+		if (n < 96 || (n % 512) == 0) {
+			LOGF("ReadFault#%u: vaddr=0x%016" PRIx64 "\n", n, fault_vaddr);
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -170,6 +176,11 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 			if (registration.event_id == event_id) {
 				registrations.push_back(registration);
 			}
+		}
+		static std::atomic_uint32_t logged = 0;
+		if (logged.fetch_add(1) < 64u || registrations.empty()) {
+			LOGF("\t TriggerInterrupt: event_id = %d (0x%x), context = 0x%x, listeners = %zu of %zu\n",
+			     event_id, event_id, context_id, registrations.size(), m_interrupt_eqs.size());
 		}
 	}
 

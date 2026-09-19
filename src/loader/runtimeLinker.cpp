@@ -835,6 +835,234 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		{
+			// Dump memory windows around the callee-saved registers and the string that the
+			// faulting frames appear to be working on (r13+0x668 in ASTRO's PLAYROOM).
+			const auto dump = [](const char* label, uint64_t addr, size_t len) {
+				if (addr == 0 || !IsReadableRange(addr, len)) return;
+				const auto* p = reinterpret_cast<const uint8_t*>(addr);
+				std::printf("mem %s @%016" PRIx64 ":", label, addr);
+				for (size_t i = 0; i < len; i++) std::printf("%s%02x", (i % 32 == 0) ? "\n " : " ", p[i]);
+				std::printf("\n ascii: ");
+				for (size_t i = 0; i < len; i++) std::printf("%c", (p[i] >= 0x20 && p[i] < 0x7f) ? p[i] : 0x2e);
+				std::printf("\n");
+			};
+			dump("rbx", info->rbx, 128);
+			dump("r12", info->r12, 128);
+			dump("r13", info->r13, 128);
+			dump("r14", info->r14, 128);
+			dump("r15", info->r15, 128);
+			dump("r13+0x668", info->r13 + 0x668, 64);
+			dump("below-rsp (report fn saved regs)", info->rsp - 64, 64);
+			if (IsReadableRange(info->rsp - 64, 64)) {
+				// The report function pushes rbp, r15, r14, r13, r12, rbx on entry; its frame is
+				// still intact below rsp when the trap fires right after it returns.
+				const auto saved_r13 = *reinterpret_cast<const uint64_t*>(info->rsp - 40);
+				std::printf("recovered caller r13 = %016" PRIx64 "\n", saved_r13);
+				const auto msvc_string = [&](const char* label, uint64_t addr) {
+					if (!IsReadableRange(addr, 32)) return;
+					const auto size = *reinterpret_cast<const uint64_t*>(addr + 16);
+					const auto cap  = *reinterpret_cast<const uint64_t*>(addr + 24);
+					const auto data = cap >= 16 ? *reinterpret_cast<const uint64_t*>(addr) : addr;
+					std::printf("%s: size=%" PRIu64 " cap=%" PRIu64 " -> ", label, size, cap);
+					if (size < 4096 && IsReadableRange(data, size)) {
+						std::printf("\"%.*s\"\n", static_cast<int>(size), reinterpret_cast<const char*>(data));
+					} else {
+						std::printf("(unreadable)\n");
+					}
+				};
+				msvc_string("object name (+0x370)", saved_r13 + 0x370);
+				if (IsReadableRange(info->rbp - 24, 8)) {
+					// The trapping function pushes r15, r14, r13 after rbp; r13 there is the
+					// level object of the frame two levels up (its callee leaves r13 untouched).
+					const auto this_ptr = *reinterpret_cast<const uint64_t*>(info->rbp - 24);
+					std::printf("rbp-24 (candidate LevelObject this) = %016" PRIx64 "\n", this_ptr);
+					msvc_string("  name (+0x370)", this_ptr + 0x370);
+					msvc_string("  str  (+0x668)", this_ptr + 0x668);
+					msvc_string("  str  (+0x2c0)", this_ptr + 0x2c0);
+					msvc_string("  str  (+0x390)", this_ptr + 0x390);
+					dump("  obj+0x0", this_ptr, 96);
+				}
+				msvc_string("string +0x668", saved_r13 + 0x668);
+				msvc_string("string +0x2c0", saved_r13 + 0x2c0);
+				dump("object +0x100..", saved_r13 + 0x100, 64);
+			}
+			dump("r13+0x370 (object name string)", info->r13 + 0x370, 48);
+			if (IsReadableRange(info->r13 + 0x370, 32)) {
+				const auto sptr = *reinterpret_cast<const uint64_t*>(info->r13 + 0x370);
+				const auto slen = *reinterpret_cast<const uint64_t*>(info->r13 + 0x380);
+				const auto scap = *reinterpret_cast<const uint64_t*>(info->r13 + 0x388);
+				std::printf("name string: size=%" PRIu64 " cap=%" PRIu64 "\n", slen, scap);
+				if (scap >= 16) dump("[r13+0x370] (long name)", sptr, 96);
+			}
+			dump("r13+0x2b0", info->r13 + 0x2b0, 64);
+			dump("r13+0x160 (vector)", info->r13 + 0x160, 32);
+			if (IsReadableRange(info->r13 + 0x668, 8)) {
+				const auto sptr = *reinterpret_cast<const uint64_t*>(info->r13 + 0x668);
+				dump("[r13+0x668]", sptr, 96);
+			}
+			dump("rdi", info->rdi, 96);
+			dump("rsi-1024", info->rsi - 1024, 1024);
+			dump("rsi", info->rsi, 256);
+		}
+		{
+			// Handle.h:205 diagnosis: r15 is `this` of the object whose +0xb10 handle failed.
+			const auto rd64 = [](uint64_t a) { return *reinterpret_cast<const uint64_t*>(a); };
+			const auto hexdump = [&](const char* label, uint64_t addr, size_t len) {
+				std::printf("%s @%016" PRIx64 ":", label, addr);
+				if (!IsReadableRange(addr, len)) { std::printf(" (unreadable)\n"); return; }
+				for (size_t i = 0; i < len; i++) {
+					if (i % 32 == 0) std::printf("\n ");
+					std::printf(" %02x", reinterpret_cast<const uint8_t*>(addr)[i]);
+				}
+				std::printf("\n");
+			};
+			const auto scan_strings = [&](const char* label, uint64_t base, size_t len) {
+				std::printf("strings in %s @%016" PRIx64 " (msvc layout):\n", label, base);
+				if (!IsReadableRange(base, len)) { std::printf(" (unreadable)\n"); return; }
+				for (size_t off = 0; off + 32 <= len; off += 8) {
+					const auto size = rd64(base + off + 16);
+					const auto cap  = rd64(base + off + 24);
+					if (cap < 15 || cap > 4096 || size > cap) continue;
+					uint64_t ptr = (cap >= 16) ? rd64(base + off) : base + off;
+					if (size == 0 || !IsReadableRange(ptr, size + 1)) continue;
+					const auto* c = reinterpret_cast<const char*>(ptr);
+					bool ok = c[size] == 0;
+					for (size_t i = 0; ok && i < size; i++) ok = c[i] >= 0x20 && c[i] < 0x7f;
+					if (ok) std::printf("  +0x%04zx size=%" PRIu64 " \"%s\"\n", off, size, c);
+				}
+			};
+			const auto this_ptr = info->r15;
+			std::printf("this (r15) = %016" PRIx64 "\n", this_ptr);
+			if (IsReadableRange(this_ptr, 8)) {
+				const auto vt = rd64(this_ptr);
+				std::printf("vtable = %016" PRIx64 "\n", vt);
+				if (IsReadableRange(vt, 16 * 8)) {
+					std::printf("vslots:");
+					for (int i = 0; i < 16; i++) std::printf(" %d=%" PRIx64, i, rd64(vt + 8 * i) - 0x900000000ull);
+					std::printf("\n");
+				}
+			}
+			hexdump("this+0xb00", this_ptr + 0xb00, 0x40);
+			for (uint64_t hoff : {0xb08ull, 0xb10ull}) {
+				if (!IsReadableRange(this_ptr + hoff, 8)) continue;
+				const auto entry = rd64(this_ptr + hoff);
+				std::printf("handle +0x%" PRIx64 ": entry=%016" PRIx64 "\n", hoff, entry);
+				if (entry == 0) continue;
+				hexdump("  entry", entry, 0x20);
+				if (IsReadableRange(entry + 8, 8)) {
+					const auto obj = rd64(entry + 8);
+					std::printf("  target obj=%016" PRIx64 "\n", obj);
+					if (obj != 0 && IsReadableRange(obj, 8)) {
+						std::printf("  target vtable=%016" PRIx64 "\n", rd64(obj));
+						scan_strings("target", obj, 0x1400);
+					}
+				}
+			}
+			scan_strings("this", this_ptr, 0x1400);
+			// Dump the loaded-level list scanned by the Level-attribute lookup (game fn 0x16c6080):
+			// attr+0xa8 = requested name (msvc string); attr+0x10 -> owner; owner+0x100 -> registry;
+			// owner+0x180 = flags; registry+0x410/+0x418 = list begin/end; node {next, level};
+			// level+0x58 = name (msvc string); level+0x2e8 = u32 compared with flags.
+			const auto msvc_str = [&](uint64_t a) -> std::string {
+				if (!IsReadableRange(a, 0x20)) return "(unreadable)";
+				const auto size = rd64(a + 0x10);
+				const auto cap  = rd64(a + 0x18);
+				if (cap < 15 || size > cap || size > 512) return "(not a string)";
+				const uint64_t ptr = cap >= 16 ? rd64(a) : a;
+				if (!IsReadableRange(ptr, size)) return "(bad ptr)";
+				return std::string(reinterpret_cast<const char*>(ptr), size);
+			};
+			const auto dump_level_lookup = [&](const char* label, uint64_t attr) {
+				if (!IsReadableRange(attr, 0xc0)) return;
+				const auto name  = msvc_str(attr + 0xa8);
+				const auto value = msvc_str(attr + 0x88);
+				if (value.empty() || value[0] == '(') return;
+				std::printf("%s: Level attribute @%016" PRIx64 " value(+0x88)=\"%s\" lookup-name(+0xa8)=\"%s\"\n",
+				            label, attr, value.c_str(), name.c_str());
+				hexdump("  attr+0x00", attr, 0x30);
+				hexdump("  attr+0xa8", attr + 0xa8, 0x20);
+				const auto owner = rd64(attr + 0x10);
+				if (owner == 0 || !IsReadableRange(owner, 0x190)) { std::printf("  owner unreadable\n"); return; }
+				const auto registry = rd64(owner + 0x100);
+				const auto flags    = *reinterpret_cast<const uint32_t*>(owner + 0x180);
+				std::printf("  owner=%016" PRIx64 " registry=%016" PRIx64 " flags=%u\n", owner, registry, flags);
+				if (registry == 0 || !IsReadableRange(registry, 0x420)) return;
+				auto       node = rd64(registry + 0x410);
+				const auto end  = rd64(registry + 0x418);
+				std::printf("  loaded levels (begin=%016" PRIx64 " end=%016" PRIx64 "):\n", node, end);
+				for (int i = 0; i < 96 && node != 0 && node != end && IsReadableRange(node, 16); i++) {
+					const auto level = rd64(node + 8);
+					if (level != 0 && IsReadableRange(level, 0x300)) {
+						std::printf("   [%2d] %016" PRIx64 " name=\"%s\" +0x2e8=%u +0x10=%u\n", i, level,
+						            msvc_str(level + 0x58).c_str(),
+						            *reinterpret_cast<const uint32_t*>(level + 0x2e8),
+						            *reinterpret_cast<const uint32_t*>(level + 0x10));
+					} else {
+						std::printf("   [%2d] %016" PRIx64 " (null/unreadable)\n", i, level);
+					}
+					node = rd64(node);
+				}
+			};
+			dump_level_lookup("this+0xb40", this_ptr + 0xb40);
+			for (const auto val : {info->rbx, info->r12, info->r13, info->rdi}) {
+				if (val == 0 || !IsReadableRange(val, 0x10)) continue;
+				const auto obj = rd64(val + 8);
+				if (obj >= 0x300000000ull && obj < 0x400000000ull && IsReadableRange(obj, 0x1000)) {
+					dump_level_lookup("entry->obj+0x900", obj + 0x900);
+					dump_level_lookup("entry->obj+0xb40", obj + 0xb40);
+					break;
+				}
+			}
+			// Generic: treat rbx/r12/r13/rdi as candidate `this` or handle-entry pointers.
+			for (const auto [name, val] : {std::pair{"rbx", info->rbx}, std::pair{"r12", info->r12},
+			                               std::pair{"r13", info->r13}, std::pair{"rdi", info->rdi}}) {
+				if (val == 0 || !IsReadableRange(val, 0x20)) continue;
+				const auto q0 = rd64(val);
+				const auto q1 = rd64(val + 8);
+				std::printf("%s=%016" PRIx64 " [0]=%016" PRIx64 " [8]=%016" PRIx64 "\n", name, val, q0, q1);
+				// handle entry: {u16,u16 state, ..., obj @+8}
+				if (q1 != 0 && q1 >= 0x300000000ull && q1 < 0x400000000ull && IsReadableRange(q1, 0x1400)) {
+					std::printf("  as entry -> obj=%016" PRIx64 " vtable=%016" PRIx64 "\n", q1, rd64(q1));
+					hexdump("  obj+0xd30", q1 + 0xd30, 0x30);
+					scan_strings("  obj", q1, 0x1400);
+				}
+				if (q0 >= 0x902000000ull && q0 < 0x903000000ull) {
+					std::printf("  looks like an object with vtable %016" PRIx64 "\n", q0);
+					scan_strings("  this", val, 0x1400);
+				}
+			}
+			// UiLevel attribute lives at this+0xb40: name string at +0xa8, registry ref at +0x10.
+			hexdump("this+0xb40 (Level attribute)", this_ptr + 0xb40, 0x40);
+			scan_strings("Level attribute", this_ptr + 0xb40, 0x100);
+			if (IsReadableRange(this_ptr + 0xb50, 8)) {
+				const auto reg = rd64(this_ptr + 0xb50);
+				std::printf("attribute+0x10 (registry owner) = %016" PRIx64 "\n", reg);
+				if (reg != 0 && IsReadableRange(reg, 0x190)) {
+					std::printf("  owner vtable=%016" PRIx64 " +0x100=%016" PRIx64 " +0x180=%08x\n", rd64(reg),
+					            rd64(reg + 0x100), *reinterpret_cast<const uint32_t*>(reg + 0x180));
+					scan_strings("registry owner", reg, 0x400);
+					const auto reg2 = rd64(reg + 0x100);
+					if (reg2 != 0 && IsReadableRange(reg2, 0x200)) {
+						hexdump("  registry", reg2, 0x80);
+						scan_strings("registry", reg2, 0x200);
+					}
+				}
+			}
+			std::fflush(stdout);
+		}
+		{
+			// Walk the frame-pointer chain: guest code here keeps rbp frames.
+			uint64_t rbp = info->rbp;
+			std::printf("frames (rbp chain):");
+			for (int i = 0; i < 32 && rbp != 0 && IsReadableRange(rbp, 16); i++) {
+				const auto* frame = reinterpret_cast<const uint64_t*>(rbp);
+				std::printf(" %016" PRIx64, frame[1]);
+				if (frame[0] <= rbp) break;
+				rbp = frame[0];
+			}
+			std::printf("\n");
+		}
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
@@ -1026,6 +1254,10 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 
 	if (ri.resolved) {
 		patched = PatchGuestMemory64(ri.vaddr, ri.value);
+		if (jmprela_table) {
+			LOGF("Relocate: PLT import [%u] [%016llx] <- %016llx %s\n", index,
+			     (unsigned long long)ri.vaddr, (unsigned long long)ri.value, ri.name.c_str());
+		}
 	} else {
 		uint64_t value = 0;
 		bool     weak  = (ri.bind == BindType::Weak || !program->fail_if_global_not_resolved);
@@ -1049,6 +1281,9 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 			                           ri.name.c_str(), Common::EnumName(ri.type).c_str(),
 			                           Common::EnumName(ri.bind).c_str(), ri.dbg_name.c_str());
 
+			if (jmprela_table) {
+				LOGF("Relocate: PLT import [%u] %s\n", index, dbg_str.c_str());
+			}
 			if (unresolved != nullptr) {
 				unresolved->push_back(dbg_str);
 			} else {
