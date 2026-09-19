@@ -10,6 +10,11 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 
+// Dump whatever the driver can still say about a lost device: the NV checkpoint markers (the
+// newest names the draw that was executing) and the VK_EXT_device_fault address list. Safe to
+// call when neither extension is enabled -- it just says so.
+void ReportDeviceLossDiagnostics(const GraphicContext& graphics);
+
 class MasterSemaphore {
 public:
 	explicit MasterSemaphore(GraphicContext& graphics);

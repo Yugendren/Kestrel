@@ -99,6 +99,14 @@ void ReportDeviceFault(const GraphicContext& graphics) {
 
 } // namespace
 
+// Both reports are worth having from any site that sees a lost device, not just the timeline
+// wait: a device can die at vkQueueSubmit, and until now that path printed only the submit's own
+// debug tag, which names the packet we were recording rather than the work the GPU choked on.
+void ReportDeviceLossDiagnostics(const GraphicContext& graphics) {
+	ReportCheckpoints(graphics);
+	ReportDeviceFault(graphics);
+}
+
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
 	vk::SemaphoreTypeCreateInfo type_info {};
 	type_info.semaphoreType = vk::SemaphoreType::eTimeline;
@@ -152,8 +160,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
 		                                std::chrono::steady_clock::now() - wait_start)
 		                                .count()));
-		ReportCheckpoints(m_graphics);
-		ReportDeviceFault(m_graphics);
+		ReportDeviceLossDiagnostics(m_graphics);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();

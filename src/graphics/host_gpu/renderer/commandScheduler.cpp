@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
@@ -579,8 +580,20 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	// The submission must not end with a dependency still deferred: nothing after it would
 	// carry the barrier.
 	FlushShaderHazards();
-	// Guest memory the CPU reads every frame rides back with the work that dirtied it.
-	m_context.GetBufferCache().RecordPendingReadbacks();
+	// Guest memory the CPU reads every frame rides back with the work that dirtied it -- but only
+	// on the scheduler that owns the guest timeline. BufferCache records its barriers and copies
+	// into its own scheduler (BufferCache::m_scheduler.Current()), not into whichever scheduler is
+	// submitting, so flushing readbacks from any other scheduler writes commands into the main
+	// command buffer while its owning thread is recording into it. The presenter runs a second
+	// CommandScheduler on the present thread, so that is a real pair of threads in one
+	// VkCommandBuffer and one VkCommandPool -- objects Vulkan requires the application to
+	// serialise externally. It corrupts the driver's per-command-buffer state rather than failing
+	// cleanly, and Current() asserts the buffer is open, so the bad case is exactly the concurrent
+	// one. It also mis-timed the readback: the copy went into the main buffer while the completion
+	// callback waited on the present tick, so the guest could be handed stale bytes.
+	if (this == &m_context.GetCommandScheduler()) {
+		m_context.GetBufferCache().RecordPendingReadbacks();
+	}
 
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
@@ -618,6 +631,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);
+		// The submit's own debug tag names the packet being recorded, not the work the GPU died
+		// on. When the device is gone the driver can still name the last checkpoint it passed and
+		// the addresses that faulted, and this is the path a device loss at submit actually takes.
+		ReportDeviceLossDiagnostics(graphics);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
