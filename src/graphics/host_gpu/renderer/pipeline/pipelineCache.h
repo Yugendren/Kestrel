@@ -30,22 +30,26 @@ class UserConfig;
 struct ComputeShaderInfo;
 } // namespace HW
 
+// Vulkan only requires the pipeline's topology to match the dynamic one by class when
+// dynamicPrimitiveTopologyUnrestricted is false, and a patch list additionally selects the
+// tessellation stage, so the class is the only part of the topology the pipeline still needs.
+enum class PipelineTopologyClass : uint8_t { Point, Line, Triangle, Patch };
+
+PipelineTopologyClass TopologyClassOf(vk::PrimitiveTopology topology);
+vk::PrimitiveTopology  RepresentativeTopology(PipelineTopologyClass topology_class);
+
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
-	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
-	bool                       primitive_restart_enable = false;
+	PipelineTopologyClass      topology_class           = PipelineTopologyClass::Point;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       depth_bounds_test_enable = false;
 	float                      depth_min_bounds         = 0.0f;
 	float                      depth_max_bounds         = 0.0f;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       cull_front                                         = false;
-	bool                       cull_back                                          = false;
-	bool                       face                                               = false;
 	bool                       provoking_vtx_last                                 = false;
 	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
 	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
@@ -65,7 +69,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 125);
+static_assert(sizeof(PipelineStaticParameters) == 118);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};

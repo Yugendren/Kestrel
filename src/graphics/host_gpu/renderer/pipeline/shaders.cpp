@@ -225,8 +225,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	EXIT_IF(!vs_input_info.stage);
 	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
 	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
+	// A patch-class pipeline is either a tessellation pipeline or a rect list expanded by the
+	// fixed tessellation stages.
 	const bool rect_list =
-	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
+	    !mesh && !tessellation && static_params.topology_class == PipelineTopologyClass::Patch;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
@@ -339,10 +341,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vertex_input_info.vertexAttributeDescriptionCount = vertex_input.attribute_count;
 	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
 
+	// Only the topology's class (point/line/triangle/patch) is part of the pipeline key, so the
+	// pipeline declares a representative topology of that class and the real one is set dynamically
+	// per draw (see SetGraphicsDynamicParams). Primitive restart is fully dynamic as well.
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
-	input_assembly.topology = static_params.topology;
-	input_assembly.primitiveRestartEnable =
-	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
+	input_assembly.topology               = RepresentativeTopology(static_params.topology_class);
+	input_assembly.primitiveRestartEnable = VK_FALSE;
 
 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
 	depth_clip_control.negativeOneToOne = (static_params.negative_one_to_one ? VK_TRUE : VK_FALSE);
@@ -350,16 +354,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineViewportStateCreateInfo viewport_state {};
 	viewport_state.pNext = &depth_clip_control;
 
-	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
-	if (static_params.cull_back) {
-		cull_mode |= vk::CullModeFlagBits::eBack;
-	}
-	if (static_params.cull_front) {
-		cull_mode |= vk::CullModeFlagBits::eFront;
-	}
-
-	vk::FrontFace front_face =
-	    (static_params.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
+	// Cull mode and front face are dynamic per draw (see SetGraphicsDynamicParams); the
+	// rasterizer keeps Vulkan's defaults (no culling, counter-clockwise) since they are unused.
 
 	vk::PipelineRasterizationDepthClipStateCreateInfoEXT clip_ext {};
 	clip_ext.depthClipEnable = static_params.depth_clip_enable ? VK_TRUE : VK_FALSE;
@@ -381,10 +377,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		provoking_vertex.pNext = rasterizer.pNext;
 		rasterizer.pNext = &provoking_vertex;
 	}
-	rasterizer.cullMode  = cull_mode;
-	rasterizer.frontFace = front_face;
 	rasterizer.polygonMode = static_params.polygon_mode;
-	rasterizer.lineWidth = 1.0f;
+	rasterizer.lineWidth   = 1.0f;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};
 	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
@@ -486,6 +480,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eViewportWithCount,
 	    vk::DynamicState::eScissorWithCount,
 	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eCullMode,
+	    vk::DynamicState::eFrontFace,
 	    vk::DynamicState::eDepthTestEnable,
 	    vk::DynamicState::eDepthWriteEnable,
 	    vk::DynamicState::eDepthCompareOp,
@@ -498,6 +494,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
 	};
+	if (!mesh) {
+		// A mesh pipeline has no input-assembly state, so it cannot declare these dynamic.
+		dynamic_states.push_back(vk::DynamicState::ePrimitiveTopology);
+		dynamic_states.push_back(vk::DynamicState::ePrimitiveRestartEnable);
+	}
 #if !defined(__APPLE__)
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
@@ -539,10 +540,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
-		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
+		     " topology_class=%" PRIu32 " color_mask=0x%08" PRIx32
 		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
 		     vertex_program.id, ps_active ? pixel_program.id : 0,
-		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
+		     static_cast<uint32_t>(static_params.topology_class), static_params.color_mask[0],
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}

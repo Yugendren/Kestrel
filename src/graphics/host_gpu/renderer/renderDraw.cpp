@@ -323,7 +323,9 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderDepthInfo& depth, const RenderState& rendering) {
+                                     const RenderDepthInfo& depth, const RenderState& rendering,
+                                     vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                     bool mesh_active) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto& ctx = buffer.GetRegisters();
@@ -404,7 +406,29 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
 
-	const auto& mode              = ctx.GetModeControl();
+	const auto& mode = ctx.GetModeControl();
+
+	// Cull mode, front face, topology and primitive restart are dynamic per draw;
+	// PipelineStaticParameters no longer bakes them into the pipeline (see pipelineCache.cpp).
+	// Tessellation draws use a patch list too, so only the guest primitive type identifies a
+	// rect list (whose host triangles must never be culled).
+	const bool        rect_list = Prospero::IsRectList(buffer.GetUserConfig().GetPrimType());
+	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
+	if (!rect_list && mode.cull_back) {
+		cull_mode |= vk::CullModeFlagBits::eBack;
+	}
+	if (!rect_list && mode.cull_front) {
+		cull_mode |= vk::CullModeFlagBits::eFront;
+	}
+	vk_buffer.setCullMode(cull_mode);
+	vk_buffer.setFrontFace(mode.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
+	if (!mesh_active) {
+		// A mesh pipeline has no input-assembly state, matching CreatePipelineInternal's !mesh
+		// guard on these two dynamic states.
+		vk_buffer.setPrimitiveTopology(topology);
+		vk_buffer.setPrimitiveRestartEnable(primitive_restart_enable ? VK_TRUE : VK_FALSE);
+	}
+
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
@@ -1617,7 +1641,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering,
+	                         topology, primitive_restart_enable, mesh_active);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}

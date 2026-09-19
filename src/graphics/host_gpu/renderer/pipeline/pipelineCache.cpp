@@ -233,6 +233,35 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 } // namespace
 
+// shaders.cpp needs the inverse of this mapping (RepresentativeTopology) to build the pipeline's
+// static input-assembly state, so both live here instead of the anonymous namespace above.
+PipelineTopologyClass TopologyClassOf(vk::PrimitiveTopology topology) {
+	switch (topology) {
+		case vk::PrimitiveTopology::ePointList: return PipelineTopologyClass::Point;
+		case vk::PrimitiveTopology::eLineList:
+		case vk::PrimitiveTopology::eLineStrip:
+		case vk::PrimitiveTopology::eLineListWithAdjacency:
+		case vk::PrimitiveTopology::eLineStripWithAdjacency: return PipelineTopologyClass::Line;
+		case vk::PrimitiveTopology::eTriangleList:
+		case vk::PrimitiveTopology::eTriangleStrip:
+		case vk::PrimitiveTopology::eTriangleFan:
+		case vk::PrimitiveTopology::eTriangleListWithAdjacency:
+		case vk::PrimitiveTopology::eTriangleStripWithAdjacency: return PipelineTopologyClass::Triangle;
+		case vk::PrimitiveTopology::ePatchList: return PipelineTopologyClass::Patch;
+		default: EXIT("Pipeline: unsupported topology %u\n", static_cast<uint32_t>(topology));
+	}
+}
+
+vk::PrimitiveTopology RepresentativeTopology(PipelineTopologyClass topology_class) {
+	switch (topology_class) {
+		case PipelineTopologyClass::Point: return vk::PrimitiveTopology::ePointList;
+		case PipelineTopologyClass::Line: return vk::PrimitiveTopology::eLineList;
+		case PipelineTopologyClass::Triangle: return vk::PrimitiveTopology::eTriangleList;
+		case PipelineTopologyClass::Patch: return vk::PrimitiveTopology::ePatchList;
+	}
+	EXIT("Pipeline: unsupported topology class %u\n", static_cast<uint32_t>(topology_class));
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -821,8 +850,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
-	static_params.topology                 = topology;
-	static_params.primitive_restart_enable = primitive_restart_enable;
+	static_params.topology_class           = TopologyClassOf(topology);
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info->ps_sample_shading;
@@ -832,13 +860,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-	static_params.cull_back  = !rect_list && mc.cull_back;
-	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
+	// Cull mode is dynamic per draw (see SetGraphicsDynamicParams), but the pipeline's fixed
+	// polygon mode still depends on which face(s) are visible, so ResolvePolygonMode needs the
+	// same flags as locals instead of static_params members.
+	const bool rect_list  = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+	const bool cull_back  = !rect_list && mc.cull_back;
+	const bool cull_front = !rect_list && mc.cull_front;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
-	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	static_params.polygon_mode       = ResolvePolygonMode(mc, cull_front, cull_back);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh &&
 	    !vs_input_info.stage.program->info.gpu_vertex_fetch) {
