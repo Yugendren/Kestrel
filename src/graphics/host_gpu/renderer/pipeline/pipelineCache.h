@@ -10,11 +10,13 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -77,6 +79,12 @@ struct PipelineRenderingState {
 	bool operator==(const PipelineRenderingState&) const = default;
 };
 
+// Packed so that Binding/Attribute (and therefore the arrays below) have no padding bytes:
+// GraphicsPipelineKeyHash hashes bindings/attributes via XXH3 over their raw byte range, and
+// operator== below memcmp's the same ranges, both of which would be unsound if padding bytes
+// were left indeterminate.
+#pragma pack(push, 1)
+
 struct PipelineVertexInputState {
 	struct Binding {
 		uint32_t stride                           = 0;
@@ -94,8 +102,27 @@ struct PipelineVertexInputState {
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
 
-	bool operator==(const PipelineVertexInputState&) const = default;
+	// The key is value-initialised and only the entries below binding_count / attribute_count
+	// are ever written, so unused slots are zero in every key. That invariant makes comparing
+	// just the used prefixes equivalent to the old elementwise comparison of all RES_MAX
+	// entries.
+	bool operator==(const PipelineVertexInputState& other) const {
+		return binding_count == other.binding_count && attribute_count == other.attribute_count &&
+		       std::memcmp(bindings.data(), other.bindings.data(),
+		                   sizeof(Binding) * binding_count) == 0 &&
+		       std::memcmp(attributes.data(), other.attributes.data(),
+		                   sizeof(Attribute) * attribute_count) == 0;
+	}
 };
+
+#pragma pack(pop)
+
+static_assert(sizeof(PipelineVertexInputState::Binding) == 5);
+static_assert(sizeof(PipelineVertexInputState::Attribute) == 5);
+static_assert(sizeof(PipelineVertexInputState) ==
+              2 + (sizeof(PipelineVertexInputState::Binding) +
+                   sizeof(PipelineVertexInputState::Attribute)) *
+                      ShaderVertexInputInfo::RES_MAX);
 
 struct ShaderProgram {
 	uint64_t         id     = 0;
@@ -162,17 +189,16 @@ private:
 		}
 	};
 
+	// Hashing used to mix the key byte-by-byte / field-by-field (109 Mix() calls just for
+	// static_params, plus a Mix() per vertex-input field), which measured ~155 ns/op for a
+	// real 696-byte key. GraphicsPipelineKeyHash below instead runs XXH3 once over each
+	// contiguous byte range (static_params, and the used prefixes of bindings/attributes),
+	// which is sound only because those ranges have no padding -- see the
+	// #pragma pack(push, 1) on PipelineVertexInputState and PipelineStaticParameters above.
 	struct PipelineKeyHash {
 		static void Mix(std::size_t& hash, std::size_t value) {
 			hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) +
 			        (hash >> 2u);
-		}
-
-		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
-			}
 		}
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
@@ -194,16 +220,20 @@ private:
 			}
 			PipelineKeyHash::Mix(hash, key.ps_shader_id);
 			PipelineKeyHash::Mix(hash, key.vertex_input.binding_count);
-			for (uint32_t i = 0; i < key.vertex_input.binding_count; i++) {
-				PipelineKeyHash::Mix(hash, key.vertex_input.bindings[i].stride);
-				PipelineKeyHash::Mix(hash, key.vertex_input.bindings[i].instance);
+			if (key.vertex_input.binding_count != 0) {
+				PipelineKeyHash::Mix(
+				    hash, XXH3_64bits(key.vertex_input.bindings.data(),
+				                       sizeof(PipelineVertexInputState::Binding) *
+				                           key.vertex_input.binding_count));
 			}
 			PipelineKeyHash::Mix(hash, key.vertex_input.attribute_count);
-			for (uint32_t i = 0; i < key.vertex_input.attribute_count; i++) {
-				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].offset);
-				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].binding);
+			if (key.vertex_input.attribute_count != 0) {
+				PipelineKeyHash::Mix(
+				    hash, XXH3_64bits(key.vertex_input.attributes.data(),
+				                       sizeof(PipelineVertexInputState::Attribute) *
+				                           key.vertex_input.attribute_count));
 			}
-			PipelineKeyHash::MixStaticParams(hash, key.static_params);
+			PipelineKeyHash::Mix(hash, XXH3_64bits(&key.static_params, sizeof(key.static_params)));
 			return hash;
 		}
 	};
