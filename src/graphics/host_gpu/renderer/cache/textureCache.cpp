@@ -1691,6 +1691,23 @@ ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
 		if (!image.info.IsScaled()) {
 			return id;
 		}
+		// An absolute texel address has to reach the half of the pair whose resolution matches
+		// the space the address was computed in, or the binding reads the wrong pixels rather
+		// than merely blurrier ones. A rasterising stage computes them from its own fragment
+		// position, which scaling has already moved into the resolution of the render targets,
+		// so for such a stage the scaled half is the matching one: handing it the native twin
+		// makes a full-screen pass over a half-scale target address a full-size image with
+		// half-size coordinates and light the whole frame from the top-left quarter of every
+		// G-buffer it reads. The read costs nothing extra -- FindTexture already resamples the
+		// twin into the scaled half before a sampled binding, so a pass that compute produced
+		// is still seen -- and it leaves the scaled half owning the contents afterwards.
+		//
+		// A write keeps the twin whatever stage issues it: it lands in the guest range, which
+		// is downloaded and re-read at guest size, and a storage image is the form compute
+		// writes through.
+		if (desc.type != BindingType::Storage && desc.texel_space == TexelSpace::RenderTarget) {
+			return id;
+		}
 		if (!CanTwinScale(image.info)) {
 			m_scale_denied.insert(image.info.data.address);
 			auto native  = image.info;

@@ -401,7 +401,7 @@ struct RenderExecutorTestAccess {
   ResolveTexture(RenderExecutor &executor,
                  const ShaderRecompiler::IR::ImageResource &resource,
                  const ShaderRecompiler::IR::DescriptorValue &value) {
-    return executor.ResolveTexture(resource, value);
+    return executor.ResolveTexture(resource, value, ShaderType::Compute);
   }
 
   static auto PrepareGraphicsBindings(RenderExecutor &executor,

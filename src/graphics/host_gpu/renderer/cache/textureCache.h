@@ -32,6 +32,11 @@ struct TextureCacheTestAccess;
 class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
+	// Coordinate space an absolute texel address computed by a shader lives in. A rasterising
+	// stage derives it from its own fragment position, so it is expressed in the resolution of
+	// the render targets of the draw and moves with internal resolution scaling. A compute
+	// dispatch is launched with guest-sized workgroup counts, so it stays in guest texels.
+	enum class TexelSpace : uint8_t { Guest, RenderTarget };
 
 	struct ImageDesc {
 		ImageInfo     info;
@@ -41,6 +46,9 @@ public:
 		// texels. True for every storage binding and for sampled bindings that are texel-fetched
 		// or queried for their extent.
 		bool          texel_addressed = false;
+		// Which space those texel addresses are measured in; only meaningful when the binding
+		// is texel-addressed. Filled in from the shader stage that owns the binding.
+		TexelSpace    texel_space     = TexelSpace::Guest;
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,

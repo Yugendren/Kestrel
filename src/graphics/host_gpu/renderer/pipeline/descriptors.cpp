@@ -566,7 +566,8 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+                                              const ShaderRecompiler::IR::DescriptorValue& value,
+                                              ShaderType                                   stage) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
@@ -784,6 +785,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 desc.info.resident_base_level);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.texel_addressed = resource.texel_addressed;
+	// Everything but compute reaches this image from a draw, so an absolute texel address it
+	// computes is in the resolution of that draw's render targets; a dispatch is launched with
+	// guest-sized workgroup counts, so its addresses are in guest texels. The texture cache uses
+	// this to pick the half of a resolution-scaled pair that matches.
+	desc.texel_space     = stage == ShaderType::Compute ? TextureCache::TexelSpace::Guest
+	                                                    : TextureCache::TexelSpace::RenderTarget;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
@@ -904,7 +911,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	} else {
 		prepared.images.resize(program.info.images.size());
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			auto binding =
+			    ResolveTexture(program.info.images[i], snapshot.images[i], program.stage);
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 			binding.mip_views.swap(prepared.images[i].mip_views);
 			binding.mip_views.clear();
@@ -1006,7 +1014,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i], program.stage);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}

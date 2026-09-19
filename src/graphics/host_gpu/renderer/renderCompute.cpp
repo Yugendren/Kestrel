@@ -231,7 +231,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			    groups[axis] != (extents[axis] + threads - 1) / threads ||
 			    groups[axis] * threads > UINT32_MAX) return false;
 		}
-		const auto  binding     = ResolveTexture(resource, resources.images[0]);
+		const auto  binding =
+		    ResolveTexture(resource, resources.images[0], ShaderType::Compute);
 		const auto& destination = binding.desc.info.data;
 		if (!FillSourcesDisjoint(resources.buffers, destination)) return false;
 		std::scoped_lock lock {cache.m_lock};
