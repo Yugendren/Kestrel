@@ -672,7 +672,11 @@ int Audio::AudioInGetSilentState(Id handle) {
 	if (port == nullptr) {
 		return AUDIO_IN_ERROR_INVALID_HANDLE;
 	}
-	if (port->stream == nullptr || !RecordingDevicePresent(port->device)) {
+	// Without a host capture device the port delivers silence but still reports a connected,
+	// non-silent device: the DualSense microphone is always present on a console, and titles
+	// treat DEVICE_NONE as "no microphone" and drop their audio-input objects. Only a host
+	// device that was opened and then disappeared reports DEVICE_NONE.
+	if (port->stream != nullptr && !RecordingDevicePresent(port->device)) {
 		return AUDIO_IN_SILENT_STATE_DEVICE_NONE;
 	}
 	return 0;
