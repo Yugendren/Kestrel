@@ -1,6 +1,8 @@
 // Exercise the guest ABI without linking unrelated emulator subsystems.
 #include "libs/libSaveData.cpp"
 
+#include "common/emulatorConfig.h"
+
 #include <array>
 #include <chrono>
 #include <filesystem>
@@ -596,6 +598,11 @@ void RunChild(const fs::path& executable, const char* mode) {
 } // namespace
 
 int main(int argc, char** argv) {
+	// SaveData's PRINT_NAME() reads Log::GetDirection(), which asserts unless Log::Initialize()
+	// already ran; both the parent process and the "write"/"read" re-exec children hit that path.
+	Config::Initialize();
+	Log::Initialize();
+
 	if (argc == 2) {
 		if (std::string_view(argv[1]) == "write") {
 			WriteRestartFixture();

@@ -326,6 +326,7 @@ static int write_save_file(const std::filesystem::path& path, const void* data, 
 	const auto   temporary = std::filesystem::path(path.string() + ".tmp");
 	Common::File file;
 	if (!file.Create(temporary)) {
+		LOGF("SaveData: could not create \"%s\"\n", temporary.string());
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
 	uint32_t written = 0;
@@ -334,11 +335,20 @@ static int write_save_file(const std::filesystem::path& path, const void* data, 
 	file.Close();
 	std::error_code error;
 	if (written == size && flushed) {
-		// Common::File::RenameFile deliberately refuses to replace an existing file.
+		// std::filesystem::rename (not Common::File::RenameFile) is used deliberately: on both
+		// POSIX and Windows it replaces an existing destination atomically, whereas
+		// Common::File::RenameFile deletes the destination first and then renames, which is not
+		// atomic and would leave neither file behind if the emulator died in between.
 		std::filesystem::rename(temporary, path, error);
 		if (!error) {
 			return OK;
 		}
+		LOGF("SaveData: could not replace \"%s\" with \"%s\": %s\n", path.string(),
+		     temporary.string(), error.message());
+	} else {
+		LOGF("SaveData: short write to \"%s\" (%" PRIu32 "/%" PRIu32
+		     " bytes, flushed=%d)\n",
+		     temporary.string(), written, size, static_cast<int>(flushed));
 	}
 	std::filesystem::remove(temporary, error);
 	return SAVE_DATA_ERROR_INTERNAL;
@@ -416,9 +426,12 @@ static int load_save_param(const std::filesystem::path& directory, SaveDataParam
 }
 
 static int save_memory(const std::filesystem::path& directory, const SaveDataMemory& memory) {
-	std::error_code error;
-	std::filesystem::create_directories(directory, error);
-	if (error) {
+	// Route directory creation through the same host wrapper pipelineCache.cpp and the rest of
+	// the emulator use (Common::File::CreateDirectories) instead of std::filesystem directly, so
+	// save data gets the same platform handling and, on failure, actually gets logged instead of
+	// silently returning SAVE_DATA_ERROR_INTERNAL.
+	if (!Common::File::CreateDirectories(directory)) {
+		LOGF("SaveData: save_memory() could not create directory \"%s\"\n", directory.string());
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
 	// Display metadata is a separate host sidecar, leaving memory.dat as raw guest bytes.
