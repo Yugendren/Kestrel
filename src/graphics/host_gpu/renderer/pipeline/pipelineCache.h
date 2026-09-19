@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
@@ -173,6 +174,11 @@ public:
 	                             const ShaderProgram&          compute_program);
 
 private:
+	// Body shared by Save() (which takes m_mutex) and MaybeSaveLocked() (called with m_mutex
+	// already held), so the locking is split out into the public Save() wrapper below.
+	void SaveLocked();
+	[[nodiscard]] size_t PipelineCountLocked() const;
+
 	struct ProgramCache;
 
 	struct GraphicsPipelineKey {
@@ -247,7 +253,17 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
+	// Pipeline count and wall-clock time as of the last SaveLocked() attempt, used by
+	// MaybeSaveLocked() to decide whether a new save is worth its cost.
+	size_t                                m_pipeline_count_at_last_save = 0;
+	// Pipelines covered by the blob currently on disk, so a save with nothing new is skipped.
+	size_t m_persisted_pipeline_count = 0;
+	std::chrono::steady_clock::time_point m_last_save_time;
+
 	void InitializeDriverCache();
+	// Saves periodically as new pipelines are created; called with m_mutex already held by the
+	// pipeline getters, so it must not take the lock itself.
+	void MaybeSaveLocked();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

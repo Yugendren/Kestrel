@@ -39,6 +39,16 @@ namespace Libs::Graphics {
 
 namespace {
 
+// The driver pipeline cache blob is tens of megabytes for a large title, and serialising it
+// (getPipelineCacheData + a temp-file write) costs tens of milliseconds, so MaybeSaveLocked()
+// must not run it on every new pipeline. Saving too rarely, though, means a crash or force-quit
+// loses more freshly-compiled pipelines and the next launch recompiles them from scratch, which
+// is exactly what this whole mechanism exists to avoid. These two thresholds -- whichever is
+// reached first -- balance that: enough new pipelines to make the save worthwhile, or enough
+// elapsed time that a long play session is not left unsaved.
+constexpr size_t                kMinNewPipelinesToSave = 16;
+constexpr std::chrono::seconds  kMaxSaveInterval {60};
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -498,7 +508,8 @@ struct PipelineCache::ProgramCache {
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)),
+      m_last_save_time(std::chrono::steady_clock::now()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
@@ -608,7 +619,23 @@ void PipelineCache::InitializeDriverCache() {
 
 void PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+	SaveLocked();
+}
+
+// Body of the old Save(), split out so MaybeSaveLocked() (called from the pipeline getters,
+// which already hold m_mutex) can reuse it without locking m_mutex a second time.
+size_t PipelineCache::PipelineCountLocked() const {
+	return m_graphics_pipelines.size() + m_compute_pipelines.size();
+}
+
+void PipelineCache::SaveLocked() {
 	if (m_driver_cache == nullptr) {
+		return;
+	}
+	// The driver cache object stays alive for the whole session so it can be written again as more
+	// pipelines appear; re-serialising a blob that already matches what is on disk would only cost
+	// time, which is what the shutdown save after a periodic one would otherwise do.
+	if (m_persisted_pipeline_count == PipelineCountLocked()) {
 		return;
 	}
 
@@ -661,8 +688,29 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	m_persisted_pipeline_count = PipelineCountLocked();
+}
+
+// Called from the pipeline getters right after a new pipeline is inserted, with m_mutex already
+// held by that getter's own LockGuard -- hence SaveLocked() rather than Save().
+void PipelineCache::MaybeSaveLocked() {
+	if (m_driver_cache == nullptr) {
+		return;
+	}
+	const auto pipeline_count = PipelineCountLocked();
+	if (pipeline_count <= m_pipeline_count_at_last_save) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (pipeline_count - m_pipeline_count_at_last_save < kMinNewPipelinesToSave &&
+	    now - m_last_save_time < kMaxSaveInterval) {
+		return;
+	}
+	SaveLocked();
+	// Recorded even when SaveLocked() failed, so a save that keeps failing (e.g. disk full) is
+	// retried once per interval instead of on every single new pipeline.
+	m_pipeline_count_at_last_save = pipeline_count;
+	m_last_save_time              = now;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -920,6 +968,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
+	// m_mutex is already held by the LockGuard above, so MaybeSaveLocked() (not Save()) here.
+	MaybeSaveLocked();
+
 	return *iter->second;
 }
 
@@ -949,6 +1000,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+
+	// m_mutex is already held by the LockGuard above, so MaybeSaveLocked() (not Save()) here.
+	MaybeSaveLocked();
 
 	return *iter->second;
 }
