@@ -130,6 +130,10 @@ private:
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
+	// Image cover counts use the owner index grid: a zero count stands for "the owner index
+	// holds nothing on this page".
+	using ImagePageCounters =
+	    PageCounters<ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits>;
 	void ConfigureGarbageCollectionBudget(uint64_t available_budget);
 
 	// Callers have validated the nonempty 40-bit range with TryGetPageRange.
@@ -234,7 +238,9 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unique_ptr<std::atomic<uint32_t>[]>          m_image_page_cover;
+	ImagePageCounters                                 m_image_page_cover;
+	// Pages holding at least one registered GPU-modified image (see IsRegionGpuModified).
+	GpuModifiedPageCounters                           m_gpu_modified_page_cover;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;

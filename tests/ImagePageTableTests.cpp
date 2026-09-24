@@ -168,6 +168,33 @@ void TestOneMiBBoundaries() {
 	      "final guest byte uses the final one-MiB page");
 }
 
+void TestPageCounters() {
+	using Counters = Libs::Graphics::PageCounters<16, 40>;
+	constexpr uint64_t page = uint64_t {1} << 16;
+	Counters counters;
+	Check(!counters.Any(0, page * 4), "fresh counters are empty");
+	counters.Add(page + 16, 32);
+	Check(counters.Any(page, 1), "counted page reports");
+	Check(counters.Any(page * 2 - 1, 2), "range touching a counted page reports");
+	Check(!counters.Any(0, page), "neighbor page stays empty");
+	Check(!counters.Any(page * 2, page), "following page stays empty");
+	counters.Add(page, page * 2);
+	counters.Remove(page + 16, 32);
+	Check(counters.Any(page * 2, 1), "overlapping counts are kept per page");
+	counters.Remove(page, page * 2);
+	Check(!counters.Any(0, page * 4), "balanced add/remove empties every page");
+	Check(counters.Any(0, 0), "an empty range is conservatively reported");
+	constexpr uint64_t bucket_span = uint64_t {Counters::Grid::kBucketEntries} * page;
+	counters.Add(bucket_span * 3 - page, page * 2);
+	Check(counters.Any(bucket_span * 3, 1) && counters.Any(bucket_span * 3 - 1, 1),
+	      "a range crossing a bucket boundary counts on both sides");
+	Check(!counters.Any(bucket_span * 3 + page, 1), "a lazily created bucket starts empty");
+	counters.Remove(bucket_span * 3 - page, page * 2);
+	Check(!counters.Any(bucket_span * 2, bucket_span * 2), "buckets empty after removal");
+	Check(counters.Any(Counters::Grid::kAddressSpaceSize - 1, 2),
+	      "a range leaving the address space is conservatively reported");
+}
+
 } // namespace
 
 int main() {
@@ -179,6 +206,7 @@ int main() {
 	TestOneMiBRegistrationGranularity();
 	TestSharedCoarsePageLifecycle();
 	TestOneMiBBoundaries();
+	TestPageCounters();
 	std::printf("ImagePageTableTests: all cases passed\n");
 	return 0;
 }

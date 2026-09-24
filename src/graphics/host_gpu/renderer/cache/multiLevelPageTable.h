@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -254,6 +255,99 @@ private:
 	std::array<uint64_t, InlineCapacity>   m_inline;
 	std::unique_ptr<std::vector<uint64_t>> m_overflow;
 	size_type                              m_inline_size = 0;
+};
+
+// Lock-free per-page reference counts on a MultiLevelPageTable page grid. Writers add or
+// remove a byte range under whatever lock guards the state being summarized; readers may ask
+// Any() without that lock. A zero count on every page a range touches proves that nothing
+// counted overlaps it; a nonzero count only says "maybe", so readers use it as a filter in
+// front of the exact, locked query. Buckets of counters are allocated on first use and kept
+// until destruction, so a reader never sees one go away; an absent bucket reads as zero.
+template <size_t PageBits = 20, size_t AddressSpaceBits = 40, size_t FirstLevelBits = 10>
+class PageCounters final {
+public:
+	using Grid = MultiLevelPageTable<uint8_t, PageBits, AddressSpaceBits, FirstLevelBits>;
+
+	PageCounters()
+	    : m_buckets(std::make_unique<std::atomic<Bucket*>[]>(Grid::kFirstLevelEntries)) {}
+	~PageCounters() {
+		for (size_t index = 0; index < Grid::kFirstLevelEntries; ++index) {
+			delete m_buckets[index].load(std::memory_order_relaxed);
+		}
+	}
+	PageCounters(const PageCounters&)            = delete;
+	PageCounters& operator=(const PageCounters&) = delete;
+
+	// The range must be nonempty and inside the address space.
+	void Add(uint64_t address, uint64_t size) {
+		ForEachPage(address, size, [this](size_t page) {
+			auto& count = GetOrCreateBucket(page >> Grid::kSecondLevelBits)[BucketIndex(page)];
+			if (count.fetch_add(1, std::memory_order_release) == UINT32_MAX) {
+				EXIT("PageCounters: page counter overflow\n");
+			}
+		});
+	}
+
+	void Remove(uint64_t address, uint64_t size) {
+		ForEachPage(address, size, [this](size_t page) {
+			auto* bucket = m_buckets[page >> Grid::kSecondLevelBits].load(std::memory_order_acquire);
+			if (bucket == nullptr ||
+			    (*bucket)[BucketIndex(page)].fetch_sub(1, std::memory_order_release) == 0) {
+				EXIT("PageCounters: page counter underflow\n");
+			}
+		});
+	}
+
+	// Conservative: a range the grid cannot describe may overlap anything.
+	[[nodiscard]] bool Any(uint64_t address, uint64_t size) const noexcept {
+		typename Grid::PageRange pages {};
+		if (!Grid::TryGetPageRange(address, size, pages)) {
+			return true;
+		}
+		for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+			const auto* bucket =
+			    m_buckets[page >> Grid::kSecondLevelBits].load(std::memory_order_acquire);
+			if (bucket != nullptr &&
+			    (*bucket)[BucketIndex(page)].load(std::memory_order_acquire) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+private:
+	using Bucket = std::array<std::atomic<uint32_t>, Grid::kBucketEntries>;
+
+	[[nodiscard]] static constexpr size_t BucketIndex(size_t page) {
+		return page & (Grid::kBucketEntries - 1);
+	}
+
+	// Writers of different summaries may race to create a bucket; the loser frees its copy.
+	Bucket& GetOrCreateBucket(size_t index) {
+		auto* bucket = m_buckets[index].load(std::memory_order_acquire);
+		if (bucket == nullptr) {
+			auto fresh = std::make_unique<Bucket>();
+			if (m_buckets[index].compare_exchange_strong(bucket, fresh.get(),
+			                                             std::memory_order_acq_rel,
+			                                             std::memory_order_acquire)) {
+				bucket = fresh.release();
+			}
+		}
+		return *bucket;
+	}
+
+	template <typename Func>
+	static void ForEachPage(uint64_t address, uint64_t size, Func&& func) {
+		typename Grid::PageRange pages {};
+		if (!Grid::TryGetPageRange(address, size, pages)) {
+			EXIT("PageCounters: range is outside the address space\n");
+		}
+		for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+			func(page);
+		}
+	}
+
+	std::unique_ptr<std::atomic<Bucket*>[]> m_buckets;
 };
 
 } // namespace Libs::Graphics

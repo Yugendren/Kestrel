@@ -149,7 +149,6 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
-      m_image_page_cover(std::make_unique<std::atomic<uint32_t>[]>(ImagePageTable::kPageCount)),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		ConfigureGarbageCollectionBudget(m_graphics.GetTotalMemoryBudget());
@@ -352,6 +351,7 @@ bool TextureCache::SafeToDownload(const Image& image) {
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_slot_images[id].SetResampler(&m_blit_helper);
+	m_slot_images[id].SetGpuModifiedPages(&m_gpu_modified_page_cover);
 	// Conservatively bump on every new slot, registered or not (e.g. null images), rather than
 	// rely on RegisterImage() alone.
 	++m_generation;
@@ -362,32 +362,15 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 }
 
 bool TextureCache::MayCoverImages(uint64_t address, uint64_t size) const noexcept {
-	ImagePageTable::PageRange pages {};
-	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
-		return true;
-	}
-	bool covered = false;
-	ForEachPage(address, size, [this, &covered](uint64_t page) {
-		if (m_image_page_cover[page].load(std::memory_order_acquire) != 0) {
-			covered = true;
-			return true;
-		}
-		return false;
-	});
-	return covered;
+	return m_image_page_cover.Any(address, size);
 }
 
 void TextureCache::UpdateImageCover(uint64_t address, uint64_t size, bool add) {
-	ForEachPage(address, size, [this, add](uint64_t page) {
-		auto& counter = m_image_page_cover[page];
-		if (add) {
-			if (counter.fetch_add(1, std::memory_order_release) == UINT32_MAX) {
-				EXIT("TextureCache: image coverage counter overflow\n");
-			}
-		} else if (counter.fetch_sub(1, std::memory_order_release) == 0) {
-			EXIT("TextureCache: image coverage counter underflow\n");
-		}
-	});
+	if (add) {
+		m_image_page_cover.Add(address, size);
+	} else {
+		m_image_page_cover.Remove(address, size);
+	}
 }
 
 void TextureCache::RegisterImage(ImageId id) {
@@ -405,6 +388,9 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	if (image.IsGpuModified()) {
+		m_gpu_modified_page_cover.Add(image.info.data.address, image.info.data.size);
+	}
 	m_total_used_memory += image.AccountedSize();
 	++m_generation;
 }
@@ -426,6 +412,9 @@ void TextureCache::UnregisterImage(ImageId id) {
 		}
 	});
 	UpdateImageCover(image.info.data.address, image.info.data.size, false);
+	if (image.IsGpuModified()) {
+		m_gpu_modified_page_cover.Remove(image.info.data.address, image.info.data.size);
+	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -2432,6 +2421,13 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	// The command processor asks this for every table it reads from guest memory, and those
+	// tables almost never share a page with a GPU-written image. The page counts track every
+	// registered GPU-modified image, a superset of what the scan below can report, so a zero
+	// count answers without the lock or the owner-index walk.
+	if (!m_gpu_modified_page_cover.Any(address, size)) {
 		return false;
 	}
 	std::scoped_lock lock {m_lock};

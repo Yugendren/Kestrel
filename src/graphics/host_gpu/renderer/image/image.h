@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <compare>
@@ -23,6 +24,10 @@ class CommandScheduler;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
+// Per-page count of registered, GPU-modified images; owned by the texture cache. The pages
+// are 64 KiB, finer than the texture cache's 1 MiB owner index: small guest tables the command
+// processor reads commonly sit within a few hundred KiB of a render target.
+using GpuModifiedPageCounters = PageCounters<16>;
 
 struct CachedImageView {
 	ImageViewInfo info;
@@ -69,6 +74,12 @@ public:
 	// The transfer that resamples this image is not usable for depth/stencil surfaces, so the
 	// cache hands every image the helper that redraws them instead. Set once, at creation.
 	void SetResampler(BlitHelper* resampler) noexcept { m_resampler = resampler; }
+	// Where a registered image publishes its GPU-modified state, so guest-memory readers can
+	// rule out GPU-written pages without the texture-cache lock. Set once, at creation; the
+	// cache publishes the state itself when it registers or unregisters the image.
+	void SetGpuModifiedPages(GpuModifiedPageCounters* pages) noexcept {
+		m_gpu_modified_pages = pages;
+	}
 
 	// Resamples a compatible image across a resolution-scale difference. The subresource
 	// ranges select matching source and destination levels/layers; the whole-image overload
@@ -129,8 +140,20 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	// Every transition goes through these two, so the published page counts always equal the
+	// number of registered GPU-modified images on each page.
+	void MarkGpuModified() {
+		if (!m_gpu_modified) {
+			m_gpu_modified = true;
+			PublishGpuModified(true);
+		}
+	}
+	void ClearGpuModified() {
+		if (m_gpu_modified) {
+			m_gpu_modified = false;
+			PublishGpuModified(false);
+		}
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
@@ -209,8 +232,20 @@ private:
 	// resolution-scaled image. Created on first use; most scaled targets never need one.
 	[[nodiscard]] Image& GuestAlias();
 
+	void PublishGpuModified(bool modified) {
+		if (registered && m_gpu_modified_pages != nullptr) {
+			if (modified) {
+				m_gpu_modified_pages->Add(info.data.address, info.data.size);
+			} else {
+				m_gpu_modified_pages->Remove(info.data.address, info.data.size);
+			}
+		}
+	}
+
 	std::unique_ptr<Image> m_guest_alias;
 	BlitHelper*            m_resampler = nullptr;
+	// Borrowed from the texture cache, which outlives its images.
+	GpuModifiedPageCounters* m_gpu_modified_pages = nullptr;
 	// Borrowed from the texture cache, which owns the twin's slot and frees it with this image.
 	Image*            m_scale_twin = nullptr;
 	ImageId           m_scale_twin_id {};
