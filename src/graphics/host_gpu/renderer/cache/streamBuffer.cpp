@@ -10,6 +10,13 @@
 #include <numeric>
 #include <vk_mem_alloc.h>
 
+// <winnt.h>, pulled in through the Vulkan headers on Windows, defines MemoryBarrier as a macro for
+// __faststorefence, which turns vk::MemoryBarrier below into a missing type. Nothing in this file
+// needs the Win32 macro.
+#ifdef MemoryBarrier
+#undef MemoryBarrier
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
