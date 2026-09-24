@@ -1464,6 +1464,79 @@ void TestReleasedReserveCanBeReused() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestClampRangeSizeFollowsMapChanges() {
+	const char* test    = "ClampRangeSizeFollowsMapChanges";
+	void*       reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 3, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	auto       map  = [&](uint64_t page, const char* name) {
+        void* address = reinterpret_cast<void*>(base + page * SceKernelPageSize);
+        CheckOk(test,
+                Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+                    &address, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, name),
+                "KernelMapNamedFlexibleMemory");
+	};
+	map(0, "clamp_left");
+	map(1, "clamp_right");
+
+	// The first query fills the per-thread run cache; the repeats and the smaller request inside
+	// the run must be answered identically from it.
+	for (int i = 0; i < 3; i++) {
+		Check(test,
+		      Libs::LibKernel::Memory::TryClampRangeSize(base, SceKernelPageSize * 3) ==
+		          SceKernelPageSize * 2,
+		      "clamp did not stop at the end of the committed run");
+	}
+	Check(test, Libs::LibKernel::Memory::TryClampRangeSize(base + 0x10, 0x20) == 0x20,
+	      "request inside the cached run was clamped");
+
+	// Unmapping the right page must be seen by the very next query, not the cached run.
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(right)");
+	Check(test,
+	      Libs::LibKernel::Memory::TryClampRangeSize(base, SceKernelPageSize * 2) ==
+	          SceKernelPageSize,
+	      "clamp served a cached run after an unmap");
+	Check(test, Libs::LibKernel::Memory::TryClampRangeSize(base + SceKernelPageSize, 0x10) == 0,
+	      "an unmapped address clamped to a non-zero size");
+
+	// Mapping the page again extends the run again.
+	map(1, "clamp_right_again");
+	Check(test,
+	      Libs::LibKernel::Memory::TryClampRangeSize(base, SceKernelPageSize * 2) ==
+	          SceKernelPageSize * 2,
+	      "clamp missed a remapped page");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 2),
+	        "KernelMunmap(all)");
+	Check(test, Libs::LibKernel::Memory::TryClampRangeSize(base, 0x10) == 0,
+	      "clamp served a cached run after the whole mapping went away");
+
+	// A partial unmap inside one mapping splits it; the kept half must be what the next query
+	// sees.
+	void* both = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &both, SceKernelPageSize * 2, SceKernelProtCpuRw, SceKernelMapFixed, "clamp_both"),
+	        "KernelMapNamedFlexibleMemory(both)");
+	Check(test,
+	      Libs::LibKernel::Memory::TryClampRangeSize(base, SceKernelPageSize * 3) ==
+	          SceKernelPageSize * 2,
+	      "clamp did not cover a two-page mapping");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(partial)");
+	Check(test,
+	      Libs::LibKernel::Memory::TryClampRangeSize(base, SceKernelPageSize * 3) ==
+	          SceKernelPageSize,
+	      "clamp served a cached run after a partial unmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(rest)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMunmapAcrossAdjacentFlexibleMappings() {
 	const char* test     = "MunmapAcrossAdjacentFlexibleMappings";
 	const auto  baseline = AvailableFlexibleMemory(test);
@@ -3133,6 +3206,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestClampRangeSizeFollowsMapChanges);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)

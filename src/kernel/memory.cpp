@@ -220,6 +220,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -250,6 +251,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -281,6 +283,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -296,6 +299,7 @@ public:
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -343,6 +347,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -355,12 +360,14 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
 		Common::LockGuard lock(m_mutex);
+		Changed();
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -426,11 +433,19 @@ public:
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
-
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
 		}
+		// The renderer clamps every vertex and storage buffer it binds, thousands of times a
+		// frame, against a map that almost never changes; serve those from the last committed
+		// runs this thread looked up while no mutation has happened since.
+		if (const auto cached = s_clamp_cache.Find(this, m_generation.load(std::memory_order_acquire),
+		                                           virtual_addr, size);
+		    cached != 0) {
+			return cached;
+		}
+
+		Common::LockGuard lock(m_mutex);
 
 		auto vma = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), virtual_addr,
@@ -446,19 +461,25 @@ public:
 			return 0;
 		}
 
-		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
-		uint64_t expected     = virtual_addr + clamped_size;
-		++vma;
-
-		while (vma != m_ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
-		       clamped_size < size) {
-			const auto chunk = std::min(size - clamped_size, vma->size);
-			clamped_size += chunk;
-			expected += chunk;
-			++vma;
+		// Find where the committed run containing the address ends. The walk goes past the
+		// request so the cached run also answers later, larger requests; it is bounded so a long
+		// run of adjacent mappings cannot make one call expensive.
+		constexpr int MaxRunWalk = 64;
+		const auto    run_start  = vma->start;
+		uint64_t      run_end    = vma_end;
+		bool          run_exact  = true;
+		int           walked     = 0;
+		for (++vma; vma != m_ranges.end() && vma->start == run_end && IsCommittedRangeType(vma->type);
+		     ++vma) {
+			if (++walked > MaxRunWalk && run_end - virtual_addr >= size) {
+				run_exact = false;
+				break;
+			}
+			run_end = End(vma->start, vma->size);
 		}
-
-		return clamped_size;
+		s_clamp_cache.Store(this, m_generation.load(std::memory_order_relaxed), run_start, run_end,
+		                    run_exact);
+		return std::min(size, run_end - virtual_addr);
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -649,9 +670,63 @@ private:
 		return nullptr;
 	}
 
-	std::vector<Range> m_ranges;
-	Common::Mutex      m_mutex;
+	// Every mutation of m_ranges happens under m_mutex and starts by moving the generation on,
+	// which invalidates what ClampRangeSize() cached before it. Generations are unique across
+	// instances, so a map recreated at the address of a destroyed one (Shutdown() then
+	// Initialize()) can never match a run another thread cached from the old one.
+	static uint64_t NextGeneration() {
+		static std::atomic<uint64_t> next {0};
+		return next.fetch_add(1, std::memory_order_relaxed) + 1;
+	}
+	void Changed() { m_generation.store(NextGeneration(), std::memory_order_release); }
+
+	// Committed runs [start, end) recently resolved by ClampRangeSize() on this thread. A run is
+	// only trusted while the map generation it was read under is still current. `exact` is false
+	// when the walk stopped before the true end of the run, so only requests inside it may use it.
+	class ClampCache {
+	public:
+		[[nodiscard]] uint64_t Find(const VirtualRanges* owner, uint64_t generation,
+		                            uint64_t vaddr, uint64_t size) const noexcept {
+			for (const auto& run: m_runs) {
+				if (run.owner != owner || run.generation != generation || vaddr < run.start ||
+				    vaddr >= run.end) {
+					continue;
+				}
+				const auto available = run.end - vaddr;
+				if (size <= available) {
+					return size;
+				}
+				return run.exact ? available : 0;
+			}
+			return 0;
+		}
+
+		void Store(const VirtualRanges* owner, uint64_t generation, uint64_t start, uint64_t end,
+		           bool exact) noexcept {
+			m_runs[m_next] = {owner, generation, start, end, exact};
+			m_next         = (m_next + 1) % m_runs.size();
+		}
+
+	private:
+		struct Run {
+			const VirtualRanges* owner      = nullptr;
+			uint64_t             generation = 0;
+			uint64_t             start      = 0;
+			uint64_t             end        = 0;
+			bool                 exact      = false;
+		};
+		std::array<Run, 4> m_runs {};
+		size_t             m_next = 0;
+	};
+
+	static thread_local ClampCache s_clamp_cache;
+
+	std::vector<Range>    m_ranges;
+	Common::Mutex         m_mutex;
+	std::atomic<uint64_t> m_generation {NextGeneration()};
 };
+
+thread_local VirtualRanges::ClampCache VirtualRanges::s_clamp_cache;
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_physical_memory_unmaps_before_failure = UINT32_MAX;
