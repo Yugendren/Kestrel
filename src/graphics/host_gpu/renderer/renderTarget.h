@@ -10,6 +10,49 @@ namespace Libs::Graphics {
 
 static constexpr uint32_t RENDER_COLOR_ATTACHMENTS_MAX = 8;
 
+// A single-entry memo keyed on (Key, cache generation). Render-target discovery re-derives the
+// same TextureCache lookup from the same guest registers on almost every draw; a generation that
+// hasn't moved since the last resolution is a cheap, always-correct proof that the cache would
+// answer identically again, so a caller can skip straight to the stored Value instead of redoing
+// the work that produced it. One entry is enough for every caller here: each memoizes a single
+// render-target slot (or, for depth, the single depth-stencil attachment) between consecutive
+// draws, not a history of slots.
+//
+// Header-only and Vulkan-free by design, so it can be reused anywhere a "does this still match
+// what I last computed" cache of exactly one entry is useful.
+template <typename Key, typename Value>
+class GenerationMemo {
+public:
+	// Returns the memoized value when both `key` and `generation` match what Store() last saw;
+	// nullptr otherwise. A generation mismatch alone invalidates the entry even when `key` is
+	// identical: the whole point of the generation is that the same key can now resolve to a
+	// different value (e.g. TextureCache::FindImage() returning a different image id), so it must
+	// be checked before the key is trusted at all.
+	[[nodiscard]] const Value* Find(const Key& key, uint64_t generation) const {
+		if (!m_valid || m_generation != generation || !(m_key == key)) {
+			return nullptr;
+		}
+		return &m_value;
+	}
+
+	// Overwrites whatever entry was stored before, if any.
+	void Store(const Key& key, uint64_t generation, const Value& value) {
+		m_key        = key;
+		m_generation = generation;
+		m_value      = value;
+		m_valid      = true;
+	}
+
+	// Forces the next Find() to miss regardless of key or generation.
+	void Invalidate() { m_valid = false; }
+
+private:
+	Key      m_key {};
+	uint64_t m_generation = 0;
+	Value    m_value {};
+	bool     m_valid = false;
+};
+
 struct RenderAttachment {
 	vk::ImageView           image_view    = nullptr;
 	vk::ImageLayout         image_layout  = vk::ImageLayout::eUndefined;

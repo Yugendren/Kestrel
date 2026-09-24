@@ -57,6 +57,12 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Replays the per-lookup side effects FindImage() has on `id` beyond returning it -- the LRU
+	// touch and the access tick -- without walking the page table again. For a caller that has
+	// memoized a previous FindImage() result against TextureCache::Generation() and observed no
+	// change, FindImage() would resolve to this exact id again; this is the cheap remainder of
+	// that lookup instead of repeating it.
+	void                        NoteImageReuse(ImageId id);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -94,7 +100,11 @@ public:
 
 	// Bumped whenever an image is created, destroyed, (un)registered or flagged for rebind, i.e.
 	// whenever a descriptor that resolved to some image on an earlier draw could now resolve
-	// somewhere else. A caller that cached a resolution only has to compare this.
+	// somewhere else. Also bumped when a state FindImage()/ResolveScaleBinding() consult besides
+	// the image set itself changes in a way that can change a lookup's answer without touching
+	// any image: m_scale_denied gaining a new address (it feeds the scale FindImage() assigns a
+	// range) and m_display_extent growing (it anchors ResolveImageScale()'s fidelity classes). A
+	// caller that cached a resolution only has to compare this.
 	[[nodiscard]] uint64_t Generation() const { return m_generation; }
 
 private:

@@ -1511,6 +1511,20 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+// See the declaration: this is the part of a FindImage() result a caller still has to apply when
+// it already knows -- from an unmoved Generation() -- that the lookup itself would answer the
+// same way again.
+void TextureCache::NoteImageReuse(ImageId id) {
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid()) {
+		EXIT("TextureCache: image lookup requires a valid command buffer\n");
+	}
+	std::scoped_lock lock {m_lock};
+	auto& image              = m_slot_images[id];
+	image.tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(image);
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
@@ -1533,8 +1547,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				// scanout surface and only ever grow it, so the class of a range is stable
 				// once the display is up.
 				const auto& guest       = desc.info.extent;
-				m_display_extent.width  = std::max(m_display_extent.width, guest.width);
-				m_display_extent.height = std::max(m_display_extent.height, guest.height);
+				const auto  grown_width  = std::max(m_display_extent.width, guest.width);
+				const auto  grown_height = std::max(m_display_extent.height, guest.height);
+				if (grown_width != m_display_extent.width || grown_height != m_display_extent.height) {
+					// A grown extent can change ResolveImageScale()'s fidelity-class verdict for
+					// ranges FindImage() already answered under the smaller extent (see
+					// Generation()'s doc comment), so a cached answer is no longer trustworthy.
+					++m_generation;
+				}
+				m_display_extent.width  = grown_width;
+				m_display_extent.height = grown_height;
 			}
 			desc.info.scale = m_scale_denied.contains(desc.info.data.address)
 			                      ? 1.0F
@@ -1709,7 +1731,13 @@ ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
 			return id;
 		}
 		if (!CanTwinScale(image.info)) {
-			m_scale_denied.insert(image.info.data.address);
+			// A newly denied address changes what a future FindImage() on this same address
+			// resolves its scale to (see the m_scale_denied.contains() check above); Generation()
+			// has to move so a memoized caller notices, independently of whatever ExpandImage()
+			// below does to the image set itself.
+			if (m_scale_denied.insert(image.info.data.address).second) {
+				++m_generation;
+			}
 			auto native  = image.info;
 			native.scale = 1.0F;
 			return ExpandImage(native, id);
@@ -1828,7 +1856,12 @@ void TextureCache::FreeScaleTwin(Image& owner) {
 ImageId TextureCache::DenyImageScale(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
-	m_scale_denied.insert(image.info.data.address);
+	// A newly denied address changes what a future FindImage() on it resolves its scale to; bump
+	// Generation() so a memoized caller notices even on the `!IsScaled()` path below, which
+	// returns without otherwise touching the image set (and so without another generation bump).
+	if (m_scale_denied.insert(image.info.data.address).second) {
+		++m_generation;
+	}
 	if (!image.info.IsScaled()) {
 		return id;
 	}

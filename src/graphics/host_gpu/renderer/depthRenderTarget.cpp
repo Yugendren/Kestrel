@@ -330,7 +330,17 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
 		DepthFatal("unsupported depth register state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	auto&      cache     = m_context.GetTextureCache();
+	// Only the desc/image half of discovery -- what MakeDepthTargetDesc()/FindImage() derive from
+	// HW::DepthRenderTarget -- is memoized; everything below keeps reading dc/sc/sm/rc every draw
+	// exactly as before, hit or miss, because those registers are outside the memo's key.
+	const auto* depth_hit = m_depth_target_memo.Find(z, cache.Generation());
+	if (depth_hit != nullptr) {
+		r.desc     = depth_hit->desc;
+		r.image_id = depth_hit->image_id;
+	} else {
+		r.desc = MakeDepthTargetDesc(buffer, z);
+	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_meta_clear_enable = false;
 	r.depth_load_clear_enable = r.depth_clear_enable;
@@ -372,8 +382,18 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 			r.stencil_back = r.stencil_front;
 		}
 	}
-	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	if (depth_hit != nullptr) {
+		// The desc/image half was already replayed from the memo above; only the per-lookup side
+		// effects FindImage() has beyond returning an id -- the LRU touch and access tick -- still
+		// need to run, so replay exactly those instead of walking the page table again.
+		cache.NoteImageReuse(r.image_id);
+	} else {
+		r.image_id = cache.FindImage(r.desc);
+		// Generation() is read after FindImage(), which can itself insert an image and move it;
+		// comparing against the pre-call generation would let the next draw's Find() hit on a
+		// value the insertion had already invalidated.
+		m_depth_target_memo.Store(z, cache.Generation(), {r.desc, r.image_id});
+	}
 	BindRenderTarget(r.image_id);
 }
 

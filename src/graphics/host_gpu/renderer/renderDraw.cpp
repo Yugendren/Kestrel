@@ -1047,6 +1047,9 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 // scaling, for example because it is smaller than the scaling threshold or its format cannot be
 // blitted. Converge the whole pass onto the native resolution; the denial is permanent, so later
 // frames discover a uniform group.
+// DenyImageScale() below bumps TextureCache::Generation() when it denies a new address, so the
+// discovery memo's stale color/depth entries simply miss on the next draw; nothing else here
+// needs to invalidate them.
 void RenderExecutor::UnifyRenderTargetScale(CommandBuffer& buffer, DrawRenderState& state) {
 	if (!RenderScale::Enabled()) {
 		return;

@@ -72,6 +72,23 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
+
+	auto&      texture_cache = m_context.GetTextureCache();
+	const ColorTargetKey key {rt, mask, render_target_slice_offset, exact_format};
+	// Consecutive draws overwhelmingly repeat the same CB_COLORx registers for a slot, and
+	// TextureCache::Generation() moves exactly when an earlier lookup's answer could now be
+	// stale -- the same invariant PrepareBindings() already relies on for texture descriptors
+	// (see StageTextures::texture_generation in render.h). On a hit this skips every validation
+	// EXIT() and the DCC/tile-layout math below, straight to the previously resolved r; only the
+	// per-lookup side effects FindImage() has beyond returning an id -- the LRU touch and access
+	// tick -- still have to run, and NoteImageReuse() replays exactly those under the cache lock.
+	if (const auto* hit = m_color_target_memo[rt_slot].Find(key, texture_cache.Generation())) {
+		r = *hit;
+		texture_cache.NoteImageReuse(r.image_id);
+		BindRenderTarget(r.image_id);
+		return;
+	}
+
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
@@ -352,12 +369,15 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.base_layer  = view.base_layer;
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-	auto& texture_cache        = m_context.GetTextureCache();
 	r.desc                     = std::move(desc);
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	// FindImage() can itself insert a new image or otherwise move the generation, so read it
+	// after the call: storing the pre-call generation could let the very next draw's Find() hit
+	// on a value the insertion had already invalidated.
+	m_color_target_memo[rt_slot].Store(key, texture_cache.Generation(), r);
 	BindRenderTarget(r.image_id);
 }
 

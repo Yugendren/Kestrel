@@ -4,6 +4,12 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+// Discovery-memo key types below need the complete HW::RenderTarget / HW::DepthRenderTarget
+// register structs (and their operator==), plus RenderColorInfo, as the memoized value types;
+// a forward declaration is no longer enough once a GenerationMemo<...> of them is a member.
+#include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/meshDrawArgs.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -18,17 +24,9 @@
 
 namespace Libs::Graphics {
 
-namespace HW {
-class Context;
-class UserConfig;
-class Shader;
-} // namespace HW
-
 struct GraphicContext;
 struct ShaderBufferResource;
 struct ShaderComputeInputInfo;
-struct RenderDepthInfo;
-struct RenderColorInfo;
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
@@ -190,6 +188,33 @@ private:
 	friend class CommandScheduler;
 };
 
+// Key for RenderExecutor::m_color_target_memo (see ResolveRenderColorTarget() in
+// colorRenderTarget.cpp). Covers exactly what that function reads out of the guest registers
+// before it starts validating and building a TextureCache::ImageDesc: the slot's raw
+// HW::RenderTarget block, its effective 4-bit mask after the ignore_target_mask adjustment
+// (ResolveColorTargets() forces mask=0x0f for its copy-target lookups, which CB_TARGET_MASK
+// alone would not show), the slice offset carried in from the draw, and exact_format
+// (ResolveColorTargets() also asks for an exact pixel-format match, unlike the per-draw loop).
+// Two lookups differing in any of these can legitimately resolve to different images.
+struct ColorTargetKey {
+	HW::RenderTarget rt;
+	uint32_t         mask                       = 0;
+	uint32_t         render_target_slice_offset = 0;
+	bool             exact_format               = false;
+
+	bool operator==(const ColorTargetKey&) const = default;
+};
+
+// Value for RenderExecutor::m_depth_target_memo: only the half of ResolveRenderDepthTarget()'s
+// result that MakeDepthTargetDesc()/TextureCache::FindImage() derive from HW::DepthRenderTarget.
+// Everything else RenderDepthInfo carries -- clear enables and values, the stencil face
+// resolution, the depth/stencil-control enables -- is read from registers outside
+// HW::DepthRenderTarget and is recomputed on every draw regardless of this memo.
+struct DepthTargetDiscovery {
+	TextureCache::ImageDesc desc;
+	ImageId                 image_id;
+};
+
 class RenderExecutor {
 public:
 	// Defined out of line: building m_mesh_draw_args_builder needs RenderContext::GetGraphics(), and
@@ -299,6 +324,13 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	std::unordered_set<uint64_t> m_unrepresentable_textures;
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
+	// Per-slot / per-draw memo of render-target discovery, keyed on TextureCache::Generation() --
+	// the same invariant StageTextures::texture_generation above already relies on for texture
+	// descriptors. See ColorTargetKey / DepthTargetDiscovery and their use in
+	// colorRenderTarget.cpp / depthRenderTarget.cpp.
+	std::array<GenerationMemo<ColorTargetKey, RenderColorInfo>, RENDER_COLOR_ATTACHMENTS_MAX>
+	                                                             m_color_target_memo;
+	GenerationMemo<HW::DepthRenderTarget, DepthTargetDiscovery> m_depth_target_memo;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
