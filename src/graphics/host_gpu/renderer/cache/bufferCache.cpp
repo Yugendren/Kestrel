@@ -671,9 +671,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	// A read of a range synchronised earlier whose tracker region has seen no CPU modification
+	// since needs neither the stream path nor an upload: answer it from the memo. Texel buffers
+	// are excluded because they may also have to pick up image contents.
+	const bool memoizable = !is_written && !is_texel_buffer;
+	const auto epoch = memoizable ? m_memory_tracker.CpuModificationEpoch(vaddr, size) : 0;
+	if (const auto memo = m_clean_ranges.Find(vaddr, size, epoch);
+	    memo.has_value() && !IsBufferInvalid(*memo) && m_slot_buffers[*memo].IsInBounds(vaddr, size)) {
+		auto& buffer = m_slot_buffers[*memo];
+		TouchBuffer(buffer);
+		const auto offset = buffer.Offset(vaddr);
+		RememberInScope(vaddr, size, is_written, is_texel_buffer, *memo, offset, false);
+		return {&buffer, offset};
+	}
+
+	if (!is_written && size <= CACHING_PAGESIZE && [&] {
+		    const auto state = m_memory_tracker.QueryModified(vaddr, size);
+		    return state.cpu && !state.gpu;
+	    }()) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, RingWait::Never);
@@ -692,6 +707,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+	}
+	if (memoizable) {
+		// The synchronisation left the range CPU-clean; `epoch` predates it, so any modification
+		// that raced it has already made this entry stale.
+		m_clean_ranges.Remember(vaddr, size, epoch, id);
 	}
 	const auto offset = buffer.Offset(vaddr);
 	RememberInScope(vaddr, size, is_written, is_texel_buffer, id, offset, false);

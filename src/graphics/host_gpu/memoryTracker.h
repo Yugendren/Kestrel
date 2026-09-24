@@ -25,6 +25,21 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+
+	struct Modification {
+		bool cpu = false;
+		bool gpu = false;
+	};
+	// Both dirty states of a range in one pass, taking each region lock once. Creates missing
+	// regions exactly like IsRegionCpuModified().
+	[[nodiscard]] Modification QueryModified(uint64_t vaddr, uint64_t size);
+
+	// Advances whenever bytes of the range's tracker regions may have become CPU-modified: every
+	// such change is published through MarkRangeDirty(), which advances the per-region counters
+	// this sums. A caller that saw the range CPU-clean at some epoch may keep relying on that
+	// while the epoch is unchanged, without asking the tracker again. 0 -- never trusted -- when
+	// one of its regions does not exist yet or the range spans more than a few regions.
+	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
@@ -204,6 +219,8 @@ private:
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
+	// Per region, see CpuModificationEpoch().
+	std::unique_ptr<std::atomic<uint64_t>[]>       m_cpu_epochs;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;

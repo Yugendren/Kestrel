@@ -7,6 +7,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/cleanRangeMemo.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -209,6 +210,7 @@ private:
 	                     BufferId id, uint64_t offset, bool stream);
 
 	std::array<BufferScopeEntry, MaxBufferScopeEntries> m_buffer_scope {};
+	CleanRangeMemo                                      m_clean_ranges;
 	size_t                                            m_buffer_scope_count = 0;
 	uint64_t                                          m_buffer_scope_tick  = 0;
 

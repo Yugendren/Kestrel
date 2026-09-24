@@ -8,7 +8,8 @@ namespace Libs::Graphics {
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
-	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_regions    = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_cpu_epochs = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT);
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -78,6 +79,48 @@ void MemoryTracker::MarkRangeDirty(uint64_t vaddr, uint64_t size) noexcept {
 		m_dirty.Add(vaddr, size);
 	}
 	m_has_dirty.store(true, std::memory_order_release);
+	const auto first = vaddr / TRACKER_REGION_SIZE;
+	if (first >= REGION_COUNT) {
+		return;
+	}
+	const auto last = std::min<uint64_t>((vaddr + (size - 1)) / TRACKER_REGION_SIZE,
+	                                     REGION_COUNT - 1);
+	for (auto index = first; index <= last; index++) {
+		m_cpu_epochs[index].fetch_add(1, std::memory_order_acq_rel);
+	}
+}
+
+uint64_t MemoryTracker::CpuModificationEpoch(uint64_t vaddr, uint64_t size) const noexcept {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	// Every counter only grows, so their sum changes whenever any of them does.
+	constexpr uint64_t MaxRegions = 16;
+	const auto         first      = vaddr / TRACKER_REGION_SIZE;
+	const auto         last       = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+	if (last - first >= MaxRegions) {
+		return 0;
+	}
+	uint64_t epoch = 0;
+	for (auto index = first; index <= last; index++) {
+		if (m_regions[index].load(std::memory_order_acquire) == nullptr) {
+			return 0;
+		}
+		epoch += m_cpu_epochs[index].load(std::memory_order_acquire);
+	}
+	return epoch;
+}
+
+MemoryTracker::Modification MemoryTracker::QueryModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	Modification result;
+	Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		result.cpu = result.cpu || manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		result.gpu = result.gpu || manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		return result.cpu && result.gpu;
+	});
+	return result;
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

@@ -440,6 +440,11 @@ add_executable(stream_buffer_upload_tests EXCLUDE_FROM_ALL
 target_link_libraries(stream_buffer_upload_tests fmt::fmt)
 target_include_directories(stream_buffer_upload_tests PRIVATE ${inc_headers})
 
+add_executable(clean_range_memo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CleanRangeMemoTests.cpp"
+)
+target_include_directories(clean_range_memo_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"

@@ -312,6 +312,67 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestCpuModificationEpoch() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  Check(tracker.CpuModificationEpoch(address, 64) == 0,
+        "a range without a tracker region had a trusted epoch");
+  const auto folded = tracker.QueryModified(address, 64);
+  Check(folded.cpu && !folded.gpu, "new region was not reported CPU dirty only");
+
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto clean = tracker.CpuModificationEpoch(address, 64);
+  Check(clean != 0, "an existing region had no epoch");
+  Check(!tracker.QueryModified(address, 64).cpu, "upload left the range CPU dirty");
+
+  // Clearing state and GPU-side changes do not advance it: they cannot make bytes need an upload.
+  tracker.ForEachUploadRange(
+      address, page_size * 2, true, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  const auto gpu_owned = tracker.QueryModified(address, 64);
+  Check(!gpu_owned.cpu && gpu_owned.gpu, "written upload did not mark the range GPU dirty");
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 2);
+  Check(tracker.CpuModificationEpoch(address, 64) == clean,
+        "GPU-side bookkeeping advanced the CPU modification epoch");
+
+  // Any CPU modification in the region advances it, even outside the queried range.
+  tracker.MarkRegionAsCpuModified(address + page_size, 16);
+  const auto after_mark = tracker.CpuModificationEpoch(address, 64);
+  Check(after_mark != clean, "explicit CPU modification did not advance the epoch");
+  tracker.ForEachUploadRange(
+      address, page_size * 2, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  bool flushed = false;
+  tracker.InvalidateRegion(address, 16, [&] { flushed = true; });
+  Check(!flushed && tracker.CpuModificationEpoch(address, 64) != after_mark,
+        "invalidation did not advance the epoch");
+
+  // A range crossing a region boundary is trusted only once both regions exist, and a
+  // modification in either region advances it.
+  const auto region_end = (address / (4ull * 1024 * 1024) + 1) * (4ull * 1024 * 1024);
+  if (tracker.CpuModificationEpoch(region_end + 16, 16) == 0) {
+    Check(tracker.CpuModificationEpoch(region_end - 16, 32) == 0,
+          "a range with a missing region had a trusted epoch");
+  }
+  (void)tracker.QueryModified(region_end - 16, 32);
+  const auto crossing = tracker.CpuModificationEpoch(region_end - 16, 32);
+  Check(crossing != 0, "a range over two existing regions had no epoch");
+  tracker.MarkRangeDirty(region_end + 1024, 16);
+  Check(tracker.CpuModificationEpoch(region_end - 16, 32) != crossing,
+        "a modification in the second region did not advance the epoch");
+  Check(tracker.CpuModificationEpoch(address, 17ull * 4 * 1024 * 1024) == 0,
+        "a range over too many regions had a trusted epoch");
+  tracker.UntrackMemory(address, page_size * 2);
+  Release(memory);
+}
+
 void TestRangeInvalidation() {
   constexpr uintptr_t base = 0x0000000201000000ull;
   TrackerHarness harness;
@@ -929,6 +990,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestCpuModificationEpoch();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
