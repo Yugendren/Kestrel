@@ -130,7 +130,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       std::vector<ReadbackWindow>* copied) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -140,6 +141,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    if (copied != nullptr) {
+				    copied->push_back({start, end});
+			    }
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
@@ -295,8 +299,9 @@ void BufferCache::RememberReadbackWindow(ReadbackWindow window) {
 	m_readback_window_bytes += window.Size();
 }
 
-void BufferCache::DownloadReadbackWindows(ReadbackWindow              current,
-                                          std::vector<ReadbackWindow>& downloaded) {
+void BufferCache::DownloadReadbackWindows(ReadbackWindow               current,
+                                          std::vector<ReadbackWindow>&  downloaded,
+                                          std::vector<ReadbackWindow>*  copied) {
 	std::vector<ReadbackWindow> candidates;
 	m_readback_windows.ForEach([&candidates, current](uint64_t begin, uint64_t end) {
 		if (begin >= current.end || end <= current.begin) {
@@ -320,10 +325,22 @@ void BufferCache::DownloadReadbackWindows(ReadbackWindow              current,
 		if (begin >= end) {
 			continue;
 		}
-		if (DownloadBufferMemory(buffer, begin, end - begin)) {
+		if (DownloadBufferMemory(buffer, begin, end - begin, copied)) {
 			downloaded.push_back({begin, end});
 		}
 	}
+}
+
+bool BufferCache::HasPendingDownloadBytes(uint64_t vaddr, uint64_t size) const {
+	return std::any_of(m_pending_downloads.begin(), m_pending_downloads.end(),
+	                   [vaddr, size](const PendingDownload& pending) {
+		                   return pending.begin < vaddr + size && vaddr < pending.end &&
+		                          std::any_of(pending.copied.begin(), pending.copied.end(),
+		                                      [vaddr, size](const ReadbackWindow& range) {
+			                                      return range.begin < vaddr + size &&
+			                                             vaddr < range.end;
+		                                      });
+	                   });
 }
 
 bool BufferCache::HasPendingDownload(uint64_t vaddr, uint64_t size) const {
@@ -391,10 +408,17 @@ void BufferCache::RecordPendingReadbacks() {
 	}
 	m_recording_readbacks = true;
 	std::vector<ReadbackWindow> downloaded;
-	DownloadReadbackWindows({}, downloaded);
+	std::vector<ReadbackWindow> copied;
+	DownloadReadbackWindows({}, downloaded, &copied);
 	const auto tick = m_scheduler.CurrentTick();
 	for (const auto& range: downloaded) {
-		m_pending_downloads.push_back({range.begin, range.end, tick});
+		PendingDownload pending {range.begin, range.end, tick, {}};
+		for (const auto& bytes: copied) {
+			if (bytes.begin < range.end && range.begin < bytes.end) {
+				pending.copied.push_back(bytes);
+			}
+		}
+		m_pending_downloads.push_back(std::move(pending));
 	}
 	m_recording_readbacks = false;
 }
@@ -837,7 +861,10 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	// An in-flight download has the bytes but has not published them, so the guest mapping is
 	// still stale: report the range as dirty and let ReadMemory wait for that submission.
-	return m_gpu_modified_ranges.Intersects(vaddr, size) || HasPendingDownload(vaddr, size);
+	// Only the bytes an in-flight download will overwrite are stale. A readback window is much
+	// wider than what the GPU wrote in it, and reporting the whole window made every CPU-written
+	// table sharing a page with a GPU-written word wait for the GPU to reach that submission.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) || HasPendingDownloadBytes(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

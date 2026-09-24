@@ -149,17 +149,25 @@ private:
 	// RetireCompletedDownloads() has published it. HasGpuDirtyBytes() reports such a range as
 	// dirty and DownloadReadbackWindows() leaves it alone, which keeps the cache's "tracker pages
 	// and dirty bytes agree" invariant intact for everything that is not in flight.
+	//
+	// begin/end is the whole window, which is what retirement unmarks; `copied` is the part of it
+	// the GPU had actually written, the only bytes the publication will overwrite. The rest of
+	// the window is already current in the guest mapping.
 	struct PendingDownload {
-		uint64_t begin = 0;
-		uint64_t end   = 0;
-		uint64_t tick  = 0;
+		uint64_t                    begin = 0;
+		uint64_t                    end   = 0;
+		uint64_t                    tick  = 0;
+		std::vector<ReadbackWindow> copied;
 	};
 
 	[[nodiscard]] ReadbackWindow ReadbackWindowFor(const Buffer& buffer, uint64_t vaddr,
 	                                              uint64_t size) const;
 	void RememberReadbackWindow(ReadbackWindow window);
-	void DownloadReadbackWindows(ReadbackWindow current, std::vector<ReadbackWindow>& downloaded);
+	void DownloadReadbackWindows(ReadbackWindow current, std::vector<ReadbackWindow>& downloaded,
+	                             std::vector<ReadbackWindow>* copied = nullptr);
 	[[nodiscard]] bool HasPendingDownload(uint64_t vaddr, uint64_t size) const;
+	// Like HasPendingDownload(), but only the bytes an in-flight download will publish.
+	[[nodiscard]] bool HasPendingDownloadBytes(uint64_t vaddr, uint64_t size) const;
 	// Waits for the submission that already carries this range, which is normally long finished,
 	// and publishes every download that has completed since.
 	void ResolvePendingDownloads(uint64_t vaddr, uint64_t size);
@@ -183,7 +191,9 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// `copied`, when given, receives the guest byte ranges the download will publish.
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        std::vector<ReadbackWindow>* copied = nullptr);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
