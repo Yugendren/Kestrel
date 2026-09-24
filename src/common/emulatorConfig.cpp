@@ -193,6 +193,26 @@ std::filesystem::path GetFrameTimeLogFile() {
 	return g_config->frame_time_log_file;
 }
 
+bool PerfOverlayEnabled() {
+	return g_config->perf_overlay_enabled;
+}
+
+bool RecordOnStart() {
+	return g_config->record_on_start;
+}
+
+bool ClipIncludeOverlay() {
+	return g_config->clip_include_overlay;
+}
+
+std::filesystem::path GetFfmpegPath() {
+	return g_config->ffmpeg_path;
+}
+
+std::filesystem::path GetClipsFolder() {
+	return g_config->clips_folder;
+}
+
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }

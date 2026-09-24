@@ -2,7 +2,6 @@
 
 #include "common/logging/log.h"
 
-#include <chrono>
 #include <cinttypes>
 #include <utility>
 
@@ -13,16 +12,19 @@ static constexpr uint32_t FLUSH_INTERVAL_US = 1000000;
 // A few seconds of frames, so the present thread never reallocates in steady state.
 static constexpr size_t   BATCH_RESERVE     = 1024;
 
-std::unique_ptr<FrameTimeLog> FrameTimeLog::Open(const std::filesystem::path& path) {
-	std::FILE* file = std::fopen(path.string().c_str(), "a");
+std::unique_ptr<FrameTimeLog> FrameTimeLog::Open(const std::filesystem::path& path, Format format) {
+	std::FILE* file = std::fopen(path.string().c_str(), format == Format::Csv ? "w" : "a");
 	if (file == nullptr) {
 		LOGF("frame-time-log: cannot open %s, frame timing disabled\n", path.string().c_str());
 		return nullptr;
 	}
-	return std::unique_ptr<FrameTimeLog>(new FrameTimeLog(file));
+	if (format == Format::Csv) {
+		std::fputs("frame,present_us,frame_ms\n", file);
+	}
+	return std::unique_ptr<FrameTimeLog>(new FrameTimeLog(file, format));
 }
 
-FrameTimeLog::FrameTimeLog(std::FILE* file): m_file(file) {
+FrameTimeLog::FrameTimeLog(std::FILE* file, Format format): m_file(file), m_format(format) {
 	m_pending.reserve(BATCH_RESERVE);
 	m_writer = std::make_unique<Common::Thread>(WriterMain, this);
 }
@@ -37,11 +39,7 @@ FrameTimeLog::~FrameTimeLog() {
 	std::fclose(m_file);
 }
 
-void FrameTimeLog::Record() {
-	const auto time_us = static_cast<uint64_t>(
-	    std::chrono::duration_cast<std::chrono::microseconds>(
-	        std::chrono::steady_clock::now().time_since_epoch())
-	        .count());
+void FrameTimeLog::Record(uint64_t time_us) {
 	Common::LockGuard lock(m_mutex);
 	m_pending.push_back({m_frame++, time_us});
 }
@@ -73,7 +71,15 @@ void FrameTimeLog::WriteBatch(const std::vector<Sample>& batch) {
 		return;
 	}
 	for (const auto& s: batch) {
-		std::fprintf(m_file, "%" PRIu64 " %" PRIu64 "\n", s.frame, s.time_us);
+		if (m_format == Format::Text) {
+			std::fprintf(m_file, "%" PRIu64 " %" PRIu64 "\n", s.frame, s.time_us);
+		} else if (s.frame == 0) {
+			std::fprintf(m_file, "%" PRIu64 ",%" PRIu64 ",\n", s.frame, s.time_us);
+		} else {
+			std::fprintf(m_file, "%" PRIu64 ",%" PRIu64 ",%.3f\n", s.frame, s.time_us,
+			             static_cast<double>(s.time_us - m_prev_time_us) / 1000.0);
+		}
+		m_prev_time_us = s.time_us;
 	}
 	std::fflush(m_file);
 }

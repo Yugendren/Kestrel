@@ -125,6 +125,16 @@ struct ConfigOptions {
 	// (see FrameTimeLog), for frame-time percentiles and lows that the per-second fps log
 	// cannot give. Empty disables it.
 	std::filesystem::path  frame_time_log_file;
+	// Performance HUD (F10) and clip recording (F9). perf_overlay_enabled starts with the HUD
+	// shown; record_on_start starts a clip once the first frame is presented. Clips capture the
+	// screen, so with clip_include_overlay off the HUD is hidden while recording. Empty
+	// ffmpeg_path searches next to the executable and on PATH; empty clips_folder is
+	// "<exe dir>/clips".
+	bool                   perf_overlay_enabled        = false;
+	bool                   record_on_start             = false;
+	bool                   clip_include_overlay        = true;
+	std::filesystem::path  ffmpeg_path;
+	std::filesystem::path  clips_folder;
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
@@ -197,6 +207,12 @@ inline LogDirection   GetPrintfDirection() { return Detail::g_hot_values.printf_
 std::filesystem::path GetPrintfOutputFile();
 uint32_t              GetFpsLogSeconds();
 std::filesystem::path GetFrameTimeLogFile();
+
+bool                  PerfOverlayEnabled();
+bool                  RecordOnStart();
+bool                  ClipIncludeOverlay();
+std::filesystem::path GetFfmpegPath();
+std::filesystem::path GetClipsFolder();
 
 bool ProfilerEnabled();
 

@@ -14,6 +14,7 @@
 
 namespace Libs::Graphics {
 
+class PerfMonitor;
 class Presenter;
 class RenderContext;
 
@@ -54,6 +55,8 @@ struct WindowContext {
 	vk::SurfaceKHR                 surface       = nullptr;
 	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;
+	// Declared before presenter so it outlives it: the presenter calls into it on every present.
+	std::unique_ptr<PerfMonitor>   perf_monitor;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
 	// Configured windowed size of a window created fullscreen at the desktop size; applied the

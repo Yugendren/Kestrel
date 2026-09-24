@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/perfMonitor.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
@@ -945,26 +946,32 @@ struct SystemOverlay::Impl {
 		}
 	}
 
-	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
+	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count,
+	                  PerfMonitor* hud, vk::Extent2D guest_output) {
 		OverlaySnapshot snapshot;
-		if (!GetOverlaySnapshot(&snapshot)) {
+		const bool      dialog = GetOverlaySnapshot(&snapshot);
+		if (!dialog && hud == nullptr) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
 		EnsureVulkan(format, image_count);
-		if (session != snapshot.session) {
-			session       = snapshot.session;
-			focus_pending = true;
-			shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
-			symbol_mode   = false;
-			panel_offset  = {};
-			right_stick   = {};
-			auto& io      = ImGui::GetIO();
-			io.ClearEventsQueue();
-			io.ClearInputKeys();
-			io.ClearInputMouse();
+		// HUD-only frames leave the dialog session and its input queue untouched: the HUD takes
+		// no input, and the next dialog must still see its own session reset.
+		if (dialog) {
+			if (session != snapshot.session) {
+				session       = snapshot.session;
+				focus_pending = true;
+				shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
+				symbol_mode   = false;
+				panel_offset  = {};
+				right_stick   = {};
+				auto& io      = ImGui::GetIO();
+				io.ClearEventsQueue();
+				io.ClearInputKeys();
+				io.ClearInputMouse();
+			}
+			DrainInput(snapshot.session);
 		}
-		DrainInput(snapshot.session);
 
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
@@ -977,14 +984,26 @@ struct SystemOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
-			ImGui::EndFrame();
-			return false;
+		bool draw_dialog = dialog;
+		if (dialog && (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session)) {
+			// The dialog closed or changed while the frame was being set up; it is picked up on
+			// the next present. Only the HUD, if any, is drawn this time.
+			if (hud == nullptr) {
+				ImGui::EndFrame();
+				return false;
+			}
+			draw_dialog = false;
 		}
-		if (snapshot.session.kind == OverlayKind::Error) {
-			DrawError(snapshot.error, frame_extent);
-		} else {
-			DrawIme(snapshot.ime, frame_extent);
+		// The HUD goes first so the dialog stays on top of it.
+		if (hud != nullptr) {
+			hud->DrawOverlay(frame_extent, guest_output);
+		}
+		if (draw_dialog) {
+			if (snapshot.session.kind == OverlayKind::Error) {
+				DrawError(snapshot.error, frame_extent);
+			} else {
+				DrawIme(snapshot.ime, frame_extent);
+			}
 		}
 		ImGui::Render();
 		extent = frame_extent;
@@ -1041,8 +1060,9 @@ SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<
 
 SystemOverlay::~SystemOverlay() = default;
 
-bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count) {
-	return m_impl->PrepareFrame(extent, format, image_count);
+bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count,
+                                 PerfMonitor* hud, vk::Extent2D guest_output) {
+	return m_impl->PrepareFrame(extent, format, image_count, hud, guest_output);
 }
 
 void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {

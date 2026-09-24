@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/perfMonitor.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -195,6 +196,18 @@ static void ToggleDesktopFullscreen() {
 	}
 }
 
+static void TogglePerfOverlay() {
+	if (g_window != nullptr && g_window->perf_monitor != nullptr) {
+		g_window->perf_monitor->ToggleOverlay();
+	}
+}
+
+static void ToggleClipRecording() {
+	if (g_window != nullptr && g_window->perf_monitor != nullptr) {
+		g_window->perf_monitor->ToggleRecording();
+	}
+}
+
 static void GameEventKeyboard(const EventKeyboard& key) {
 	static SDL_Keycode fullscreen_key = SDLK_UNKNOWN;
 
@@ -211,6 +224,16 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();
+				}
+				break;
+			case SDLK_F9:
+				if (!key.repeat) {
+					ToggleClipRecording();
+				}
+				break;
+			case SDLK_F10:
+				if (!key.repeat) {
+					TogglePerfOverlay();
 				}
 				break;
 			case SDLK_F11:
@@ -746,6 +769,11 @@ void WindowContext::Run() {
 	loop.paused.store(false, std::memory_order_release);
 
 	while (!loop.need_exit) {
+		// Every present wakes this loop (UpdateTitle posts the title to the main thread), so a
+		// pending --record starts right after the first frame without extra polling.
+		if (perf_monitor != nullptr) {
+			perf_monitor->PumpMainThread();
+		}
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
@@ -997,6 +1025,9 @@ void WindowContext::UpdateTitle() {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	if (perf_monitor != nullptr) {
+		text += perf_monitor->RecordingTitleSuffix();
+	}
 
 	struct TitleUpdate {
 		SDL_Window*  window;

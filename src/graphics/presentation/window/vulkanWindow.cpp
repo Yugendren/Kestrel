@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/perfMonitor.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -1165,7 +1166,8 @@ void WindowContext::CreateVulkan() {
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
-	presenter = std::make_unique<Presenter>(*this);
+	perf_monitor = std::make_unique<PerfMonitor>(graphic_ctx, window);
+	presenter    = std::make_unique<Presenter>(*this);
 }
 
 void WindowContext::RefreshSurfaceCapabilities() {
@@ -1190,6 +1192,8 @@ void WindowContext::RecreateSurface() {
 WindowContext::~WindowContext() {
 	ShutdownSystemOverlayInput();
 	presenter.reset();
+	// Finishes an active clip while the SDL window it captures still exists.
+	perf_monitor.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
 

@@ -136,6 +136,15 @@ static void PrintUsage() {
 	         "                                       Default: 0 (disabled).\n");
 	::printf("  --frame-time-log <path>              Append one line per presented frame:\n"
 	         "                                       frame index, monotonic time in us.\n");
+	::printf("  --perf-overlay                       Start with the performance overlay shown\n"
+	         "                                       (F10 toggles it).\n");
+	::printf("  --record                             Record a clip from the first presented frame\n"
+	         "                                       (F9 starts/stops recording).\n");
+	::printf("  --clip-overlay <true|false>          Include the performance overlay in clips.\n"
+	         "                                       Default: true.\n");
+	::printf("  --ffmpeg <path>                      ffmpeg used for clips. Default: next to the\n"
+	         "                                       emulator, then PATH.\n");
+	::printf("  --clips-dir <path>                   Clip output folder. Default: <exe dir>/clips.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
@@ -379,6 +388,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--perf-overlay") {
+			options.config.perf_overlay_enabled = true;
+			continue;
+		}
+
+		if (arg == "--record") {
+			options.config.record_on_start = true;
+			continue;
+		}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
 			options.config.red_zone_protection_enabled = true;
@@ -590,6 +609,15 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			    static_cast<uint32_t>(fps_log_seconds < 0 ? 0 : fps_log_seconds);
 		} else if (arg == "--frame-time-log") {
 			options.config.frame_time_log_file = value;
+		} else if (arg == "--clip-overlay") {
+			if (!ParseBool(value, options.config.clip_include_overlay)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--ffmpeg") {
+			options.config.ffmpeg_path = value;
+		} else if (arg == "--clips-dir") {
+			options.config.clips_folder = value;
 		} else if (arg == "--spirv-debug-printf") {
 			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

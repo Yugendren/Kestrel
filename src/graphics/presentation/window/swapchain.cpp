@@ -8,13 +8,14 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/perfMonitor.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
-#include "graphics/presentation/window/frameTimeLog.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <deque>
 #include <limits>
@@ -27,10 +28,11 @@
 namespace Libs::Graphics {
 
 struct Presenter::Frame {
-	VulkanImage image;
-	uint64_t    present_tick = 0;
-	bool        busy         = false;
-	bool        reusing_last = false;
+	VulkanImage  image;
+	vk::Extent2D guest_extent {}; // guest video-out size; image may be render-scaled
+	uint64_t     present_tick = 0;
+	bool         busy         = false;
+	bool         reusing_last = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -284,7 +286,7 @@ public:
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage();
-	[[nodiscard]] bool   PrepareSystemOverlay();
+	[[nodiscard]] bool   PrepareSystemOverlay(PerfMonitor* hud, vk::Extent2D guest_output);
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
 	                                           bool draw_system_overlay);
 	uint64_t             Submit(CommandScheduler& scheduler);
@@ -315,14 +317,12 @@ private:
 
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
-	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+	    : renderer(*owner.render_context), window(owner), perf(*owner.perf_monitor),
+	      swapchain(owner), present_scheduler(renderer, owner.graphic_ctx),
+	      frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
-		if (const auto path = Config::GetFrameTimeLogFile(); !path.empty()) {
-			frame_time_log = FrameTimeLog::Open(path);
-		}
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -355,12 +355,11 @@ struct Presenter::Impl {
 
 	RenderContext&        renderer;
 	WindowContext&        window;
+	PerfMonitor&          perf;
 	Swapchain             swapchain;
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_overlay_revision {0};
-	// Null unless --frame-time-log is set.
-	std::unique_ptr<FrameTimeLog> frame_time_log;
 };
 
 void Swapchain::Create() {
@@ -594,11 +593,11 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 	return Status::Success;
 }
 
-bool Swapchain::PrepareSystemOverlay() {
+bool Swapchain::PrepareSystemOverlay(PerfMonitor* hud, vk::Extent2D guest_output) {
 	if (m_system_overlay == nullptr) {
 		m_system_overlay = std::make_unique<SystemOverlay>(m_window.graphic_ctx);
 	}
-	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
+	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount(), hud, guest_output);
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
@@ -745,6 +744,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
+	frame->guest_extent = {info.extent.width, info.extent.height};
 	frame->CopyFrom(buffer, image);
 	return *frame;
 }
@@ -756,6 +756,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto*             frame  = m_impl->frames.Acquire();
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
+	frame->guest_extent = {width, height};
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
 	if (producer != nullptr) {
@@ -792,11 +793,16 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
-	auto&      swapchain  = m_impl->swapchain;
+	auto&      swapchain      = m_impl->swapchain;
+	auto&      perf           = m_impl->perf;
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (swapchain.NeedsResize()) {
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	// The HUD is drawn only on real presents: it deliberately does not count as an active
+	// system overlay, which would make video-out re-present every vblank and skew the fps it
+	// measures.
+	const bool draw_hud = perf.ShouldDrawOverlay();
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
@@ -806,9 +812,17 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		{
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 			auto&             command          = m_impl->present_scheduler.BeginCommand();
+			const auto        hud_start        = std::chrono::steady_clock::now();
 			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
+			    (overlay_visual.active || draw_hud) &&
+			    swapchain.PrepareSystemOverlay(draw_hud ? &perf : nullptr, frame.guest_extent);
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+			if (draw_hud) {
+				// Shown in the HUD itself, so its per-frame CPU cost stays visible.
+				perf.ReportOverlayCost(std::chrono::duration<double, std::milli>(
+				                           std::chrono::steady_clock::now() - hud_start)
+				                           .count());
+			}
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
 		status = swapchain.Present();
@@ -819,9 +833,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
-		if (m_impl->frame_time_log != nullptr) {
-			m_impl->frame_time_log->Record();
-		}
+		perf.OnPresent();
 		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;

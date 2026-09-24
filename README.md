@@ -59,6 +59,11 @@ On `main` today:
 - **Red-zone protection** (`--redzone`): needed by Demon's Souls on Windows.
 - **fps log** (`--fps-log <seconds>`): writes `fps: N frame: N t=Ns` lines to the guest log.
   The window title also shows `frame: N, fps: N` while running.
+- **Performance overlay and clips** (F10 overlay, F9 clip recording, `--perf-overlay`,
+  `--record`, `--frame-time-log <path>`): shows fps, frame time, 1% low, a frame-time graph, CPU,
+  GPU and memory use. F9 records an H.264 clip with a per-frame timestamp CSV and needs
+  [ffmpeg](https://ffmpeg.org/). F9 and F10 cannot be used in `--keymap`. Also `--clip-overlay`,
+  `--ffmpeg`, `--clips-dir`.
 - **Launcher scripts** (`kestrel.bat`, `kestrel.sh`): presets for each game and GPU class, a
   dry-run mode, and a report mode that records a run for bug reports.
 - **Game-speed patches** (`--patch "<name>"`, `--patches <dir>`): a patch loader that reads

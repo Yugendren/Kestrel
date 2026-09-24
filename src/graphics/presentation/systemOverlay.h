@@ -12,6 +12,7 @@ struct SDL_Window;
 namespace Libs::Graphics {
 
 struct GraphicContext;
+class PerfMonitor;
 
 struct SystemOverlayVisualState {
 	bool     active;
@@ -29,7 +30,11 @@ public:
 	~SystemOverlay();
 	KYTY_CLASS_NO_COPY(SystemOverlay);
 
-	[[nodiscard]] bool PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count);
+	// Builds the ImGui frame for the active IME/error dialog and, when `hud` is non-null, the
+	// performance HUD (both share the one process-wide ImGui context and Vulkan backend).
+	// Returns true if anything was drawn and Record() must be called.
+	[[nodiscard]] bool PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t image_count,
+	                                PerfMonitor* hud, vk::Extent2D guest_output);
 	void               Record(vk::CommandBuffer command, vk::ImageView target);
 	void               ReleaseVulkan();
 
