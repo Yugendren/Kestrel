@@ -39,7 +39,8 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+	    : Buffer(graphics, scheduler, usage, usage, cpu_address, flags, size) {}
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -79,6 +80,10 @@ public:
 	size_t lru_id       = 0;
 
 protected:
+	// `placement` chooses the memory the buffer lives in; `usage` is what it is used for.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
+	       MemoryUsage placement, uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
@@ -144,6 +149,14 @@ public:
 	// buffer for it instead of failing the whole download.
 	[[nodiscard]] DownloadAllocation AcquireDownload(uint64_t size, uint64_t alignment = 0);
 
+	// A MemoryUsage::Stream ring lives in device memory, where the GPU reads it at full speed, and
+	// the CPU writes a host-memory twin at the same offsets instead (writes into mapped device
+	// memory cross the bus uncached, and on some hosts crawl). The bytes the recording submission
+	// wrote reach device memory through RecordUploads(), which the scheduler records into a
+	// command buffer it submits ahead of the recording one.
+	[[nodiscard]] bool HasPendingUploads() const noexcept { return !m_pending_uploads.empty(); }
+	void               RecordUploads(vk::CommandBuffer command);
+
 private:
 	friend struct StreamBufferTestAccess;
 
@@ -165,6 +178,33 @@ private:
 	                                                uint64_t requested_upper_bound, RingWait wait,
 	                                                size_t& wait_cursor, uint64_t& wait_bound);
 
+	[[nodiscard]] std::span<uint8_t> HostView() const noexcept {
+		return m_host_twin != nullptr ? m_host_twin->Mapped() : Mapped();
+	}
+	[[nodiscard]] bool HostCoherent() const noexcept {
+		return m_host_twin != nullptr ? m_host_twin->IsCoherent() : IsCoherent();
+	}
+	void CommitRange(bool upload);
+	// Adds a ring range written on the host to the copies RecordUploads() will record.
+	static void AppendUpload(std::vector<vk::BufferCopy>& uploads, uint64_t offset,
+	                         uint64_t size) {
+		// Allocations are packed in ring order, so a range usually continues the previous one up
+		// to its alignment padding; copying the padding too keeps the writes one region.
+		constexpr uint64_t MaxMergedGap = 4096;
+		if (!uploads.empty()) {
+			auto&      last     = uploads.back();
+			const auto last_end = last.srcOffset + last.size;
+			if (offset >= last_end && offset - last_end <= MaxMergedGap) {
+				last.size = offset + size - last.srcOffset;
+				return;
+			}
+		}
+		uploads.push_back({offset, offset, size});
+	}
+
+	std::unique_ptr<Buffer>     m_host_twin;
+	// Ring ranges written by the CPU since the last RecordUploads(), in ring order.
+	std::vector<vk::BufferCopy> m_pending_uploads;
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
 	std::vector<Watch>    m_current_watches;

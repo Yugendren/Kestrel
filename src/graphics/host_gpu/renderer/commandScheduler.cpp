@@ -591,12 +591,25 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	// cleanly, and Current() asserts the buffer is open, so the bad case is exactly the concurrent
 	// one. It also mis-timed the readback: the copy went into the main buffer while the completion
 	// callback waited on the present tick, so the guest could be handed stale bytes.
+	vk::CommandBuffer stream_uploads = nullptr;
 	if (this == &m_context.GetCommandScheduler()) {
 		m_context.GetBufferCache().RecordPendingReadbacks();
+		// The stream ring is written on the host while this buffer records; its bytes reach
+		// device memory in a command buffer submitted ahead of this one in the same batch, so
+		// every draw recorded here finds them in place. The pool retires it with this tick.
+		if (m_context.GetBufferCache().HasPendingStreamUploads()) {
+			stream_uploads = m_command_pool.Commit();
+			vk::CommandBufferBeginInfo begin_info {};
+			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			EXIT_NOT_IMPLEMENTED(stream_uploads.begin(&begin_info) != vk::Result::eSuccess);
+			m_context.GetBufferCache().RecordStreamUploads(stream_uploads);
+			EXIT_NOT_IMPLEMENTED(stream_uploads.end() != vk::Result::eSuccess);
+		}
 	}
 
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
+	const std::array<vk::CommandBuffer, 2> buffers {stream_uploads, buffer};
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
@@ -618,8 +631,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.commandBufferCount   = stream_uploads ? 2 : 1;
+		submit_info.pCommandBuffers      = stream_uploads ? buffers.data() : &buffer;
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 

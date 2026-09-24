@@ -87,6 +87,12 @@ public:
 	// about to be submitted, so the read waits on that submission instead of draining everything
 	// recorded after it. Called by CommandScheduler just before it closes the buffer.
 	void               RecordPendingReadbacks();
+	// The stream ring's host writes of the recording submission, carried to device memory by a
+	// command buffer submitted ahead of it. See StreamBuffer::RecordUploads().
+	[[nodiscard]] bool HasPendingStreamUploads() const noexcept {
+		return m_stream_buffer.HasPendingUploads();
+	}
+	void RecordStreamUploads(vk::CommandBuffer command) { m_stream_buffer.RecordUploads(command); }
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();

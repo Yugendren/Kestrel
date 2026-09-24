@@ -56,7 +56,8 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               MemoryUsage placement, uint64_t cpu_address, vk::BufferUsageFlags flags,
+               uint64_t size)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -71,9 +72,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
-	allocation_info.usage = AllocationUsage(usage);
-	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(placement);
+	allocation_info.usage = AllocationUsage(placement);
+	allocation_info.preferredFlags = placement == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
@@ -219,9 +220,15 @@ StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler
                            uint64_t size)
     // A stream allocation can back a mesh draw's parameter block, which the shader addresses
     // directly through its 64-bit device address rather than through a bound descriptor.
-    : Buffer(graphics, scheduler, usage, 0, AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-             size),
-      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
+    : Buffer(graphics, scheduler, usage,
+             usage == MemoryUsage::Stream ? MemoryUsage::DeviceLocal : usage, 0,
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
+      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {
+	if (usage == MemoryUsage::Stream) {
+		m_host_twin = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
+		                                       vk::BufferUsageFlagBits::eTransferSrc, size);
+	}
+}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
                                         uint64_t& alignment) {
@@ -246,7 +253,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	// only the returned pointer cannot. Reserve() is the entry point such callers use.
 	uint64_t   mapped_size = size;
 	const auto atom        = Graphics().physical_device_properties.limits.nonCoherentAtomSize;
-	if (!NormalizeReservation(IsCoherent(), atom, mapped_size, alignment)) {
+	if (!NormalizeReservation(HostCoherent(), atom, mapped_size, alignment)) {
 		return {nullptr, 0};
 	}
 	if (mapped_size > Size()) {
@@ -282,11 +289,20 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	m_wait_bound  = wait_bound;
 	m_offset      = aligned_offset;
 	m_mapped_size = mapped_size;
-	return {Mapped().empty() ? nullptr : Mapped().data() + m_offset, m_offset};
+	return {HostView().empty() ? nullptr : HostView().data() + m_offset, m_offset};
 }
 
 void StreamBuffer::Commit() {
-	if (Usage() != MemoryUsage::Download && m_mapped_size != 0 && !Mapped().empty()) {
+	CommitRange(true);
+}
+
+void StreamBuffer::CommitRange(bool upload) {
+	if (m_host_twin != nullptr) {
+		if (upload && m_mapped_size != 0) {
+			m_host_twin->Flush(m_offset, m_mapped_size);
+			AppendUpload(m_pending_uploads, m_offset, m_mapped_size);
+		}
+	} else if (Usage() != MemoryUsage::Download && m_mapped_size != 0 && !Mapped().empty()) {
 		Flush(m_offset, m_mapped_size);
 	}
 
@@ -315,9 +331,28 @@ uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignmen
 
 uint64_t StreamBuffer::Reserve(uint64_t size, uint64_t alignment) {
 	const auto [data, offset] = Map(size, alignment);
-	EXIT_IF(data == nullptr && !Mapped().empty());
-	Commit();
+	EXIT_IF(data == nullptr && !HostView().empty());
+	// Nothing was written on the host, so there is nothing to carry to device memory either.
+	CommitRange(false);
 	return offset;
+}
+
+void StreamBuffer::RecordUploads(vk::CommandBuffer command) {
+	if (m_pending_uploads.empty()) {
+		return;
+	}
+	EXIT_IF(m_host_twin == nullptr);
+	// No barrier ahead of the copy: Map() hands a ring range out only once every submission that
+	// read it has completed, and host writes are visible to the device at submission.
+	command.copyBuffer(m_host_twin->Handle(), Handle(),
+	                   static_cast<uint32_t>(m_pending_uploads.size()), m_pending_uploads.data());
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                        nullptr);
+	m_pending_uploads.clear();
 }
 
 StreamBuffer::DownloadAllocation StreamBuffer::AcquireDownload(uint64_t size, uint64_t alignment) {
