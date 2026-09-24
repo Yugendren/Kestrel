@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/framePacer.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
@@ -803,8 +804,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	EXIT_IF(frequency == 0);
 
 	int64_t total_wait = 0;
-	// Timestamp of the last vblank on which a flip was allowed. 0 lets the first vblank flip.
-	uint64_t last_flip = 0;
+	// --frame-cap pacing state (see FramePacer for why it is a deadline with half-vblank slack).
+	Graphics::FramePacer pacer;
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
@@ -828,12 +829,10 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		// consumed is capped, so a title that waits for flip completion throttles itself to the
 		// cap instead of rendering frames that are never shown. A cap at or above the vblank
 		// frequency cannot pace anything and is ignored.
-		const auto frame_cap  = Config::GetFrameCap();
-		bool       allow_flip = true;
-		if (frame_cap != 0 && frame_cap < refresh) {
-			const auto flip_period = std::max(frequency / frame_cap, uint64_t {1});
-			allow_flip = frame_begin - last_flip >= flip_period;
-		}
+		const auto frame_cap   = Config::GetFrameCap();
+		const bool capped      = frame_cap != 0 && frame_cap < refresh;
+		const auto flip_period = capped ? std::max(frequency / frame_cap, uint64_t {1}) : period;
+		const bool allow_flip  = !capped || pacer.IsFlipDue(frame_begin, period);
 
 		if (m_presenter.IsGuestPaused()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
@@ -848,7 +847,6 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		VblankBegin();
 		bool presented = false;
 		if (allow_flip) {
-			last_flip = frame_begin;
 			presented = m_flip_queue.Flip(0);
 		}
 		if (allow_flip && !presented && m_presenter.NeedsSystemOverlayRefresh()) {
@@ -884,6 +882,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
 				m_presenter.Present(blank);
 			}
+		}
+		if (capped && presented) {
+			pacer.OnPresented(frame_begin, flip_period);
 		}
 		VblankEnd();
 

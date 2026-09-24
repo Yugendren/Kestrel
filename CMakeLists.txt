@@ -423,6 +423,11 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(frame_pacer_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FramePacerTests.cpp"
+)
+target_include_directories(frame_pacer_tests PRIVATE ${inc_headers})
+
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
