@@ -41,6 +41,9 @@ struct PreparedBindings {
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<vk::Sampler>              samplers;
+	// Which recorded stage resolution `images` and `samplers` hold (see RenderExecutor's
+	// StageTextures), so a draw reusing that resolution leaves them in place; 0 when none.
+	uint64_t                              texture_resolution = 0;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;

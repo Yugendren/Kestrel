@@ -278,6 +278,8 @@ private:
 		std::vector<TextureBinding>                        images;
 		std::vector<vk::Sampler>                           samplers;
 		uint64_t                                           texture_generation = 0;
+		// Identifies this recorded resolution among every stage's (from m_texture_resolutions).
+		uint64_t                                           resolution = 0;
 	};
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -328,6 +330,7 @@ private:
 	// Indexed by ShaderType, which ends with the tessellation stages.
 	std::array<StageTextures, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1>
 	                                      m_stage_textures;
+	uint64_t                              m_texture_resolutions = 0;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

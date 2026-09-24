@@ -901,10 +901,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	if (last.program == &program && last.texture_generation == generation &&
 	    std::ranges::equal(last.image_values, snapshot.images) &&
 	    std::ranges::equal(last.sampler_values, snapshot.samplers)) {
-		// Copy-assignment keeps the capacity of the persistent bindings, including each image's
-		// mip view list; the recorded bindings carry no views, as a fresh resolution would not.
-		prepared.images   = last.images;
-		prepared.samplers = last.samplers;
+		// The persistent bindings usually still hold this resolution from the previous draw of the
+		// stage: the views and layouts they inherit are recomputed every draw by RebindImages()
+		// and CommitBindings(), and an entry RebindImages() re-resolved since is the current
+		// resolution of the same descriptor value. Otherwise copy-assignment keeps their capacity,
+		// including each image's mip view list; the recorded bindings carry no views, as a fresh
+		// resolution would not.
+		if (prepared.texture_resolution != last.resolution) {
+			prepared.images             = last.images;
+			prepared.samplers           = last.samplers;
+			prepared.texture_resolution = last.resolution;
+		}
 		for (const auto& binding: prepared.images) {
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		}
@@ -929,7 +936,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		last.images   = prepared.images;
 		last.samplers = prepared.samplers;
 		// Resolving can itself create images, so record the generation it ended at.
-		last.texture_generation = m_context.GetTextureCache().Generation();
+		last.texture_generation     = m_context.GetTextureCache().Generation();
+		last.resolution             = ++m_texture_resolutions;
+		prepared.texture_resolution = last.resolution;
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
