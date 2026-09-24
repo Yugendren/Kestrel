@@ -301,11 +301,14 @@ struct PipelineCache::ProgramCache {
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
+		    : resource_plan(std::move(plan)), compiled_plan(resource_plan) {
 			permutations.reserve(8);
 		}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
+		// Every draw of this program refreshes its resources; the plan's walk is lowered once here
+		// instead of being interpreted per draw. Declared after resource_plan, which it refers to.
+		ShaderRecompiler::IR::CompiledSrtPlan        compiled_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
@@ -412,7 +415,8 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			if (!ReportMaterialization(label, stage, params.hash, report,
 			                           ShaderRecompiler::IR::MaterializeResources(
-			                               entry->second.resource_plan, runtime,
+			                               entry->second.resource_plan,
+			                               &entry->second.compiled_plan, runtime,
 			                               entry->second.resources, entry->second.specialization,
 			                               &report))) {
 				return {};
@@ -471,7 +475,8 @@ struct PipelineCache::ProgramCache {
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
 			if (!ReportMaterialization(label, stage, params.hash, report,
 			                           ShaderRecompiler::IR::MaterializeResources(
-			                               entry->second.resource_plan, runtime,
+			                               entry->second.resource_plan,
+			                               &entry->second.compiled_plan, runtime,
 			                               entry->second.resources, entry->second.specialization,
 			                               &report))) {
 				return {};

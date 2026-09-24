@@ -1158,6 +1158,12 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           MaterializeReport* report) {
+	return MaterializeResources(program, nullptr, runtime, snapshot, specialization, report);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const CompiledSrtPlan* compiled,
+                          const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                          ResourceSpecialization& specialization, MaterializeReport* report) {
 	if (report != nullptr) {
 		*report = {};
 	}
@@ -1189,8 +1195,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		observed.read_specialization_memory = CaptureStrictRead;
 		if (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;
 	}
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
+	SrtRefresh refresh(program, observed, compiled);
+	auto&      clean  = refresh.Clean();
+	auto&      walker = refresh.Main();
 	const auto active = clean.FindActiveSources();
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return fail("the flattened SRT did not evaluate");

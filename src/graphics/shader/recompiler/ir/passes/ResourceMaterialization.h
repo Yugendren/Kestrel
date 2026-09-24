@@ -53,6 +53,12 @@ struct MaterializeReport {
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           MaterializeReport* report = nullptr);
+// As above, walking through `compiled` (built from `program`) wherever it applies. A null or
+// unusable `compiled` interprets the whole walk.
+bool MaterializeResources(const ResourcePlan& program, const CompiledSrtPlan* compiled,
+                          const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                          ResourceSpecialization& specialization,
+                          MaterializeReport* report = nullptr);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
