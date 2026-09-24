@@ -99,13 +99,25 @@ private:
 	std::span<uint8_t>            m_mapped;
 };
 
+// How far StreamBuffer::Map() may go to free ring space that earlier work still reads.
+enum class RingWait : uint8_t {
+	// Fail instead of waiting.
+	Never,
+	// Wait for submissions the GPU already has, but fail rather than submit the command buffer
+	// that is still recording. Submitting runs the scheduler's end-of-submission hooks, which
+	// callers holding memory-tracker state (an upload callback, for one) must not re-enter.
+	Submitted,
+	// Wait for anything, submitting the recording command buffer if the range is its own.
+	Any,
+};
+
 class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	             uint64_t size);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
-	                                                bool allow_wait = true);
+	                                                RingWait wait = RingWait::Any);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
 	// Reserves a range without producing a CPU pointer, for a usage a shader writes into directly
@@ -142,9 +154,15 @@ private:
 
 	[[nodiscard]] static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
 	                                               uint64_t& alignment);
+	// Whether a range still read by work recorded at `tick` may be waited for under `wait`, given
+	// the tick the scheduler is currently recording.
+	[[nodiscard]] static bool MayWaitFor(RingWait wait, uint64_t tick,
+	                                     uint64_t current_tick) noexcept {
+		return wait == RingWait::Any || (wait == RingWait::Submitted && tick < current_tick);
+	}
 	[[nodiscard]] bool        WaitPendingOperations(const std::vector<Watch>& watches,
 	                                                std::optional<size_t>     invalidation_mark,
-	                                                uint64_t requested_upper_bound, bool allow_wait,
+	                                                uint64_t requested_upper_bound, RingWait wait,
 	                                                size_t& wait_cursor, uint64_t& wait_bound);
 
 	uint64_t              m_offset      = 0;

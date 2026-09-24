@@ -240,7 +240,7 @@ bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& 
 }
 
 std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignment,
-                                                bool allow_wait) {
+                                                RingWait wait) {
 	// A MemoryUsage::DeviceLocal buffer has no host mapping (nothing ever writes it from the CPU),
 	// so Mapped() is empty here; the ring-offset and watch bookkeeping below still applies to it,
 	// only the returned pointer cannot. Reserve() is the entry point such callers use.
@@ -269,7 +269,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	    wrap ? std::optional<size_t> {m_current_watch_cursor} : m_invalidation_mark;
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
 	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
-	                           allow_wait, wait_cursor, wait_bound)) {
+	                           wait, wait_cursor, wait_bound)) {
 		return {nullptr, 0};
 	}
 
@@ -336,14 +336,15 @@ StreamBuffer::DownloadAllocation StreamBuffer::AcquireDownload(uint64_t size, ui
 
 bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
                                          std::optional<size_t>     invalidation_mark,
-                                         uint64_t requested_upper_bound, bool allow_wait,
+                                         uint64_t requested_upper_bound, RingWait wait,
                                          size_t& wait_cursor, uint64_t& wait_bound) {
 	if (!invalidation_mark.has_value()) {
 		return true;
 	}
 	while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
 		const auto& watch = watches[wait_cursor];
-		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
+		if (!Scheduler().IsFree(watch.tick) &&
+		    !MayWaitFor(wait, watch.tick, Scheduler().CurrentTick())) {
 			return false;
 		}
 		Scheduler().Wait(watch.tick);

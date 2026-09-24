@@ -586,7 +586,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	// This runs inside MemoryTracker::ForEachUploadRange's upload callback (with region locks held
+	// for a written range). Waiting for the recording tick would submit it, and submitting records
+	// pending readbacks, which walk the tracker again: the staging ring wrapping onto its own
+	// submission during a heavy load used to abort there. Older work may still be waited for; if
+	// only the recording tick holds the space, the one-shot buffer below takes the upload.
+	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4, RingWait::Submitted);
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
@@ -671,7 +676,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, RingWait::Never);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
 			m_stream_buffer.Commit();
 			RememberInScope(vaddr, size, is_written, is_texel_buffer, {}, offset, true);

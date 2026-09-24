@@ -2282,9 +2282,9 @@ public:
     auto *fixed_download = &cache.GetUtilityBuffer(MemoryUsage::Download);
     const auto fixed_handle = fixed_download->Handle();
     const auto [oversized_download, oversized_offset] =
-        fixed_download->Map(fixed_download->Size() + 4, 64, false);
+        fixed_download->Map(fixed_download->Size() + 4, 64, RingWait::Never);
     const auto [download_probe, download_probe_offset] =
-        fixed_download->Map(64, 64, false);
+        fixed_download->Map(64, 64, RingWait::Never);
     Require("StreamBufferRing", "fixed download utility",
             oversized_download == nullptr && oversized_offset == 0 &&
                 download_probe != nullptr && download_probe_offset == 0 &&
@@ -2328,7 +2328,7 @@ public:
     const auto first_size =
         stream.IsCoherent() ? small_ring_size - 16 : small_ring_size - atom + 1;
     constexpr uint64_t blocked_size = 24;
-    const auto [first, first_offset] = stream.Map(first_size, 16, false);
+    const auto [first, first_offset] = stream.Map(first_size, 16, RingWait::Never);
     Require("StreamBufferRing", "first allocation",
             first != nullptr && first_offset == 0,
             "initial stream allocation failed");
@@ -2336,13 +2336,13 @@ public:
     stream.Commit();
 
     const auto [oversize, oversize_offset] =
-        stream.Map(small_ring_size + 1, 1, false);
+        stream.Map(small_ring_size + 1, 1, RingWait::Never);
     Require("StreamBufferRing", "oversize",
             oversize == nullptr && oversize_offset == 0,
             "oversize allocation was accepted");
-    const auto [blocked, blocked_offset] = stream.Map(blocked_size, 1, false);
+    const auto [blocked, blocked_offset] = stream.Map(blocked_size, 1, RingWait::Never);
     const auto [blocked_again, blocked_again_offset] =
-        stream.Map(blocked_size, 1, false);
+        stream.Map(blocked_size, 1, RingWait::Never);
     Require("StreamBufferRing", "transactional failure",
             blocked == nullptr && blocked_offset == 0 &&
                 blocked_again == nullptr && blocked_again_offset == 0,
@@ -3878,7 +3878,7 @@ public:
                     expected_packing_offset, expected_packing_alignment),
                 "failed to calculate non-coherent fault-ring stride");
       }
-      auto [packing_probe, packing_offset] = download.Map(1, 1, false);
+      auto [packing_probe, packing_offset] = download.Map(1, 1, RingWait::Never);
       Require(name, "adjacent download reservation stride",
               packing_probe != nullptr &&
                   packing_offset == expected_packing_offset,

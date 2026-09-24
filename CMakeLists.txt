@@ -428,6 +428,12 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(stream_buffer_wait_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/StreamBufferWaitTests.cpp"
+)
+target_link_libraries(stream_buffer_wait_tests fmt::fmt)
+target_include_directories(stream_buffer_wait_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
