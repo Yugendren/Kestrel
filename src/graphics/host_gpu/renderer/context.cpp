@@ -39,6 +39,9 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	// A freshly begun command buffer has no dynamic state recorded on it yet.
+	m_dynamic_state.Reset();
 }
 
 void CommandBuffer::End() const {

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/meshDrawArgs.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/dynamicState.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -149,13 +150,18 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const;
-	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
-	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
-	[[nodiscard]] bool             IsRendering() const noexcept { return m_rendering; }
+	[[nodiscard]] vk::CommandBuffer  Handle() const;
+	[[nodiscard]] GraphicContext&    GetGraphics() const noexcept { return m_graphics; }
+	[[nodiscard]] RenderContext&     GetContext() const noexcept { return m_context; }
+	[[nodiscard]] HW::Context&       GetRegisters() const noexcept { return *m_registers; }
+	[[nodiscard]] HW::UserConfig&    GetUserConfig() const noexcept { return *m_user_config; }
+	[[nodiscard]] HW::Shader&        GetShaders() const noexcept { return *m_shaders; }
+	[[nodiscard]] bool               IsRendering() const noexcept { return m_rendering; }
+	[[nodiscard]] DynamicStateCache& DynamicState() const noexcept { return m_dynamic_state; }
+	// Called wherever something other than SetGraphicsDynamicParams() (renderDraw.cpp) records
+	// dynamic state on this buffer -- currently blitHelper.cpp binding its own graphics pipelines
+	// -- so the cache does not think a stale value is still current.
+	void InvalidateDynamicState() const noexcept { m_dynamic_state.Reset(); }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -168,22 +174,26 @@ private:
 	void Begin();
 	void End() const;
 
-	CommandScheduler&   m_scheduler;
-	RenderContext&      m_context;
-	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer          = nullptr;
-	uint32_t            m_debug_op        = 0;
-	uint64_t            m_debug_submit_id = 0;
-	uint32_t            m_debug_arg0      = 0;
-	uint32_t            m_debug_arg1      = 0;
-	uint32_t            m_debug_arg2      = 0;
-	uint32_t            m_debug_arg3      = 0;
-	uint64_t            m_debug_arg4      = 0;
-	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	CommandScheduler&         m_scheduler;
+	RenderContext&            m_context;
+	GraphicContext&           m_graphics;
+	vk::CommandBuffer         m_buffer          = nullptr;
+	uint32_t                  m_debug_op        = 0;
+	uint64_t                  m_debug_submit_id = 0;
+	uint32_t                  m_debug_arg0      = 0;
+	uint32_t                  m_debug_arg1      = 0;
+	uint32_t                  m_debug_arg2      = 0;
+	uint32_t                  m_debug_arg3      = 0;
+	uint64_t                  m_debug_arg4      = 0;
+	mutable RenderState       m_render_state;
+	// Nothing is known about a command buffer's dynamic state until CommandBuffer::Begin() resets
+	// this (see context.cpp); blitHelper.cpp additionally invalidates it after binding its own
+	// graphics pipelines and issuing its own vkCmdSet* calls.
+	mutable DynamicStateCache m_dynamic_state;
+	mutable bool              m_rendering   = false;
+	HW::Context*              m_registers   = nullptr;
+	HW::UserConfig*           m_user_config = nullptr;
+	HW::Shader*               m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };

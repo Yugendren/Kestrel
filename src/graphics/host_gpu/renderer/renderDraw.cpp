@@ -340,6 +340,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
 	    });
 	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
+	static_assert(viewport_slots <= DynamicStateCache::MaxViewports,
+	              "DynamicStateCache stores a full viewport array per command buffer");
 	std::array<vk::Viewport, viewport_slots> viewports {};
 	std::array<vk::Rect2D, viewport_slots>   scissors {};
 	const uint32_t viewport_count = indexed_viewports ? viewport_slots : 1;
@@ -384,8 +386,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissors[i].extent  = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	buffer.DynamicState().SetViewportWithCount(vk_buffer, viewport_count, viewports.data());
+	buffer.DynamicState().SetScissorWithCount(vk_buffer, viewport_count, scissors.data());
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -398,20 +400,22 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
+	buffer.DynamicState().SetLineWidth(vk_buffer, line_width);
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	buffer.DynamicState().SetBlendConstants(vk_buffer, blend_constants.data());
+	buffer.DynamicState().SetDepthTestEnable(vk_buffer, depth.depth_test_enable ? VK_TRUE : VK_FALSE);
+	buffer.DynamicState().SetDepthWriteEnable(vk_buffer,
+	                                          depth.depth_write_enable ? VK_TRUE : VK_FALSE);
+	buffer.DynamicState().SetDepthCompareOp(vk_buffer, depth.depth_compare_op);
 #if defined(__APPLE__)
 	// MoltenVK lacks the depthBounds feature; depth-bounds testing stays disabled and the bounds
 	// themselves are never set (see the matching guard in CreatePipelineInternal).
-	vk_buffer.setDepthBoundsTestEnable(VK_FALSE);
+	buffer.DynamicState().SetDepthBoundsTestEnable(vk_buffer, VK_FALSE);
 #else
-	vk_buffer.setDepthBoundsTestEnable(depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+	buffer.DynamicState().SetDepthBoundsTestEnable(
+	    vk_buffer, depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
+	buffer.DynamicState().SetDepthBounds(vk_buffer, depth.depth_min_bounds, depth.depth_max_bounds);
 #endif
 
 	const auto& mode = ctx.GetModeControl();
@@ -428,8 +432,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	if (!rect_list && mode.cull_front) {
 		cull_mode |= vk::CullModeFlagBits::eFront;
 	}
-	vk_buffer.setCullMode(cull_mode);
-	vk_buffer.setFrontFace(mode.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
+	buffer.DynamicState().SetCullMode(vk_buffer, cull_mode);
+	buffer.DynamicState().SetFrontFace(
+	    vk_buffer, mode.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
 	if (!mesh_active) {
 		// A mesh pipeline has no input-assembly state, matching CreatePipelineInternal's !mesh
 		// guard on these two dynamic states.
@@ -441,7 +446,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	buffer.DynamicState().SetDepthBiasEnable(vk_buffer, depth_bias_enable ? VK_TRUE : VK_FALSE);
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -450,19 +455,22 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		buffer.DynamicState().SetDepthBias(vk_buffer, constant_factor, poly_offset.clamp,
+		                                   slope_factor);
 	}
 
+	auto& dynamic_state = buffer.DynamicState();
 	// Every pipeline declares the stencil op, masks and reference dynamic, and Vulkan requires
 	// each declared dynamic state to be set in the command buffer before a draw even when the
 	// stencil test is off. With the test disabled the depth info keeps value-initialised faces
 	// (KEEP ops, zero masks), which are inert.
-	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+	dynamic_state.SetStencilTestEnable(vk_buffer, depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-		vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-		vk_buffer.setStencilCompareMask(face, state.compareMask);
-		vk_buffer.setStencilWriteMask(face, state.writeMask);
-		vk_buffer.setStencilReference(face, state.reference);
+		dynamic_state.SetStencilOp(vk_buffer, face, state.failOp, state.passOp, state.depthFailOp,
+		                           state.compareOp);
+		dynamic_state.SetStencilCompareMask(vk_buffer, face, state.compareMask);
+		dynamic_state.SetStencilWriteMask(vk_buffer, face, state.writeMask);
+		dynamic_state.SetStencilReference(vk_buffer, face, state.reference);
 	};
 	set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
 	set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
@@ -471,12 +479,17 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
 #else
+	static_assert(RENDER_COLOR_ATTACHMENTS_MAX <= DynamicStateCache::MaxColorAttachments,
+	              "DynamicStateCache stores a full colour-write-enable array per command buffer");
 	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
 		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
 	}
 	if (rendering.num_color_attachments != 0) {
-		vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable);
+		buffer.DynamicState().SetColorWriteEnable(vk_buffer, rendering.num_color_attachments,
+		                                          enable);
+	} else {
+		buffer.DynamicState().ForgetColorWriteEnable();
 	}
 #endif
 }
@@ -1657,7 +1670,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering,
 	                         topology, primitive_restart_enable, mesh_active);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+		buffer.DynamicState().SetAttachmentFeedbackLoopEnable(vk_buffer, feedback_aspects);
 	}
 
 	LogDrawPhase(draw.Name(), "BeginRendering");

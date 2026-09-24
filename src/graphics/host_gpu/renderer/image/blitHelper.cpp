@@ -259,6 +259,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
+
+	// The pipeline bind above and the setViewport/setScissor calls just made bypass
+	// DynamicStateCache, so its idea of what is current on the buffer is now wrong.
+	command_buffer.InvalidateDynamicState();
 }
 
 bool BlitHelper::CanResampleDepth(const ImageInfo& info) {
@@ -387,6 +391,11 @@ void BlitHelper::ResampleDepth(Image& source, Image& destination,
 
 	destination.Transit(vk::ImageLayout::eDepthStencilReadOnlyOptimal,
 	                    vk::AccessFlagBits2::eShaderRead, destination_range, command);
+
+	// Both loops above bind graphics pipelines and issue their own setViewport/setScissor/
+	// setStencil* calls without going through DynamicStateCache, so its idea of what is current
+	// on the buffer is now wrong.
+	command_buffer.InvalidateDynamicState();
 }
 
 } // namespace Libs::Graphics
