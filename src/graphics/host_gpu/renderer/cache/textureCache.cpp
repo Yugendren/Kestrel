@@ -1909,9 +1909,41 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
+// Whether a sampled binding of `image` through `desc` would do nothing but return the view it
+// returned last time. Every side effect of the sampled path of FindTexture() is covered:
+//  - the LRU touch is a no-op while the GC tick it was made at is still the current one;
+//  - RefreshImage() and SyncScaledContents() only act on the dirty/twin/tracking state that
+//    Image::IsSampleReady() reads, so they are no-ops exactly when it holds;
+//  - a descriptor over the stencil range also refreshes the stencil association, and a scale
+//    twin pulls its owner's contents in: both depend on another image, so neither is skipped;
+//  - FindView() is a pure function of the view description for the life of the image.
+// The availability checks that would EXIT are required to pass, so a binding that has to fail
+// still reaches them.
+bool TextureCache::IsSampledViewCurrent(const Image& image, const ImageDesc& desc) const {
+	const auto& last = image.last_sampled_view;
+	if (last.view == nullptr || last.gc_tick != m_gc_tick || !(last.info == desc.view_info) ||
+	    image.ScaleTwinOwner()) {
+		return false;
+	}
+	if (image.info.data.Empty()) {
+		return true;
+	}
+	const bool samples_stencil = image.info.HasStencil() &&
+	                             desc.info.data.address >= image.info.stencil.address &&
+	                             desc.info.data.End() <= image.info.stencil.End();
+	return image.registered && !image.depth_id && !image.binding.needs_rebind &&
+	       !samples_stencil && image.IsSampleReady();
+}
+
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
+	// Draws rebind the same sampled images through the same views nearly every time, and for an
+	// image whose contents are already current the full path below only re-derives the same view.
+	if (desc.type == BindingType::Texture && IsSampledViewCurrent(image, desc)) {
+		return image.last_sampled_view.view;
+	}
+	const auto gc_tick = m_gc_tick;
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1958,7 +1990,11 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	return image.FindView(desc.view_info);
+	const auto view = image.FindView(desc.view_info);
+	if (desc.type == BindingType::Texture) {
+		image.last_sampled_view = {desc.view_info, view, gc_tick};
+	}
+	return view;
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {

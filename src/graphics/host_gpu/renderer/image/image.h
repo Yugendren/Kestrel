@@ -207,6 +207,15 @@ public:
 		m_twin_stale  = false;
 	}
 
+	// Whether a sampled binding has nothing to bring up to date: no CPU or buffer upload
+	// pending, no twin contents to pull back into the scaled half, and page tracking already
+	// covering the current range -- exactly the state in which the texture cache's
+	// RefreshImage() and SyncScaledContents() return without doing anything for this image.
+	[[nodiscard]] bool IsSampleReady() const noexcept {
+		return !m_cpu_dirty && !m_maybe_cpu_dirty && !m_buffer_modified && !m_twin_newest &&
+		       track_addr == info.data.address && track_addr_end == info.data.End();
+	}
+
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
@@ -219,6 +228,15 @@ public:
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// The view the last sampled binding of this image resolved to and the texture-cache GC tick
+	// that binding touched the LRU at; see TextureCache::FindTexture(). Views are only ever
+	// appended to `views` and live as long as the image, so the handle cannot go stale.
+	struct SampledView {
+		ImageViewInfo info;
+		vk::ImageView view    = nullptr;
+		uint64_t      gc_tick = 0;
+	};
+	SampledView      last_sampled_view;
 
 private:
 	friend struct ImageTestAccess;
