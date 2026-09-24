@@ -1,6 +1,7 @@
 file(GLOB common_src CONFIGURE_DEPENDS
 	"*.cpp"
 	"logging/*.cpp"
+	"perf/*.cpp"
 	"platform/*.cpp"
 )
 
@@ -29,6 +30,9 @@ target_link_libraries(common
 		kyty_git_version
 		spdlog::spdlog
 )
+
+# NVML is loaded at runtime (common/perf/nvmlGpuMonitor.cpp).
+target_link_libraries(common PRIVATE ${CMAKE_DL_LIBS})
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)
 set(check_headers ${CMAKE_CURRENT_SOURCE_DIR})

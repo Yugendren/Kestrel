@@ -12,7 +12,11 @@ SystemInfo GetSystemInfo() {
 	const auto* package = cpuinfo_get_package(0);
 	EXIT_IF(package == nullptr);
 
-	return {package->name};
+	SystemInfo info;
+	info.ProcessorName  = package->name;
+	info.PhysicalCores  = cpuinfo_get_cores_count();
+	info.LogicalThreads = cpuinfo_get_processors_count();
+	return info;
 }
 
 } // namespace Common

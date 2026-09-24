@@ -475,6 +475,14 @@ kyty_add_cpu_check(cpu_check_tests)
 target_compile_definitions(cpu_check_tests PRIVATE KYTY_CPU_CHECK_LEVEL=${KYTY_CPU_CHECK_LEVEL})
 target_include_directories(cpu_check_tests PRIVATE ${inc_headers})
 
+# Frame-time statistics, host CPU/memory sampling and the optional NVML monitor behind the
+# performance overlay. Not registered with ctest: the CPU check spins a thread for 600 ms.
+add_executable(perf_stats_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PerfStatsTests.cpp"
+)
+target_link_libraries(perf_stats_tests common)
+target_include_directories(perf_stats_tests PRIVATE ${inc_headers})
+
 add_executable(stream_buffer_wait_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/StreamBufferWaitTests.cpp"
 )
@@ -588,6 +596,14 @@ add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(save_data_memory_tests common fmt::fmt)
 target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
+
+# ChildProcess (spawn, stdin, log redirect, kill) plus an ffmpeg/NVENC end-to-end run that is
+# skipped when ffmpeg is not installed. Not registered with ctest: it needs a GPU encoder.
+add_executable(child_process_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ChildProcessTests.cpp"
+)
+target_link_libraries(child_process_tests common)
+target_include_directories(child_process_tests PRIVATE ${inc_headers})
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
