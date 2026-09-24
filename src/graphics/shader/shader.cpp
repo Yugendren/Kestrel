@@ -15,9 +15,11 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -380,6 +382,31 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
+// Copies a table the command processor reads to set a draw up (vertex attribute and V# tables)
+// out of guest memory. A plain dereference goes through the guest mapping, whose protection is
+// page-granular: any byte on the page that the GPU wrote, or that sits in a readback window still
+// in flight, makes the read fault, and the fault path waits for the GPU to reach the whole
+// window. These tables are CPU-written and share pages with GPU-written data, so that wait was
+// pure false sharing. Checking exactly the table bytes waits only when the GPU really wrote them,
+// and then reads the same bytes the fault path would have published.
+static void ShaderReadGuestTable(const uint32_t* table, std::span<uint32_t> dst) {
+	if (dst.empty()) {
+		return;
+	}
+	const auto address = reinterpret_cast<uint64_t>(table);
+	const auto size    = dst.size_bytes();
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, dst.data(), size)) {
+		return;
+	}
+	if (Libs::LibKernel::Memory::SyncGpuCleanBacking(address, size) &&
+	    Libs::LibKernel::Memory::TryReadBacking(address, dst.data(), size)) {
+		return;
+	}
+	// Image-owned or not backed by a guest allocation: read the mapping and let the fault
+	// handler resolve it, as before.
+	std::copy_n(table, dst.size(), dst.data());
+}
+
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        const ShaderSemantic*  input_semantics,
                                        uint32_t num_input_semantics, const uint32_t* attrib,
@@ -636,8 +663,25 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			     shader_addr);
 			return false;
 		}
+		// Only the entries the program's semantics select are read: the attribute table is
+		// indexed by semantic, the V# table by the buffer index each attribute entry names.
+		std::array<uint32_t, 256> attrib_table {};
+		uint32_t                  attrib_dwords = 0;
+		for (uint32_t i = 0; i < metadata.input_semantics_count; i++) {
+			attrib_dwords =
+			    std::max<uint32_t>(attrib_dwords, metadata.input_semantics[i].semantic + 1u);
+		}
+		ShaderReadGuestTable(attrib, std::span {attrib_table}.first(attrib_dwords));
+		std::array<uint32_t, 32u * 4u> buffer_table {};
+		uint32_t                       buffer_dwords = 0;
+		for (uint32_t i = 0; i < metadata.input_semantics_count; i++) {
+			const auto index = attrib_table[metadata.input_semantics[i].semantic] & 0x1fu;
+			buffer_dwords    = std::max<uint32_t>(buffer_dwords, (index + 1u) * 4u);
+		}
+		ShaderReadGuestTable(buffer, std::span {buffer_table}.first(buffer_dwords));
 		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
-		                           metadata.input_semantics_count, attrib, buffer);
+		                           metadata.input_semantics_count, attrib_table.data(),
+		                           buffer_table.data());
 		ShaderDetectBuffers(info);
 		if (shader_hash != 0u) {
 			GetVertexTableCache().Store(shader_hash, info);
