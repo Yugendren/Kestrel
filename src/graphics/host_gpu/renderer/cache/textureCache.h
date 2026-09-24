@@ -227,7 +227,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
-	TrackingSpinLock                                  m_lock;
+	TrackingLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;

@@ -212,7 +212,7 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
 
-  static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
+  static std::unique_lock<TrackingLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
 

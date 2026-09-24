@@ -3,12 +3,14 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <semaphore>
 #include <string>
 #include <thread>
@@ -278,6 +280,38 @@ void TestConcurrentRegionPublication() {
   Release(memory);
   Check(cpu_dirty_results.load(std::memory_order_relaxed) == 2,
         "concurrent region publication lost initial CPU ownership");
+}
+
+// More contenders than cores so acquisitions fall through the bounded spin into the kernel wait,
+// which is the path guest write faults take under load.
+void TestTrackingLockExclusion() {
+  Libs::Graphics::TrackingLock lock;
+  const uint32_t thread_count =
+      std::max(4u, 2 * std::thread::hardware_concurrency());
+  constexpr uint32_t ITERATIONS = 20000;
+  uint64_t counter = 0;
+  std::atomic_uint32_t inside{0};
+  std::atomic_bool overlap{false};
+  {
+    std::vector<std::jthread> threads;
+    threads.reserve(thread_count);
+    for (uint32_t t = 0; t < thread_count; t++) {
+      threads.emplace_back([&] {
+        for (uint32_t i = 0; i < ITERATIONS; i++) {
+          std::lock_guard guard(lock);
+          if (inside.fetch_add(1, std::memory_order_relaxed) != 0) {
+            overlap.store(true, std::memory_order_relaxed);
+          }
+          counter++;
+          inside.fetch_sub(1, std::memory_order_relaxed);
+        }
+      });
+    }
+  }
+  Check(!overlap.load(std::memory_order_relaxed),
+        "tracking lock admitted two owners");
+  Check(counter == static_cast<uint64_t>(thread_count) * ITERATIONS,
+        "tracking lock lost updates under contention");
 }
 
 void TestCpuDirtyUpload() {
@@ -989,6 +1023,7 @@ int main(int argc, char **argv) {
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
+  TestTrackingLockExclusion();
   TestCpuDirtyUpload();
   TestCpuModificationEpoch();
   TestRangeInvalidation();

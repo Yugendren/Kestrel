@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 
+#include "common/adaptiveLock.h"
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -57,20 +58,6 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 	std::fflush(stderr);
 	std::_Exit(322);
 }
-
-class SpinGuard final {
-public:
-	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			std::atomic_signal_fence(std::memory_order_seq_cst);
-		}
-	}
-	~SpinGuard() { m_lock.clear(std::memory_order_release); }
-	KYTY_CLASS_NO_COPY(SpinGuard);
-
-private:
-	std::atomic_flag& m_lock;
-};
 
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
@@ -132,7 +119,8 @@ struct PageManager::Impl {
 	static_assert(sizeof(PageState) == 1);
 
 	struct Region {
-		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
+		// Blocks rather than spins: watcher updates run from the fault handler on many threads.
+		Common::AdaptiveLock                lock;
 		std::array<PageState, REGION_PAGES> pages;
 	};
 
@@ -160,7 +148,7 @@ struct PageManager::Impl {
 
 	~Impl() {
 		for (const auto& region: region_storage) {
-			SpinGuard lock(region->lock);
+			std::lock_guard lock(region->lock);
 			for (auto& page: region->pages) {
 				if (page.write_watchers != 0 || page.access_watchers != 0) {
 					FailFast("PageManager destroyed with live page state");
@@ -200,11 +188,11 @@ struct PageManager::Impl {
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
-		SpinGuard lock(region.lock);
-		auto      perms                 = region.pages[first].Perms();
-		uint64_t  range_begin           = 0;
-		uint64_t  range_bytes           = 0;
-		uint64_t  potential_range_bytes = 0;
+		std::lock_guard lock(region.lock);
+		auto            perms                 = region.pages[first].Perms();
+		uint64_t        range_begin           = 0;
+		uint64_t        range_bytes           = 0;
+		uint64_t        potential_range_bytes = 0;
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {

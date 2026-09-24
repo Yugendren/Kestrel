@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
+#include "common/adaptiveLock.h"
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -28,18 +29,26 @@
 
 namespace Libs::Graphics {
 
-class TrackingSpinLock final {
+// Region tracking lock with owner tracking so a recursive acquisition fails loudly instead of
+// deadlocking. Guest write faults take it from the SIGSEGV handler on many threads at once, so it
+// must block rather than spin: with more faulting threads than cores, a preempted holder used to
+// leave every contender spinning for a full timeslice.
+class TrackingLock final {
 public:
+	TrackingLock()  = default;
+	~TrackingLock() = default;
+	KYTY_CLASS_NO_COPY(TrackingLock);
+
 	void lock() noexcept {
 		const auto thread = CurrentThread();
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
 		}
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
+		if (!m_lock.try_lock()) {
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			m_lock.lock();
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -48,7 +57,7 @@ public:
 			EXIT("region tracking lock released by non-owner\n");
 		}
 		m_owner.store(0, std::memory_order_relaxed);
-		m_lock.clear(std::memory_order_release);
+		m_lock.unlock();
 	}
 
 private:
@@ -66,7 +75,7 @@ private:
 #endif
 	}
 
-	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
+	Common::AdaptiveLock m_lock;
 	std::atomic_uint32_t m_owner {0};
 };
 
@@ -170,7 +179,7 @@ public:
 		}
 	}
 
-	TrackingSpinLock lock;
+	TrackingLock lock;
 
 private:
 	template <bool track, bool is_read>

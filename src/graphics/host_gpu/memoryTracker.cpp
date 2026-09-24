@@ -174,7 +174,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 		managers.push_back(manager);
 	});
 
-	std::vector<std::unique_lock<TrackingSpinLock>> locks;
+	std::vector<std::unique_lock<TrackingLock>> locks;
 	locks.reserve(managers.size());
 	for (auto* manager: managers) {
 		locks.emplace_back(manager->lock);
