@@ -43,6 +43,8 @@ public:
 	};
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
+		// A store reallocated at a dead one's address must not match mappings remembered from it.
+		BumpMapsGeneration();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		m_handle = CreateFileMappingA(
 		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
@@ -105,6 +107,7 @@ public:
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
 		m_maps.clear();
+		BumpMapsGeneration();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
 		}
@@ -117,6 +120,7 @@ public:
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
 		m_maps.clear();
+		BumpMapsGeneration();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
 		}
@@ -180,6 +184,9 @@ public:
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (data == nullptr) {
 			return false;
+		}
+		if (TryReadRecentMapping(vaddr, data, size)) {
+			return true;
 		}
 		auto* destination = static_cast<uint8_t*>(data);
 		return TryTransferBacking(
@@ -246,7 +253,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
-			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			EXIT_IF(!EmplaceMapUnlocked(MapEntry {vaddr, size, backing_offset, mode}));
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -257,7 +264,7 @@ public:
 		}
 		{
 			std::lock_guard lock(m_mutex);
-			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			EXIT_IF(!EmplaceMapUnlocked(MapEntry {vaddr, size, backing_offset, mode}));
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -347,7 +354,7 @@ public:
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-					m_maps.erase(entry);
+					EraseMapUnlocked(entry);
 #endif
 				}
 			}
@@ -369,7 +376,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
-				m_maps.emplace(old.vaddr, old);
+				(void)EmplaceMapUnlocked(old);
 				return false;
 			}
 			if (placeholder_preserved != nullptr) {
@@ -417,7 +424,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		m_maps.emplace(old.vaddr, old);
+		(void)EmplaceMapUnlocked(old);
 		return false;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
@@ -427,15 +434,14 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
-		m_maps.erase(old.vaddr);
+		EraseMapUnlocked(m_maps.find(old.vaddr));
 		if (left_size != 0) {
-			m_maps.emplace(old.vaddr,
-			               MapEntry {old.vaddr, left_size, old.backing_offset, old.mode});
+			(void)EmplaceMapUnlocked(MapEntry {old.vaddr, left_size, old.backing_offset, old.mode});
 		}
 		if (right_size != 0) {
-			m_maps.emplace(right_addr,
-			               MapEntry {right_addr, right_size,
-			                         old.backing_offset + right_addr - old.vaddr, old.mode});
+			(void)EmplaceMapUnlocked(MapEntry {right_addr, right_size,
+			                                   old.backing_offset + right_addr - old.vaddr,
+			                                   old.mode});
 		}
 
 		if (placeholder_preserved != nullptr) {
@@ -495,6 +501,9 @@ private:
 		while (current < end) {
 			MapEntry entry {};
 			EXIT_IF(!FindContainingUnlocked(current, 1, &entry));
+			if (current == vaddr && end <= entry.vaddr + entry.size) {
+				RememberMappingUnlocked(entry);
+			}
 			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
 			const auto offset = entry.backing_offset + current - entry.vaddr;
 			transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
@@ -509,6 +518,101 @@ private:
 		uint64_t            backing_offset = 0;
 		VirtualMemory::Mode mode           = VirtualMemory::Mode::NoAccess;
 	};
+
+	// The command processor reads a few small guest tables per draw, nearly always from the
+	// same handful of mappings, so each thread remembers the mappings it read last and reads
+	// through them without m_mutex or the map walk. A remembered mapping is only trusted while
+	// the maps generation it was recorded at is current; every change to m_maps moves the
+	// generation (under m_mutex), and the reader rechecks it after copying, so a copy that
+	// overlapped an unmap or remap is discarded and redone on the locked path. The generation
+	// is process-wide so remembered mappings never outlive their store. The backing alias
+	// itself stays mapped for the store's lifetime, so a discarded copy never faults.
+	static constexpr size_t RECENT_MAPPINGS = 4;
+
+	struct RecentMapping {
+		const GuestBackingStore* store      = nullptr;
+		uint64_t                 generation = 0;
+		MapEntry                 entry {};
+	};
+
+	struct RecentMappings {
+		std::array<RecentMapping, RECENT_MAPPINGS> slots {};
+		uint32_t                                   next = 0;
+	};
+
+	static RecentMappings& Recent() {
+		static thread_local RecentMappings recent;
+		return recent;
+	}
+
+	static std::atomic<uint64_t>& MapsGeneration() {
+		static std::atomic<uint64_t> generation {0};
+		return generation;
+	}
+
+	static void BumpMapsGeneration() { MapsGeneration().fetch_add(1, std::memory_order_acq_rel); }
+
+	// Every m_maps insertion and removal goes through these two, with m_mutex held.
+	bool EmplaceMapUnlocked(const MapEntry& entry) {
+		const bool inserted = m_maps.emplace(entry.vaddr, entry).second;
+		BumpMapsGeneration();
+		return inserted;
+	}
+
+	void EraseMapUnlocked(std::map<uint64_t, MapEntry>::iterator entry) {
+		if (entry != m_maps.end()) {
+			m_maps.erase(entry);
+		}
+		BumpMapsGeneration();
+	}
+
+	// Caller holds m_mutex, so the generation read here is the one this entry belongs to.
+	void RememberMappingUnlocked(const MapEntry& entry) {
+		if (!RangeOk(entry.backing_offset, entry.size)) {
+			return;
+		}
+		const auto generation = MapsGeneration().load(std::memory_order_relaxed);
+		auto&      recent     = Recent();
+		for (auto& slot: recent.slots) {
+			if (slot.store == this && slot.entry.vaddr == entry.vaddr) {
+				slot = {this, generation, entry};
+				return;
+			}
+		}
+		recent.slots[recent.next] = {this, generation, entry};
+		recent.next               = (recent.next + 1) % RECENT_MAPPINGS;
+	}
+
+	// Stages through a small local copy: a read that fails, here or on the locked path after a
+	// discarded copy, must leave the destination untouched. The command processor's tables are
+	// small; larger reads take the locked path.
+	static constexpr uint64_t RECENT_MAPPING_MAX_READ = 256;
+
+	bool TryReadRecentMapping(uint64_t vaddr, void* data, uint64_t size) const {
+		if (size == 0 || size > RECENT_MAPPING_MAX_READ || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		const auto generation = MapsGeneration().load(std::memory_order_acquire);
+		for (const auto& slot: Recent().slots) {
+			const auto& entry = slot.entry;
+			if (slot.store != this || slot.generation != generation || vaddr < entry.vaddr ||
+			    vaddr + size > entry.vaddr + entry.size) {
+				continue;
+			}
+			std::array<uint8_t, RECENT_MAPPING_MAX_READ> staged;
+			std::memcpy(staged.data(),
+			            m_backing_base + entry.backing_offset + (vaddr - entry.vaddr), size);
+			// Order the copy before the recheck: a remap that the copy may have observed has
+			// moved the generation by then.
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (MapsGeneration().load(std::memory_order_relaxed) != generation) {
+				return false;
+			}
+			std::memcpy(data, staged.data(), size);
+			return true;
+		}
+		return false;
+	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
 		EXIT_IF(out == nullptr);

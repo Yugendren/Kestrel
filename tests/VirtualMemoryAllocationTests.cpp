@@ -1119,6 +1119,126 @@ void TestFixedNoOverwriteRejectsReservedRange() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// TryReadBacking remembers the mappings it read through; a remap of the same guest address to
+// other physical memory must not be served from the remembered one.
+void TestBackingReadFollowsRemap() {
+	const char* test = "BackingReadFollowsRemap";
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            SceKernelPageSize * 2, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* addr = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &addr, SceKernelPageSize, SceKernelProtCpuRw, 0, phys_addr, SceKernelPageSize,
+	            "remap_first"),
+	        "KernelMapNamedDirectMemory(first)");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+
+	constexpr uint64_t first_value      = 0x4649525354504859ull; // "FIRSTPHY"
+	constexpr uint64_t second_value     = 0x5345434f4e445048ull; // "SECONDPH"
+	*reinterpret_cast<uint64_t*>(base) = first_value;
+	uint64_t value                      = 0;
+	for (int read = 0; read < 2; read++) {
+		Check(test, Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value)),
+		      "TryReadBacking did not resolve the first mapping");
+		Check(test, value == first_value, "TryReadBacking missed the first mapping's bytes");
+	}
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(first)");
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value)),
+	      "TryReadBacking resolved an unmapped address");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &addr, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed,
+	            phys_addr + static_cast<int64_t>(SceKernelPageSize), SceKernelPageSize,
+	            "remap_second"),
+	        "KernelMapNamedDirectMemory(second)");
+	Check(test, reinterpret_cast<uint64_t>(addr) == base, "fixed remap moved");
+	*reinterpret_cast<uint64_t*>(base) = second_value;
+	Check(test, Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value)),
+	      "TryReadBacking did not resolve the second mapping");
+	Check(test, value == second_value, "TryReadBacking read through a stale mapping");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(second)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr,
+	                                                                  SceKernelPageSize * 2),
+	        "KernelCheckedReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// Same, for a partial munmap: the surviving pieces of a remembered mapping are re-registered, and
+// the unmapped middle must stop resolving and then follow the physical memory mapped over it.
+void TestBackingReadFollowsPartialUnmap() {
+	const char* test = "BackingReadFollowsPartialUnmap";
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            SceKernelPageSize * 4, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* addr = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &addr, SceKernelPageSize * 3, SceKernelProtCpuRw, 0, phys_addr,
+	            SceKernelPageSize, "partial_first"),
+	        "KernelMapNamedDirectMemory(first)");
+	const auto base   = reinterpret_cast<uint64_t>(addr);
+	const auto middle = base + SceKernelPageSize;
+
+	constexpr uint64_t left_value   = 0x4c45465450485953ull; // "LEFTPHYS"
+	constexpr uint64_t first_value  = 0x4649525354504859ull; // "FIRSTPHY"
+	constexpr uint64_t second_value = 0x5345434f4e445048ull; // "SECONDPH"
+	*reinterpret_cast<uint64_t*>(base)   = left_value;
+	*reinterpret_cast<uint64_t*>(middle) = first_value;
+	uint64_t value                       = 0;
+	for (int read = 0; read < 2; read++) {
+		Check(test, Libs::LibKernel::Memory::TryReadBacking(middle, &value, sizeof(value)),
+		      "TryReadBacking did not resolve the first mapping");
+		Check(test, value == first_value, "TryReadBacking missed the first mapping's bytes");
+	}
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(middle, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(middle, &value, sizeof(value)),
+	      "TryReadBacking resolved a partially unmapped address");
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadBacking(base, &value, sizeof(value)) &&
+	          value == left_value,
+	      "TryReadBacking lost the surviving left piece");
+
+	addr = reinterpret_cast<void*>(middle);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &addr, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed,
+	            phys_addr + static_cast<int64_t>(SceKernelPageSize * 3), SceKernelPageSize,
+	            "partial_second"),
+	        "KernelMapNamedDirectMemory(second)");
+	Check(test, reinterpret_cast<uint64_t>(addr) == middle, "fixed remap moved");
+	*reinterpret_cast<uint64_t*>(middle) = second_value;
+	Check(test, Libs::LibKernel::Memory::TryReadBacking(middle, &value, sizeof(value)),
+	      "TryReadBacking did not resolve the second mapping");
+	Check(test, value == second_value, "TryReadBacking read through a stale mapping");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 3),
+	        "KernelMunmap(all)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr,
+	                                                                  SceKernelPageSize * 4),
+	        "KernelCheckedReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestDirectMapQueryOffsetAndPartialMunmap() {
 	const char* test = "DirectMapQueryOffsetAndPartialMunmap";
 
@@ -3207,6 +3327,8 @@ int main(int argc, char** argv) {
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
 	RunTest(TestClampRangeSizeFollowsMapChanges);
+	RunTest(TestBackingReadFollowsRemap);
+	RunTest(TestBackingReadFollowsPartialUnmap);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
