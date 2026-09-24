@@ -189,6 +189,10 @@ uint32_t GetFpsLogSeconds() {
 	return g_config->fps_log_seconds;
 }
 
+std::filesystem::path GetFrameTimeLogFile() {
+	return g_config->frame_time_log_file;
+}
+
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }

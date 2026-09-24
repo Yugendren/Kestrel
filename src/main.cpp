@@ -134,6 +134,8 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --fps-log <seconds>                  Log fps/frame/time counters every N seconds.\n"
 	         "                                       Default: 0 (disabled).\n");
+	::printf("  --frame-time-log <path>              Append one line per presented frame:\n"
+	         "                                       frame index, monotonic time in us.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
@@ -586,6 +588,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			const int32_t fps_log_seconds = Common::ToInt32(value);
 			options.config.fps_log_seconds =
 			    static_cast<uint32_t>(fps_log_seconds < 0 ? 0 : fps_log_seconds);
+		} else if (arg == "--frame-time-log") {
+			options.config.frame_time_log_file = value;
 		} else if (arg == "--spirv-debug-printf") {
 			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

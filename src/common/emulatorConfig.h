@@ -121,6 +121,10 @@ struct ConfigOptions {
 	// counters as the window title. Lets a run be measured from the log when the window
 	// title is not reachable, e.g. over SSH on Windows. 0 disables it.
 	uint32_t               fps_log_seconds             = 0;
+	// When non-empty, one "<frame> <monotonic_us>" line per presented frame is appended here
+	// (see FrameTimeLog), for frame-time percentiles and lows that the per-second fps log
+	// cannot give. Empty disables it.
+	std::filesystem::path  frame_time_log_file;
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
@@ -192,6 +196,7 @@ inline bool GraphicsDebugDumpEnabled() {
 inline LogDirection   GetPrintfDirection() { return Detail::g_hot_values.printf_direction; }
 std::filesystem::path GetPrintfOutputFile();
 uint32_t              GetFpsLogSeconds();
+std::filesystem::path GetFrameTimeLogFile();
 
 bool ProfilerEnabled();
 

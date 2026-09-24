@@ -11,6 +11,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window/frameTimeLog.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
@@ -319,6 +320,9 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		if (const auto path = Config::GetFrameTimeLogFile(); !path.empty()) {
+			frame_time_log = FrameTimeLog::Open(path);
+		}
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -355,6 +359,8 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	// Null unless --frame-time-log is set.
+	std::unique_ptr<FrameTimeLog> frame_time_log;
 };
 
 void Swapchain::Create() {
@@ -813,6 +819,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
+		if (m_impl->frame_time_log != nullptr) {
+			m_impl->frame_time_log->Record();
+		}
 		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
 		return;
