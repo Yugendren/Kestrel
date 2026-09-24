@@ -369,13 +369,18 @@ void BufferCache::RetireCompletedDownloads() {
 	m_pending_downloads.erase(retired, m_pending_downloads.end());
 }
 
-void BufferCache::ResolvePendingDownloads(uint64_t vaddr, uint64_t size) {
+uint64_t BufferCache::PendingDownloadTick(uint64_t vaddr, uint64_t size) const {
 	uint64_t wait_tick = 0;
 	for (const auto& pending: m_pending_downloads) {
 		if (pending.begin < vaddr + size && vaddr < pending.end) {
 			wait_tick = std::max(wait_tick, pending.tick);
 		}
 	}
+	return wait_tick;
+}
+
+void BufferCache::ResolvePendingDownloads(uint64_t vaddr, uint64_t size) {
+	const auto wait_tick = PendingDownloadTick(vaddr, size);
 	if (wait_tick != 0) {
 		// An older submission, not everything recorded since: this is the whole point of copying
 		// the range back before the guest asked for it.
@@ -428,6 +433,20 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
+	}
+	if (!GuestGpu::IsGpuThread()) {
+		// A guest thread reading memory the GPU is still producing has to wait for the GPU, but
+		// the command processor does not: running that wait inside the synchronous command
+		// stalls every draw behind the guest's read. Wait here for the download already in
+		// flight, so the command below finds it complete. Anything the GPU wrote after the
+		// lookup is still handled there, as before.
+		uint64_t wait_tick = 0;
+		m_scheduler.Context().GetGpu().SendCommandSync(
+		    [this, vaddr, size, &wait_tick] { wait_tick = PendingDownloadTick(vaddr, size); });
+		if (wait_tick != 0) {
+			m_scheduler.GetMasterSemaphore().Wait(wait_tick);
+			m_scheduler.WaitPriorityOperations(wait_tick);
+		}
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		ResolvePendingDownloads(vaddr, size);

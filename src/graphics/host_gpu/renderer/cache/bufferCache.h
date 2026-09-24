@@ -171,6 +171,8 @@ private:
 	// Waits for the submission that already carries this range, which is normally long finished,
 	// and publishes every download that has completed since.
 	void ResolvePendingDownloads(uint64_t vaddr, uint64_t size);
+	// The newest submission carrying an in-flight download of this range, 0 if none.
+	[[nodiscard]] uint64_t PendingDownloadTick(uint64_t vaddr, uint64_t size) const;
 	void RetireCompletedDownloads();
 	// Settles the oldest downloads when too many are outstanding. Never waits for the newest
 	// submission: that is the one the command processor has just recorded.
