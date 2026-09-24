@@ -542,6 +542,12 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(slot_vector_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
+)
+target_link_libraries(slot_vector_tests common fmt::fmt)
+target_include_directories(slot_vector_tests PRIVATE ${inc_headers})
+
 # Header-only: GenerationMemo (renderTarget.h) and the HW register equality operators
 # (hardwareContext.h) pull in nothing beyond common, fmt and the Vulkan headers vulkanCommon.h
 # declares against, so this links like image_page_table_tests rather than the full emulator.

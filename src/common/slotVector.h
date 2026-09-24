@@ -5,11 +5,12 @@
 #include "common/abi.h"
 
 #include <compare>
+#include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <limits>
-#include <optional>
+#include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -31,93 +32,130 @@ struct SlotId {
 };
 
 // Stable-address slot storage for cache resources that are intentionally non-movable.
+//
+// Layout: values live in fixed-size chunks that are never moved or freed until the vector is
+// destroyed, so a reference obtained from operator[] stays valid across insert() (callers hold
+// `auto& x = slots[id]` while inserting). The per-slot generation/liveness words live in a
+// separate dense array. The validity check in operator[]/try_get/is_allocated therefore reads a
+// small hot array instead of the tail of a large T (for Image the generation used to sit ~800
+// bytes into the slot, a cache line the caller never touches otherwise, so every lookup paid an
+// extra miss), and indexing is shift/mask plus two loads instead of std::deque's
+// iterator arithmetic.
 template <typename T>
 class SlotVector {
 public:
 	SlotVector() = default;
+	~SlotVector() {
+		for (uint32_t index = 0; index < m_meta.size(); ++index) {
+			if (m_meta[index].alive) {
+				std::destroy_at(Value(index));
+			}
+		}
+	}
 	KYTY_CLASS_NO_COPY(SlotVector);
 
 	[[nodiscard]] T& operator[](SlotId id) noexcept {
 		EXIT_IF(!is_allocated(id));
-		return *m_values[id.index].value;
+		return *Value(id.index);
 	}
 
 	[[nodiscard]] const T& operator[](SlotId id) const noexcept {
 		EXIT_IF(!is_allocated(id));
-		return *m_values[id.index].value;
+		return *Value(id.index);
 	}
 
-	[[nodiscard]] T* try_get(SlotId id) noexcept {
-		return is_allocated(id) ? &*m_values[id.index].value : nullptr;
-	}
+	[[nodiscard]] T* try_get(SlotId id) noexcept { return is_allocated(id) ? Value(id.index) : nullptr; }
 
 	[[nodiscard]] const T* try_get(SlotId id) const noexcept {
-		return is_allocated(id) ? &*m_values[id.index].value : nullptr;
+		return is_allocated(id) ? Value(id.index) : nullptr;
 	}
 
 	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
-		return id && id.index < m_values.size() &&
-		       m_values[id.index].generation == id.generation && m_values[id.index].value.has_value();
+		if (!id || id.index >= m_meta.size()) {
+			return false;
+		}
+		const auto& meta = m_meta[id.index];
+		return meta.alive && meta.generation == id.generation;
 	}
 
 	template <typename... Args>
 	[[nodiscard]] SlotId insert(Args&&... args) {
 		uint32_t index = 0;
 		if (m_free_list.empty()) {
-			index = static_cast<uint32_t>(m_values.size());
-			m_values.emplace_back();
-			m_values.back().value.emplace(std::forward<Args>(args)...);
+			index = static_cast<uint32_t>(m_meta.size());
+			if ((index >> CHUNK_SHIFT) == m_chunks.size()) {
+				// Raw storage, not value-initialised: no zero-fill of the whole chunk.
+				m_chunks.push_back(std::make_unique_for_overwrite<Storage[]>(CHUNK_SIZE));
+			}
+			// The slot is published (not alive) before T is constructed, so a constructor that
+			// re-enters insert() gets a different index.
+			m_meta.emplace_back();
 		} else {
 			index = m_free_list.back();
 			m_free_list.pop_back();
-			EXIT_IF(m_values[index].value.has_value());
-			m_values[index].value.emplace(std::forward<Args>(args)...);
+			EXIT_IF(m_meta[index].alive);
 		}
+		std::construct_at(Value(index), std::forward<Args>(args)...);
+		m_meta[index].alive = true;
 		++m_size;
-		return SlotId {index, m_values[index].generation};
+		return SlotId {index, m_meta[index].generation};
 	}
 
 	void erase(SlotId id) noexcept {
 		EXIT_IF(!is_allocated(id));
-		auto& slot = m_values[id.index];
-		slot.value.reset();
-		if (++slot.generation == 0) {
-			slot.generation = 1;
+		std::destroy_at(Value(id.index));
+		auto& meta = m_meta[id.index];
+		meta.alive = false;
+		if (++meta.generation == 0) {
+			meta.generation = 1;
 		}
 		m_free_list.push_back(id.index);
 		--m_size;
 	}
 
 	[[nodiscard]] size_t size() const noexcept { return m_size; }
-	[[nodiscard]] size_t capacity() const noexcept { return m_values.size(); }
+	[[nodiscard]] size_t capacity() const noexcept { return m_meta.size(); }
 
 	template <typename F>
 	void ForEach(F&& fn) {
-		for (uint32_t index = 0; index < m_values.size(); ++index) {
-			if (m_values[index].value) {
-				fn(SlotId {index, m_values[index].generation}, *m_values[index].value);
+		for (uint32_t index = 0; index < m_meta.size(); ++index) {
+			if (m_meta[index].alive) {
+				fn(SlotId {index, m_meta[index].generation}, *Value(index));
 			}
 		}
 	}
 
 	template <typename F>
 	void ForEach(F&& fn) const {
-		for (uint32_t index = 0; index < m_values.size(); ++index) {
-			if (m_values[index].value) {
-				fn(SlotId {index, m_values[index].generation}, *m_values[index].value);
+		for (uint32_t index = 0; index < m_meta.size(); ++index) {
+			if (m_meta[index].alive) {
+				fn(SlotId {index, m_meta[index].generation}, *Value(index));
 			}
 		}
 	}
 
 private:
-	struct Slot {
-		std::optional<T> value;
-		uint32_t         generation = 1;
+	static constexpr uint32_t CHUNK_SHIFT = 6;
+	static constexpr uint32_t CHUNK_SIZE  = 1u << CHUNK_SHIFT;
+	static constexpr uint32_t CHUNK_MASK  = CHUNK_SIZE - 1;
+
+	struct alignas(T) Storage {
+		std::byte bytes[sizeof(T)];
 	};
 
-	std::deque<Slot>             m_values;
-	std::vector<uint32_t>        m_free_list;
-	size_t                       m_size = 0;
+	struct SlotMeta {
+		uint32_t generation = 1;
+		bool     alive      = false;
+	};
+
+	[[nodiscard]] T* Value(uint32_t index) const noexcept {
+		return std::launder(reinterpret_cast<T*>(m_chunks[index >> CHUNK_SHIFT][index & CHUNK_MASK].bytes));
+	}
+
+	std::vector<std::unique_ptr<Storage[]>> m_chunks;
+	std::vector<SlotMeta>                   m_meta;
+	std::vector<uint32_t>                   m_free_list;
+	size_t                                  m_size = 0;
 };
 
 } // namespace Common
