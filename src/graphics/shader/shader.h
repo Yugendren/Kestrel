@@ -299,6 +299,9 @@ struct ShaderMappedData {
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
 	uint32_t        scratch_size_dwords = 0;
+	// The program hash (the binary's declared hash, else XXH3 of the code), computed on the first
+	// lookup of this registration and kept until the address is registered again; 0 until then.
+	uint64_t        code_hash           = 0;
 };
 
 void ShaderInit();
