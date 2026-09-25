@@ -557,6 +557,14 @@ add_executable(dynamic_state_cache_tests EXCLUDE_FROM_ALL
 target_link_libraries(dynamic_state_cache_tests common fmt::fmt)
 target_include_directories(dynamic_state_cache_tests PRIVATE ${inc_headers})
 
+# Header-only: the program memo keys and the vertex input layout comparison
+# (shaderProgramMemo.h) need nothing beyond common, fmt and the Vulkan headers.
+add_executable(program_memo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramMemoTests.cpp"
+)
+target_link_libraries(program_memo_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(program_memo_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")

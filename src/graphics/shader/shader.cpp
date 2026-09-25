@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderProgramMemo.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -65,6 +66,9 @@ struct ShaderBinaryInfo {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+// Serial of the latest registration. Program memos compare it against the value they last
+// checked and look their shader up again only when it moved (ShaderRegistrationStamp).
+static std::atomic<uint64_t>                                           g_shader_map_generation {0};
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -77,7 +81,25 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 
 	std::scoped_lock lock(g_shader_map_mutex);
 
-	(*g_shader_map)[addr] = data;
+	auto& entry        = (*g_shader_map)[addr];
+	entry              = data;
+	entry.code_hash    = 0;
+	entry.registration = g_shader_map_generation.load(std::memory_order_relaxed) + 1;
+	g_shader_map_generation.store(entry.registration, std::memory_order_release);
+}
+
+static uint64_t ShaderRegistryGeneration() {
+	return g_shader_map_generation.load(std::memory_order_acquire);
+}
+
+// The registration currently mapped at `addr`, 0 if none.
+static uint64_t ShaderRegistrationAt(uint64_t addr) {
+	EXIT_IF(g_shader_map == nullptr);
+
+	std::scoped_lock lock(g_shader_map_mutex);
+
+	const auto iter = g_shader_map->find(addr);
+	return iter != g_shader_map->end() ? iter->second.registration : 0;
 }
 
 static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
@@ -129,6 +151,16 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
 }
 
+// Places a stage's user-data SGPRs after `user_data_base` reserved dwords (merged stages start
+// their user SGPRs at s8).
+static void ShaderSetUserData(ShaderParams& params, std::span<const uint32_t> user_data,
+                              uint32_t user_data_base) {
+	params.user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base;
+	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
+	        params.user_data_count > params.user_data.size());
+	std::copy(user_data.begin(), user_data.end(), params.user_data.begin() + user_data_base);
+}
+
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label,
 	                                std::span<const uint32_t> user_data,
 	                                const ShaderMappedData& data, uint32_t user_data_base = 0) {
@@ -140,13 +172,10 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label,
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
 	ShaderParams params {
-	    .code            = code,
-	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
-	    .hash            = data.code_hash,
+	    .code = code,
+	    .hash = data.code_hash,
 	};
-	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
-	        params.user_data_count > params.user_data.size());
-	std::copy(user_data.begin(), user_data.end(), params.user_data.begin() + user_data_base);
+	ShaderSetUserData(params, user_data, user_data_base);
 	return params;
 }
 
@@ -633,12 +662,89 @@ void ShaderVertexTablesDrifted() {
 	GetVertexTableCache().Clear();
 }
 
+// Per registration: the vertex-input metadata AGC attaches to a vertex program.
+static bool ShaderReadVertexProgramMetadata(uint64_t shader_addr, uint32_t user_sgpr_num,
+                                            const ShaderMappedData& data,
+                                            ShaderVertexMetadata&   metadata) {
+	if (data.user_data == nullptr) {
+		LOGF("ShaderGetVertexInputInfo(): no AGC user data for shader=0x%016" PRIx64
+		     " user_sgpr_num=%u\n",
+		     shader_addr, user_sgpr_num);
+	}
+	std::string metadata_error;
+	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
+		LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
+		     shader_addr, metadata_error.c_str());
+		return false;
+	}
+	return true;
+}
+
+// Per draw: decodes the vertex attribute and V# tables the user-data SGPRs point at into the
+// fetched attributes and their buffers. The tables and the buffers they name change between
+// draws of one program, so this never comes from a memo.
 // gpu_fetch_hash identifies a vertex program compiled for --vertex-fetch gpu, whose decoded
 // table layout is cached per program; 0 decodes the tables on every call.
+static bool ShaderFetchVertexInputs(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
+                                    const ShaderVertexMetadata& metadata, uint64_t gpu_fetch_hash,
+                                    ShaderVertexInputInfo& info) {
+	KYTY_PROFILER_FUNCTION();
+
+	if (metadata.vertex_attrib_reg < 0) {
+		return true;
+	}
+	info.fetch_external   = false;
+	info.fetch_embedded   = true;
+	info.fetch_attrib_reg = metadata.vertex_attrib_reg;
+	info.fetch_buffer_reg = metadata.vertex_buffer_reg;
+
+	const auto shader_hash = gpu_fetch_hash;
+	if (shader_hash != 0u && GetVertexTableCache().Restore(shader_hash, info)) {
+		return true;
+	}
+	const auto* attrib = reinterpret_cast<const uint32_t*>(
+	    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
+	    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
+	const auto* buffer = reinterpret_cast<const uint32_t*>(
+	    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
+	    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
+
+	if (attrib == nullptr || buffer == nullptr) {
+		LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
+		     shader_addr);
+		return false;
+	}
+	// Only the entries the program's semantics select are read: the attribute table is
+	// indexed by semantic, the V# table by the buffer index each attribute entry names.
+	std::array<uint32_t, 256> attrib_table {};
+	uint32_t                  attrib_dwords = 0;
+	for (uint32_t i = 0; i < metadata.input_semantics_count; i++) {
+		attrib_dwords =
+		    std::max<uint32_t>(attrib_dwords, metadata.input_semantics[i].semantic + 1u);
+	}
+	ShaderReadGuestTable(attrib, std::span {attrib_table}.first(attrib_dwords));
+	std::array<uint32_t, 32u * 4u> buffer_table {};
+	uint32_t                       buffer_dwords = 0;
+	for (uint32_t i = 0; i < metadata.input_semantics_count; i++) {
+		const auto index = attrib_table[metadata.input_semantics[i].semantic] & 0x1fu;
+		buffer_dwords    = std::max<uint32_t>(buffer_dwords, (index + 1u) * 4u);
+	}
+	ShaderReadGuestTable(buffer, std::span {buffer_table}.first(buffer_dwords));
+	ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
+	                           metadata.input_semantics_count, attrib_table.data(),
+	                           buffer_table.data());
+	ShaderDetectBuffers(info);
+	if (shader_hash != 0u) {
+		GetVertexTableCache().Store(shader_hash, info);
+	}
+	return true;
+}
+
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
                                            uint32_t user_sgpr_num, const HW::ShaderRegisters& sh,
                                            const ShaderMappedData& data, uint64_t gpu_fetch_hash,
-                                           ShaderVertexInputInfo&  info) {
+                                           ShaderVertexInputInfo&  info,
+                                           ShaderVertexMetadata&   metadata) {
 	KYTY_PROFILER_FUNCTION();
 
 	info = {};
@@ -648,66 +754,8 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	EXIT_NOT_IMPLEMENTED(shader_addr == 0);
 	info.scratch_size_dwords = data.scratch_size_dwords;
 
-	if (data.user_data == nullptr) {
-		LOGF("ShaderGetVertexInputInfo(): no AGC user data for shader=0x%016" PRIx64
-		     " user_sgpr_num=%u\n",
-		     shader_addr, user_sgpr_num);
-	}
-	ShaderVertexMetadata metadata;
-	std::string          metadata_error;
-	if (!ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, metadata, &metadata_error)) {
-		LOGF("ShaderGetVertexInputInfo(): invalid AGC metadata shader=0x%016" PRIx64 ": %s\n",
-		     shader_addr, metadata_error.c_str());
-		return false;
-	}
-
-	if (metadata.vertex_attrib_reg >= 0) {
-		info.fetch_external   = false;
-		info.fetch_embedded   = true;
-		info.fetch_attrib_reg = metadata.vertex_attrib_reg;
-		info.fetch_buffer_reg = metadata.vertex_buffer_reg;
-
-		const auto shader_hash = gpu_fetch_hash;
-		if (shader_hash != 0u && GetVertexTableCache().Restore(shader_hash, info)) {
-			return true;
-		}
-		const auto* attrib = reinterpret_cast<const uint32_t*>(
-		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_attrib_reg + 1]) << 32u));
-		const auto* buffer = reinterpret_cast<const uint32_t*>(
-		    static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg]) |
-		    (static_cast<uint64_t>(user_sgpr.value[metadata.vertex_buffer_reg + 1]) << 32u));
-
-		if (attrib == nullptr || buffer == nullptr) {
-			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
-			     shader_addr);
-			return false;
-		}
-		// Only the entries the program's semantics select are read: the attribute table is
-		// indexed by semantic, the V# table by the buffer index each attribute entry names.
-		std::array<uint32_t, 256> attrib_table {};
-		uint32_t                  attrib_dwords = 0;
-		for (uint32_t i = 0; i < metadata.input_semantics_count; i++) {
-			attrib_dwords =
-			    std::max<uint32_t>(attrib_dwords, metadata.input_semantics[i].semantic + 1u);
-		}
-		ShaderReadGuestTable(attrib, std::span {attrib_table}.first(attrib_dwords));
-		std::array<uint32_t, 32u * 4u> buffer_table {};
-		uint32_t                       buffer_dwords = 0;
-		for (uint32_t i = 0; i < metadata.input_semantics_count; i++) {
-			const auto index = attrib_table[metadata.input_semantics[i].semantic] & 0x1fu;
-			buffer_dwords    = std::max<uint32_t>(buffer_dwords, (index + 1u) * 4u);
-		}
-		ShaderReadGuestTable(buffer, std::span {buffer_table}.first(buffer_dwords));
-		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
-		                           metadata.input_semantics_count, attrib_table.data(),
-		                           buffer_table.data());
-		ShaderDetectBuffers(info);
-		if (shader_hash != 0u) {
-			GetVertexTableCache().Store(shader_hash, info);
-		}
-	}
-	return true;
+	return ShaderReadVertexProgramMetadata(shader_addr, user_sgpr_num, data, metadata) &&
+	       ShaderFetchVertexInputs(shader_addr, user_sgpr, metadata, gpu_fetch_hash, info);
 }
 
 static void ShaderGetStaticInputInfoPS(
@@ -900,8 +948,29 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
 }
 
-ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                            const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
+namespace {
+
+// What preparing a vertex program read from the shader registry, remembered by
+// VertexProgramMemo.
+struct VertexProgramSource {
+	uint64_t             front_registration = 0;
+	uint64_t             back_registration  = 0;
+	ShaderVertexMetadata metadata;
+};
+
+} // namespace
+
+// NGG user SGPRs start at s8; a separately compiled GS back half also receives its user-data
+// pointer in s0:s1.
+static void ShaderSetNggBackUserData(const HW::VertexShaderInfo& regs, ShaderParams& params) {
+	params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
+	params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
+}
+
+static ShaderParams PrepareVertexProgram(const HW::VertexShaderInfo& regs,
+                                         const HW::Context&          context,
+                                         const HW::UserConfig&       user_config,
+                                         ShaderVertexInputInfo& info, VertexProgramSource& source) {
 	const auto& sh     = context.GetShaderRegisters();
 	const auto data = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
@@ -909,17 +978,17 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    regs.es_regs.data_addr, "ShaderRecompiler VS",
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
 	    merged ? 8u : 0u);
+	source.front_registration = data.registration;
 	if (!merged) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data,
-		                                    ShaderGpuVertexFetchEnabled() ? params.hash : 0u, info)) {
+		                                    ShaderGpuVertexFetchEnabled() ? params.hash : 0u, info,
+		                                    source.metadata)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		return params;
 	}
-	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
-	// its user-data pointer in s0:s1.
 	info                     = {};
 	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
@@ -935,9 +1004,9 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		const auto back = ShaderGetMappedData(regs.gs_regs.data_addr, "ShaderGetInputInfoGS():");
 		const auto back_params =
 		    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS", {}, back);
-		params.back_code = back_params.code;
-		params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
-		params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
+		params.back_code         = back_params.code;
+		source.back_registration = back.registration;
+		ShaderSetNggBackUserData(regs, params);
 		const uint64_t hashes[] = {params.hash, back_params.hash};
 		params.hash = XXH3_64bits(hashes, sizeof(hashes));
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
@@ -969,6 +1038,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
+ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                            const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
+	VertexProgramSource source;
+	return PrepareVertexProgram(regs, context, user_config, info, source);
+}
+
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info) {
@@ -997,8 +1072,10 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
 	input_info = {};
+	ShaderVertexMetadata local_metadata;
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
-	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, 0u, input_info[0])) {
+	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, 0u, input_info[0],
+	                                    local_metadata)) {
 		EXIT("failed to prepare local shader program\n");
 	}
 	input_info[0].logical_stage       = ShaderType::Local;
@@ -1024,15 +1101,121 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
-ShaderParams PrepareProgram(
+static ShaderParams PreparePixelProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo&                               ps_info) {
+    ShaderPixelInputInfo& ps_info, uint64_t& registration) {
 	const auto data = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
+	registration    = data.registration;
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, "ShaderRecompiler PS",
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
+}
+
+ShaderParams PrepareProgram(
+    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    ShaderPixelInputInfo&                               ps_info) {
+	uint64_t registration = 0;
+	return PreparePixelProgram(regs, sh, target_export_mapping, ps_info, registration);
+}
+
+VertexProgramMemo::VertexProgramMemo(): m_info(std::make_unique<ShaderVertexInputInfo>()) {}
+
+VertexProgramMemo::~VertexProgramMemo() = default;
+
+ShaderParams VertexProgramMemo::Prepare(const HW::VertexShaderInfo& regs,
+                                        const HW::Context&          context,
+                                        const HW::UserConfig&       user_config,
+                                        ShaderVertexInputInfo& info, bool& same_program) {
+	BuildVertexProgramKey(regs, context, user_config, m_scratch_key);
+	// Read before any registry lookup: a registration racing with this call then moves the
+	// generation past the recorded one and the next call looks the shader up again.
+	const auto generation = ShaderRegistryGeneration();
+	const bool ngg        = (context.GetShaderStages() & 0x20u) != 0;
+	const bool hit =
+	    m_valid && m_scratch_key == m_key &&
+	    m_front.Matches(regs.es_regs.data_addr, generation, ShaderRegistrationAt) &&
+	    (m_back_code.empty() ||
+	     m_back.Matches(regs.gs_regs.data_addr, generation, ShaderRegistrationAt));
+	if (!hit) {
+		VertexProgramSource source;
+		auto params = PrepareVertexProgram(regs, context, user_config, info, source);
+		m_key = m_scratch_key;
+		m_front.Record(regs.es_regs.data_addr, source.front_registration, generation);
+		if (params.back_code.empty()) {
+			m_back.Clear();
+		} else {
+			m_back.Record(regs.gs_regs.data_addr, source.back_registration, generation);
+		}
+		m_code      = params.code;
+		m_back_code = params.back_code;
+		m_hash      = params.hash;
+		m_metadata  = source.metadata;
+		CopyPreparedVertexState(info, *m_info);
+		CopyVertexInputLayout(info, *m_info);
+		m_valid      = true;
+		same_program = false;
+		return params;
+	}
+
+	ShaderParams params;
+	params.code      = m_code;
+	params.back_code = m_back_code;
+	params.hash      = m_hash;
+	ShaderSetUserData(
+	    params, std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr),
+	    ngg ? 8u : 0u);
+	info = {};
+	CopyPreparedVertexState(*m_info, info);
+	if (ngg) {
+		if (!m_back_code.empty()) {
+			ShaderSetNggBackUserData(regs, params);
+		}
+		same_program = true;
+		return params;
+	}
+	if (!ShaderFetchVertexInputs(regs.es_regs.data_addr, regs.gs_user_sgpr, m_metadata,
+	                             ShaderGpuVertexFetchEnabled() ? m_hash : 0u, info)) {
+		EXIT("failed to prepare vertex shader program\n");
+	}
+	// The registers matched; the program is the same unless this draw's tables describe a
+	// different attribute layout (addresses and record counts may differ freely).
+	same_program = VertexInputLayoutEqual(info, *m_info);
+	if (!same_program) {
+		CopyVertexInputLayout(info, *m_info);
+	}
+	return params;
+}
+
+ShaderParams PixelProgramMemo::Prepare(
+    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    bool dual_source_blending, ShaderPixelInputInfo& info, bool& same_program) {
+	BuildPixelProgramKey(regs, sh, target_export_mapping, dual_source_blending, m_scratch_key);
+	const auto generation = ShaderRegistryGeneration();
+	same_program          = m_valid && m_scratch_key == m_key &&
+	               m_stamp.Matches(regs.ps_regs.data_addr, generation, ShaderRegistrationAt);
+	if (same_program) {
+		info = m_info;
+		ShaderParams params;
+		params.code = m_code;
+		params.hash = m_hash;
+		ShaderSetUserData(
+		    params,
+		    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), 0u);
+		return params;
+	}
+	uint64_t registration = 0;
+	auto params = PreparePixelProgram(regs, sh, target_export_mapping, info, registration);
+	m_key       = m_scratch_key;
+	m_stamp.Record(regs.ps_regs.data_addr, registration, generation);
+	m_code  = params.code;
+	m_hash  = params.hash;
+	m_info  = info;
+	m_valid = true;
+	return params;
 }
 
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,

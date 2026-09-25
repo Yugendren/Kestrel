@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderProgramMemo.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
@@ -314,6 +315,14 @@ struct PipelineCache::ProgramCache {
 		std::vector<Permutation>                    permutations;
 	};
 
+	// The entry and permutation the previous Get of one graphics stage resolved to. A caller that
+	// knows its program key equals that call's (VertexProgramMemo / PixelProgramMemo) skips the
+	// key build and lookup; materialisation and the permutation match still run per call.
+	struct StageMemo {
+		SourceEntry* entry       = nullptr;
+		size_t       permutation = 0;
+	};
+
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
 			std::size_t hash = static_cast<std::size_t>(key.stage);
@@ -374,8 +383,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
-	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	                  StageMemo* memo = nullptr, bool same_program = false) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -398,12 +407,28 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		lookup_key.stage           = stage;
-		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = params.user_data_count;
-		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
+		const bool   from_memo        = memo != nullptr && same_program && memo->entry != nullptr;
+		SourceEntry* source           = from_memo ? memo->entry : nullptr;
+		const size_t memo_permutation = from_memo ? memo->permutation : 0;
+		if (!from_memo) {
+			lookup_key.stage           = stage;
+			lookup_key.hash            = params.hash;
+			lookup_key.user_data_count = params.user_data_count;
+			lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+			BuildStageStaticKey(input_info, lookup_key.static_state);
+			if (const auto found = programs.find(lookup_key); found != programs.end()) {
+				source = &found->second;
+			}
+		}
+		// Only a call that resolves a program may leave a memo behind.
+		const auto remember = [&](size_t permutation) {
+			if (memo != nullptr) {
+				*memo = {.entry = source, .permutation = permutation};
+			}
+		};
+		if (memo != nullptr) {
+			*memo = {};
+		}
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -412,27 +437,32 @@ struct PipelineCache::ProgramCache {
 		    .sync_memory                = SyncShaderGuestMemory,
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
-		if (entry != programs.end()) {
+		if (source != nullptr) {
 			if (!ReportMaterialization(label, stage, params.hash, report,
 			                           ShaderRecompiler::IR::MaterializeResources(
-			                               entry->second.resource_plan,
-			                               &entry->second.compiled_plan, runtime,
-			                               entry->second.resources, entry->second.specialization,
-			                               &report))) {
+			                               source->resource_plan, &source->compiled_plan, runtime,
+			                               source->resources, source->specialization, &report))) {
 				return {};
 			}
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			const auto matches = [&](const Permutation& candidate) {
+				const auto& layout = candidate.program.bindings;
+				return layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+				                                                    layout.ShaderDataDwords()) &&
+				       candidate.specialization == source->specialization;
+			};
+			auto& permutations = source->permutations;
+			// A repeated program nearly always materialises to the permutation it used last.
+			const auto permutation =
+			    from_memo && memo_permutation < permutations.size() &&
+			            matches(permutations[memo_permutation])
+			        ? permutations.begin() + static_cast<std::ptrdiff_t>(memo_permutation)
+			        : std::ranges::find_if(permutations, matches);
+			if (permutation != permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &entry->second.resources};
+				                    .resources = &source->resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				remember(static_cast<size_t>(permutation - permutations.begin()));
 				return permutation->handle;
 			}
 		}
@@ -470,27 +500,28 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		if (entry == programs.end()) {
-			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+		if (source == nullptr) {
+			source = &programs
+			              .try_emplace(lookup_key,
+			                           ShaderRecompiler::IR::ExtractResourcePlan(translated.program))
+			              .first->second;
 			if (!ReportMaterialization(label, stage, params.hash, report,
 			                           ShaderRecompiler::IR::MaterializeResources(
-			                               entry->second.resource_plan,
-			                               &entry->second.compiled_plan, runtime,
-			                               entry->second.resources, entry->second.specialization,
-			                               &report))) {
+			                               source->resource_plan, &source->compiled_plan, runtime,
+			                               source->resources, source->specialization, &report))) {
 				return {};
 			}
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
-		const auto& permutation = entry->second.permutations.back();
-		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+		source->permutations.push_back(CompilePermutation(
+		    params, options, std::move(translated), source->specialization, push_data_cursor));
+		const auto& permutation = source->permutations.back();
+		input_info.stage = {.program = &permutation.program, .resources = &source->resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		remember(source->permutations.size() - 1);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		for (const auto& [key, entry]: programs) {
+			counts[static_cast<size_t>(key.stage)] += entry.permutations.size();
 		}
 		// Guest geometry shaders are compiled through the host mesh stage.
 		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
@@ -518,12 +549,17 @@ struct PipelineCache::ProgramCache {
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	// Graphics stages only; GetGraphicsPrograms pairs each with the matching PrepareProgram memo.
+	StageMemo                                                   vertex_memo;
+	StageMemo                                                   pixel_memo;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)),
+      m_vertex_program_memo(std::make_unique<VertexProgramMemo>()),
+      m_pixel_program_memo(std::make_unique<PixelProgramMemo>()),
       m_last_save_time(std::chrono::steady_clock::now()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
@@ -821,12 +857,22 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	// The program memos compare this draw with the previous one, so they share m_mutex with the
+	// program cache they feed. Draws are already serialised by the render context lock, so
+	// taking it before the prepare step (instead of after) costs no concurrency.
+	Common::LockGuard lock(m_mutex);
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
+	// Tessellation draws (LS/HS/TES) are prepared without a memo: the memos cover the single
+	// vertex/mesh stage and the pixel stage. A tessellation draw leaves both vertex memos alone,
+	// and they stay paired, so the next non-tessellation draw still compares with the previous
+	// non-tessellation one.
+	bool same_vertex_program = false;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
-		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		vertex_params[0] = m_vertex_program_memo->Prepare(vertex_regs, context, user_config,
+		                                                  vertex_info[0], same_vertex_program);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -848,18 +894,23 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	ShaderParams pixel_params;
+	bool         same_pixel_program = false;
 	if (pixel_active) {
-		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		const auto& blend          = context.GetBlendControl(0);
 		const auto  is_dual_source = [](uint8_t factor) {
 			return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
 			       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
 		};
-		pixel_info.dual_source_blending =
+		const bool dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		    (is_dual_source(blend.color_srcblend) || is_dual_source(blend.color_destblend) ||
 		     (blend.separate_alpha_blend &&
 		      (is_dual_source(blend.alpha_srcblend) || is_dual_source(blend.alpha_destblend))));
+		// The verdict feeds the pixel program's static key, so the memo keys on it too.
+		pixel_params = m_pixel_program_memo->Prepare(pixel_regs, sh, target_export_mapping,
+		                                             dual_source_blending, pixel_info,
+		                                             same_pixel_program);
+		pixel_info.dual_source_blending = dual_source_blending;
 		if (pixel_info.dual_source_blending) {
 			// MRT1 supplies a second blend source for the same render target as MRT0.
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
@@ -880,15 +931,21 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	Common::LockGuard lock(m_mutex);
-	uint32_t          push_data_cursor =
+	uint32_t         push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawAddressDwordCount : 0;
-	GraphicsPrograms  result;
+	GraphicsPrograms result;
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor,
+		                                    &m_program_cache->pixel_memo, same_pixel_program);
 	}
-	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	if (tess_active) {
+		for (uint32_t i = 0; i < 3u; i++) {
+			result.vertex[i] =
+			    m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		}
+	} else {
+		result.vertex[0] = m_program_cache->Get(vertex_params[0], vertex_info[0], push_data_cursor,
+		                                        &m_program_cache->vertex_memo, same_vertex_program);
 	}
 	return result;
 }

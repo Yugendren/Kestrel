@@ -302,6 +302,8 @@ struct ShaderMappedData {
 	// The program hash (the binary's declared hash, else XXH3 of the code), computed on the first
 	// lookup of this registration and kept until the address is registered again; 0 until then.
 	uint64_t        code_hash           = 0;
+	// Serial of the ShaderMapUserData call that registered this entry, unique per registration.
+	uint64_t        registration        = 0;
 };
 
 void ShaderInit();

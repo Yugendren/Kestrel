@@ -25,6 +25,8 @@
 namespace Libs::Graphics {
 
 struct GraphicContext;
+class VertexProgramMemo;
+class PixelProgramMemo;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
@@ -278,6 +280,9 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	// Previous draw's PrepareProgram inputs per graphics stage; guarded by m_mutex.
+	std::unique_ptr<VertexProgramMemo> m_vertex_program_memo;
+	std::unique_ptr<PixelProgramMemo>  m_pixel_program_memo;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
