@@ -192,6 +192,7 @@ endif()
 option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/KytyOptimization.cmake")
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
