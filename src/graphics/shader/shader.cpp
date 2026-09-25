@@ -747,7 +747,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
                                            ShaderVertexMetadata&   metadata) {
 	KYTY_PROFILER_FUNCTION();
 
-	info = {};
+	info.ResetKeepingArrays();
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
@@ -989,7 +989,7 @@ static ShaderParams PrepareVertexProgram(const HW::VertexShaderInfo& regs,
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		return params;
 	}
-	info                     = {};
+	info.ResetKeepingArrays();
 	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
@@ -1071,7 +1071,9 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
-	input_info = {};
+	for (auto& stage: input_info) {
+		stage.ResetKeepingArrays();
+	}
 	ShaderVertexMetadata local_metadata;
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
 	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, 0u, input_info[0],
@@ -1167,7 +1169,7 @@ ShaderParams VertexProgramMemo::Prepare(const HW::VertexShaderInfo& regs,
 	ShaderSetUserData(
 	    params, std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr),
 	    ngg ? 8u : 0u);
-	info = {};
+	info.ResetKeepingArrays();
 	CopyPreparedVertexState(*m_info, info);
 	if (ngg) {
 		if (!m_back_code.empty()) {

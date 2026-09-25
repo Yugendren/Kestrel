@@ -531,7 +531,34 @@ struct DrawRenderState {
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
+
+	// Restores everything a draw reads before writing it. Left as the previous draw wrote them:
+	// the RES_MAX arrays of each vertex stage's input info (every reader stops at resources_num,
+	// buffers_num and attr_num) and the color_info slots (ResolveRenderColorTarget clears a slot
+	// before it is counted, and nothing reads past color_count except slot 0, which is always
+	// resolved). All three vertex stages are reset: a draw after a tessellation draw must not
+	// see its LS/HS/TES state.
+	void Reset() {
+		depth_info  = {};
+		color_count = 0;
+		ps_active   = true;
+		for (auto& stage: vertex_info) {
+			stage.ResetKeepingArrays();
+		}
+		ps_input_info = {};
+		programs      = {};
+	}
 };
+
+// A DrawRenderState is tens of kilobytes, nearly all of it arrays that only matter up to their
+// counts; value-initialising one per draw showed up as memset in the command processor profile.
+// Each thread keeps one and resets only what the next draw reads. Draws never nest, so one per
+// thread is enough.
+static DrawRenderState& AcquireDrawRenderState() {
+	thread_local auto state = std::make_unique<DrawRenderState>();
+	state->Reset();
+	return *state;
+}
 
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
@@ -1891,7 +1918,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance, args.indirect};
-	DrawRenderState state {};
+	auto& state = AcquireDrawRenderState();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return true;
@@ -1970,7 +1997,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return true;
 	}
-	DrawRenderState state {};
+	auto& state = AcquireDrawRenderState();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return true;

@@ -142,6 +142,26 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+
+	// Value-initialises every member except the three RES_MAX arrays (about 10 KB). Every reader
+	// of those stops at resources_num, buffers_num and attr_num, so clearing them per draw only
+	// cost time. Keep in step with the members above.
+	void ResetKeepingArrays() {
+		stage               = {};
+		logical_stage       = ShaderType::Vertex;
+		resources_num       = 0;
+		fetch_attrib_reg    = 0;
+		fetch_buffer_reg    = 0;
+		buffers_num         = 0;
+		wave_size           = 64;
+		scratch_size_dwords = 0;
+		pa_cl_vs_out_cntl   = 0;
+		clip_space          = {};
+		mesh                = {};
+		tess                = {};
+		fetch_external      = false;
+		fetch_embedded      = false;
+	}
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
