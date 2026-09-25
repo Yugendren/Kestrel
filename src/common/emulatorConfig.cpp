@@ -10,6 +10,17 @@ namespace Config {
 
 static std::unique_ptr<ConfigOptions> g_config;
 
+static float ClampPostScale(float scale) {
+	if (!std::isfinite(scale)) {
+		return 1.0F;
+	}
+	return std::clamp(scale, 0.1F, 4.0F);
+}
+
+static uint32_t ClampShadowMax(uint32_t cap) {
+	return cap == 0 ? 0 : std::clamp(cap, 64u, 16384u);
+}
+
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
 
@@ -18,6 +29,7 @@ void Initialize() {
 
 void Shutdown() {
 	g_config.reset();
+	Detail::g_hot_values = {};
 }
 
 void Load(const ConfigOptions& cfg) {
@@ -26,6 +38,12 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 
 	*g_config = cfg;
+	Detail::g_hot_values = {
+	    .graphics_debug_dump_enabled = cfg.graphics_debug_dump_enabled,
+	    .printf_direction            = cfg.printf_direction,
+	    .post_scale                  = ClampPostScale(cfg.graphics.post_scale),
+	    .shadow_max                  = ClampShadowMax(cfg.graphics.shadow_max),
+	};
 }
 
 uint32_t GetScreenWidth() {
@@ -101,18 +119,6 @@ float GetLodBias() {
 	return std::clamp(bias, -4.0F, 4.0F);
 }
 
-float GetPostScale() {
-	const float scale = g_config->graphics.post_scale;
-	if (!std::isfinite(scale)) {
-		return 1.0F;
-	}
-	return std::clamp(scale, 0.1F, 4.0F);
-}
-
-uint32_t GetShadowMax() {
-	const uint32_t cap = g_config->graphics.shadow_max;
-	return cap == 0 ? 0 : std::clamp(cap, 64u, 16384u);
-}
 
 uint32_t GetFrameCap() {
 	const uint32_t cap = g_config->graphics.frame_cap;
@@ -149,14 +155,6 @@ bool CommandBufferDumpEnabled() {
 
 std::filesystem::path GetCommandBufferDumpFolder() {
 	return g_config->command_buffer_dump_folder;
-}
-
-bool GraphicsDebugDumpEnabled() {
-	return g_config->graphics_debug_dump_enabled;
-}
-
-LogDirection GetPrintfDirection() {
-	return g_config->printf_direction;
 }
 
 std::filesystem::path GetPrintfOutputFile() {

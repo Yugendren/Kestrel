@@ -115,6 +115,21 @@ struct ConfigOptions {
 
 void Load(const ConfigOptions& cfg);
 
+namespace Detail {
+// Values the command processor reads per PM4 packet or per draw (the debug-dump switch alone is
+// asked ~26k times per frame in a busy scene). Out-of-line getters cost a call and a pointer
+// chase through g_config each time, so Load() copies these into a plain global the inline
+// getters below read directly. Config is immutable after Load(), which runs on the main thread
+// before the graphics threads are created, so a plain (non-atomic) copy is safe.
+struct HotValues {
+	bool         graphics_debug_dump_enabled = false;
+	LogDirection printf_direction            = LogDirection::Silent;
+	float        post_scale                  = 1.0F;
+	uint32_t     shadow_max                  = 0;
+};
+inline HotValues g_hot_values;
+} // namespace Detail
+
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
 const std::string& GetUserName();
@@ -130,8 +145,8 @@ float GetRenderScale();
 RtMode GetRtMode();
 uint32_t GetMaxAnisotropy();
 float    GetLodBias();
-float    GetPostScale();
-uint32_t GetShadowMax();
+inline float    GetPostScale() { return Detail::g_hot_values.post_scale; }
+inline uint32_t GetShadowMax() { return Detail::g_hot_values.shadow_max; }
 uint32_t GetFrameCap();
 VertexFetchMode GetVertexFetchMode();
 uint32_t GetConsoleLanguage();
@@ -145,9 +160,11 @@ std::filesystem::path  GetShaderLogFolder();
 bool                  CommandBufferDumpEnabled();
 std::filesystem::path GetCommandBufferDumpFolder();
 
-bool GraphicsDebugDumpEnabled();
+inline bool GraphicsDebugDumpEnabled() {
+	return Detail::g_hot_values.graphics_debug_dump_enabled;
+}
 
-LogDirection          GetPrintfDirection();
+inline LogDirection   GetPrintfDirection() { return Detail::g_hot_values.printf_direction; }
 std::filesystem::path GetPrintfOutputFile();
 uint32_t              GetFpsLogSeconds();
 
