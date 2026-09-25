@@ -13,6 +13,31 @@
 #include <span>
 #include <vector>
 
+// Counts heap allocations while enabled, so a test can require that repeated
+// materialisation into reused destinations does not allocate.
+namespace {
+bool g_count_allocations = false;
+uint64_t g_allocations = 0;
+} // namespace
+
+void *operator new(std::size_t size) {
+  if (g_count_allocations) {
+    g_allocations++;
+  }
+  void *memory = std::malloc(size == 0 ? 1 : size);
+  if (memory == nullptr) {
+    std::abort();
+  }
+  return memory;
+}
+void *operator new[](std::size_t size) { return operator new(size); }
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete[](void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
+
 namespace {
 
 void Check(bool value, const char *text) {
@@ -1937,6 +1962,128 @@ void TestCompiledUnsupportedPlansFallBack() {
   }
 }
 
+bool SameSnapshot(const ir::ResourceSnapshot &a,
+                  const ir::ResourceSnapshot &b) {
+  return a.buffers == b.buffers && a.images == b.images &&
+         a.samplers == b.samplers && a.flattened_srt == b.flattened_srt &&
+         a.user_data == b.user_data && a.uniform_fill == b.uniform_fill;
+}
+
+// Fills every field of a destination with data no plan produces, which
+// MaterializeResources must overwrite rather than leak into its result.
+void Poison(ir::ResourceSnapshot &snapshot,
+            ir::ResourceSpecialization &specialization, uint32_t seed) {
+  ir::DescriptorValue junk;
+  junk.dwords.fill(0xdead0000u + seed);
+  junk.dword_count = 8;
+  snapshot.buffers.assign(5 + seed % 3u, junk);
+  snapshot.images.assign(9 + seed % 5u, junk);
+  snapshot.samplers.assign(7, junk);
+  snapshot.flattened_srt.assign(11 + seed % 4u, 0xbad0000u + seed);
+  snapshot.user_data.assign(6, 0xfee0000u + seed);
+  snapshot.uniform_fill = {.kind = ir::UniformFillKind::Buffer,
+                           .resource = 3,
+                           .words = 4,
+                           .value = seed};
+  specialization.buffers.assign(4, {.packed_stride = 0x1234u + seed});
+  specialization.images.assign(6, {.mip_count = 9u + seed, .fmask = true});
+}
+
+// Destinations reused across different plans back to back (as the program
+// cache does per draw) give exactly what fresh ones give, also after a failure
+// left them half written. Steady state does not allocate.
+void TestReusedDestinationsMatchFresh() {
+  using namespace ir;
+  const uint32_t dword = 0x12345678u;
+  auto srt = SrtPlan(reinterpret_cast<uint64_t>(&dword));
+  auto user_data = UserDataBufferPlan();
+  auto mixed = MixedSamplerPlan();
+  auto uniform = UserDataBufferPlan();
+  auto &fill_value = uniform.value_storage.emplace_back(ValueOpcode::GetUserData);
+  fill_value.SetArg(0, Value(static_cast<ScalarReg>(1)));
+  uniform.uniform_fill.fill.kind = UniformFillKind::Buffer;
+  uniform.uniform_fill.fill.words = 2;
+  uniform.uniform_fill.values = {Value(&fill_value), Value(7u)};
+  const std::array<const ResourcePlan *, 4> plans = {&srt, &user_data, &mixed,
+                                                     &uniform};
+  std::vector<std::unique_ptr<CompiledSrtPlan>> compiled;
+  for (const auto *plan : plans) {
+    compiled.push_back(std::make_unique<CompiledSrtPlan>(*plan));
+    Check(compiled.back()->Usable(), "reuse test plan was not compiled");
+  }
+  // {0x1000, 7} gives the uniform plan a fill value; {} fails the plans that
+  // read user data.
+  const std::vector<std::vector<uint32_t>> registers = {
+      {0x1000u, 7u}, {0x2000u, 8u, 3u}, {}, {0u, 7u, 0u, 0u}};
+
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  std::mt19937 rng(0xa8a8a8a8u);
+  uint32_t succeeded = 0;
+  uint32_t failed = 0;
+  for (uint32_t step = 0; step < 400; step++) {
+    const auto index = rng() % plans.size();
+    const auto &values = registers[rng() % registers.size()];
+    const SrtRuntime runtime{.user_data = values};
+    const bool interpreter = rng() % 4u == 0u;
+    if (rng() % 3u == 0u) {
+      Poison(snapshot, specialization, step);
+    }
+    ResourceSnapshot expected_snapshot;
+    ResourceSpecialization expected_specialization;
+    const bool expected = MaterializeResources(
+        *plans[index], runtime, expected_snapshot, expected_specialization);
+    const bool actual = MaterializeResources(
+        *plans[index], interpreter ? nullptr : compiled[index].get(), runtime,
+        snapshot, specialization);
+    Check(expected == actual, "reused materialization changed its outcome");
+    if (actual) {
+      succeeded++;
+      Check(SameSnapshot(snapshot, expected_snapshot) &&
+                specialization == expected_specialization,
+            "reused destinations leaked stale state");
+    } else {
+      failed++;
+    }
+  }
+  Check(succeeded >= 100u && failed >= 20u,
+        "reuse test did not mix successes and failures");
+
+  // Steady state: two destinations (as the vertex and pixel stages keep) keep
+  // their capacity, so a pass over every plan allocates nothing once each has
+  // seen the largest result.
+  std::array<ResourceSnapshot, 2> stage_snapshots;
+  ResourceSpecialization steady_specialization;
+  const std::vector<uint32_t> steady_registers = {0x2000u, 8u, 3u};
+  const SrtRuntime steady_runtime{.user_data = steady_registers};
+  const auto pass = [&] {
+    for (uint32_t stage = 0; stage < stage_snapshots.size(); stage++) {
+      for (size_t index = 0; index < plans.size(); index++) {
+        Check(MaterializeResources(*plans[index], compiled[index].get(),
+                                   steady_runtime, stage_snapshots[stage],
+                                   steady_specialization),
+              "steady-state materialization failed");
+      }
+    }
+  };
+  for (uint32_t warm = 0; warm < 3; warm++) {
+    pass();
+  }
+  g_allocations = 0;
+  g_count_allocations = true;
+  for (uint32_t round = 0; round < 4; round++) {
+    pass();
+  }
+  g_count_allocations = false;
+  std::printf("ResourceMaterializationTests: reuse: %u reused results "
+              "matched fresh ones across %u failures, "
+              "%llu allocations in %u steady-state materializations\n",
+              succeeded, failed, static_cast<unsigned long long>(g_allocations),
+              4u * static_cast<uint32_t>(stage_snapshots.size() * plans.size()));
+  std::fflush(stdout);
+  Check(g_allocations == 0u, "steady-state materialization allocated");
+}
+
 } // namespace
 
 namespace Common {
@@ -1975,6 +2122,7 @@ int main() {
   TestCompiledUnsupportedPlansFallBack();
   TestCompiledRandomDifferential();
   TestCompiledMaterializeMatchesInterpreter();
+  TestReusedDestinationsMatchFresh();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }
