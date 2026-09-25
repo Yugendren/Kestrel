@@ -388,7 +388,19 @@ void CommandScheduler::FlushShaderHazards() {
 	// render pass is open and the barrier may be recorded here.
 	m_command.EndRendering();
 	ShaderHazardBarrier(m_command.Handle());
+	m_command.NoteFullBarrier();
 	m_shader_hazards.Clear();
+}
+
+void CommandScheduler::RequestFullBarrier() {
+	if (m_command.IsInvalid()) {
+		return;
+	}
+	// Every dispatch the tracker holds was recorded before the requested barrier, which is
+	// recorded ahead of the next command whatever it is, so the deferred hazard barrier is
+	// redundant.
+	m_shader_hazards.Clear();
+	m_command.RequestFullBarrier();
 }
 
 void CommandScheduler::Flush() {

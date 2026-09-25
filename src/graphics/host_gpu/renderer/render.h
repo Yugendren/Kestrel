@@ -149,7 +149,21 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	// Orders everything recorded so far before everything recorded later with an ALL_COMMANDS
+	// memory barrier (the command processor's cache flushes and partial flushes). The barrier is
+	// not recorded here but by the next Handle() call, i.e. immediately before the next command,
+	// so a run of requests with nothing recorded between them -- or following another full
+	// barrier -- costs one barrier instead of one each. The recorded stream is the same as
+	// recording every request on the spot, minus barriers that would sit back to back.
+	void RequestFullBarrier() const;
+	// Tells the buffer a full memory barrier was just recorded by other means (the shader hazard
+	// barrier), so a request with nothing recorded since is already satisfied.
+	void NoteFullBarrier() const noexcept { m_after_full_barrier = true; }
 
+	// Every command recorded into the buffer goes through here, which is what makes it the place
+	// to record a requested barrier. Code that only needs the buffer to be open checks IsInvalid()
+	// instead, so it does not record the barrier early (the end-of-pipe writes in sync.cpp follow
+	// most barrier requests and would otherwise defeat the coalescing).
 	[[nodiscard]] vk::CommandBuffer  Handle() const;
 	[[nodiscard]] GraphicContext&    GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&     GetContext() const noexcept { return m_context; }
@@ -173,6 +187,7 @@ private:
 
 	void Begin();
 	void End() const;
+	void RecordFullBarrier() const;
 
 	CommandScheduler&         m_scheduler;
 	RenderContext&            m_context;
@@ -191,6 +206,10 @@ private:
 	// graphics pipelines and issuing its own vkCmdSet* calls.
 	mutable DynamicStateCache m_dynamic_state;
 	mutable bool              m_rendering   = false;
+	// RequestFullBarrier() was called and the barrier has not been recorded yet.
+	mutable bool              m_full_barrier_pending = false;
+	// The last command recorded was a full memory barrier.
+	mutable bool              m_after_full_barrier = false;
 	HW::Context*              m_registers   = nullptr;
 	HW::UserConfig*           m_user_config = nullptr;
 	HW::Shader*               m_shaders     = nullptr;

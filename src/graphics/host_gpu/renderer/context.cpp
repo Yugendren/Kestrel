@@ -26,11 +26,42 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	if (m_full_barrier_pending) {
+		m_full_barrier_pending = false;
+		RecordFullBarrier();
+	}
+	// The caller is about to record a command, so the buffer no longer ends in a full barrier.
+	m_after_full_barrier = false;
 	return m_buffer;
 }
 
+void CommandBuffer::RequestFullBarrier() const {
+	if (m_full_barrier_pending || m_after_full_barrier) {
+		return;
+	}
+	// A barrier cannot be recorded inside a render pass instance. Ending the pass now, not when
+	// the barrier is recorded, keeps the draw path from continuing the pass across the request:
+	// its next draw begins a new pass, and BeginRendering() records the barrier first.
+	EndRendering();
+	m_full_barrier_pending = true;
+}
+
+void CommandBuffer::RecordFullBarrier() const {
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	m_buffer.pipelineBarrier2(dependency);
+}
+
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || IsInvalid());
+	// End() records a pending barrier, so none can be left over from the previous buffer.
+	EXIT_IF(m_rendering || IsInvalid() || m_full_barrier_pending);
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};

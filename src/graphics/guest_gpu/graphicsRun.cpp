@@ -1517,18 +1517,9 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
-
-	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-
-	vk::DependencyInfo dependency {};
-	dependency.memoryBarrierCount = 1;
-	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	// Deferred to the next recorded command, so back-to-back flush events (a partial flush
+	// followed by cache write-backs, say) share one barrier.
+	GetScheduler().RequestFullBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

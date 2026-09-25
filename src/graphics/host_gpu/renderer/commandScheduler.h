@@ -65,6 +65,9 @@ public:
 	// other than another dispatch may observe those writes.
 	[[nodiscard]] ShaderHazardTracker& ShaderHazards() noexcept { return m_shader_hazards; }
 	void                               FlushShaderHazards();
+	// A full memory barrier between the work recorded so far and whatever is recorded next
+	// (CommandBuffer::RequestFullBarrier). It also covers pending shader hazards.
+	void                               RequestFullBarrier();
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
