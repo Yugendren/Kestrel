@@ -2010,6 +2010,82 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	return image.FindView(desc.view_info);
 }
 
+// A draw that continues the previous draw's render pass skips acquiring its targets again, which
+// is only sound when the acquisition would repeat the previous one. The previous call left its
+// image LRU-touched, GPU-owned, refreshed from guest memory, tracked, ahead of its scale twin and
+// enrolled for download; a depth call also recorded the descriptor's stencil range and metadata
+// and refreshed the stencil association. What can undo any of that without moving Generation()
+// or ending the render pass is checked here:
+//  - the image went away, was superseded (needs_rebind) or became a stencil association: the
+//    full call would rediscover it or fail;
+//  - it is also bound as a texture or storage image this draw (binding.is_bound): the attachment
+//    layout and the depth feedback-loop handling are decided per draw from the draw's bindings;
+//  - the guest CPU or a buffer write reached its memory, even possibly (the maybe-dirty state is
+//    resolved by hashing), or its page watchers no longer cover exactly its range: RefreshImage()
+//    would upload or re-arm them;
+//  - a storage binding of its scale twin left the twin newer: SyncScaledContents() would blit,
+//    and MarkScaledNewest() would change the pair's state;
+//  - it stopped being GPU-modified: CommitGpuWrite() and download enrolment would run again;
+//  - for a depth target, the stencil range, metadata or HTile record differ from the descriptor's,
+//    or the stencil association is missing or would be refreshed.
+// Clear state needs no check: a pending HTile or DCC fast clear is only set by dispatches and
+// buffer fills, which end the span of draws a caller compares across; a depth or stencil clear
+// enable is a register the previous draw saw as well, and consuming a metadata clear it already
+// consumed is idempotent. The only difference that remains possible -- the open pass began with
+// a clear that a new acquisition would no longer request -- is harmless: the full path would end
+// the pass, which stores the cleared and drawn contents, and begin an identical one that loads
+// them.
+//
+// The lock matters: the fault handler marks CPU writes from another thread under it
+// (InvalidateMemory()), as FindRenderTarget() reads them. A write landing after it is released is
+// no different from one landing after FindRenderTarget() returns.
+bool TextureCache::TargetAcquisitionRepeats(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	const auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || !image->registered || image->depth_id ||
+	    image->binding.needs_rebind || image->binding.is_bound) {
+		return false;
+	}
+	const auto refreshed = [](const Image& target) {
+		const bool tracked = !target.registered || (target.track_addr == target.info.data.address &&
+		                                            target.track_addr_end == target.info.data.End());
+		return tracked && !target.IsCpuDirty() && !target.IsBufferModified();
+	};
+	if (!refreshed(*image) || !image->IsGpuModified() || image->IsTwinNewest() ||
+	    !image->IsTwinStale()) {
+		return false;
+	}
+	switch (desc.type) {
+		case BindingType::RenderTarget: return image->usage.render_target;
+		case BindingType::DepthTarget: break;
+		default: return false;
+	}
+	if (!image->usage.depth_target || image->info.stencil != desc.info.stencil ||
+	    !(image->info.metadata == desc.info.metadata) ||
+	    (desc.info.HasMetadata() && !m_surface_metas.contains(desc.info.metadata.range.address))) {
+		return false;
+	}
+	if (!desc.info.HasStencil()) {
+		return true;
+	}
+	// AssociateStencil()'s lookup, without creating the association.
+	const Image* stencil = nullptr;
+	for (const auto candidate: FindImagesInRegion(desc.info.stencil.address,
+	                                              desc.info.stencil.size, false)) {
+		const auto* owner = m_slot_images.try_get(candidate);
+		if (owner != nullptr && owner->info.data == desc.info.stencil &&
+		    owner->info.extent == image->info.extent) {
+			stencil = owner;
+		}
+	}
+	if (stencil == nullptr || stencil->depth_id != id) {
+		return false;
+	}
+	// RefreshImage() leaves the association alone behind a compressed or multisampled depth.
+	return image->info.metadata.stencil_compressed || image->info.samples != 1 ||
+	       refreshed(*stencil);
+}
+
 void TextureCache::MarkGpuWritten(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];

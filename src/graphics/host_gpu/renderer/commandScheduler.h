@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderHazardTracker.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
@@ -42,6 +43,11 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// How many deferred operations PopPendingOperations() has run. A draw that reuses the previous
+	// draw's state compares it, since a deferred callback may do anything to the renderer.
+	[[nodiscard]] uint64_t DeferredOperationsRun() const noexcept {
+		return m_deferred_operations_run.load(std::memory_order_relaxed);
+	}
 
 	// Occlusion-query emulation for PixelPipeStatDump (guest_gpu TriggerEvent 0x39). The guest
 	// brackets one occlusion-tested draw with a begin dump and an end dump 8 bytes apart in an
@@ -136,6 +142,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	std::atomic_uint64_t         m_deferred_operations_run {0};
 	ShaderHazardTracker          m_shader_hazards;
 };
 

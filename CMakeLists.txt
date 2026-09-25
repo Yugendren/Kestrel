@@ -566,6 +566,15 @@ add_executable(program_memo_tests EXCLUDE_FROM_ALL
 target_link_libraries(program_memo_tests common fmt::fmt Vulkan::Headers xxhash)
 target_include_directories(program_memo_tests PRIVATE ${inc_headers})
 
+# Header-only: the draw-state tracker (drawStateTracker.h) and the draw-reuse record
+# (drawReuse.h, which pulls in pipelineCache.h for the vertex input layout) need nothing beyond
+# common, fmt, xxHash and the Vulkan headers.
+add_executable(draw_reuse_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DrawReuseTests.cpp"
+)
+target_link_libraries(draw_reuse_tests common fmt::fmt Vulkan::Headers xxhash)
+target_include_directories(draw_reuse_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")

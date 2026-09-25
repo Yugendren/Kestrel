@@ -898,9 +898,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// Only the search for the host image behind a descriptor is carried over. Everything the
 	// binding itself does per draw still happens: BindImage() below, and the content refresh and
 	// download tracking that RebindImages() drives through the texture cache.
-	if (last.program == &program && last.texture_generation == generation &&
-	    std::ranges::equal(last.image_values, snapshot.images) &&
-	    std::ranges::equal(last.sampler_values, snapshot.samplers)) {
+	const bool reused = last.program == &program && last.texture_generation == generation &&
+	                    std::ranges::equal(last.image_values, snapshot.images) &&
+	                    std::ranges::equal(last.sampler_values, snapshot.samplers);
+	if (program.stage == ShaderType::Pixel) {
+		m_pixel_bindings_reused = reused;
+	}
+	if (reused) {
 		// The persistent bindings usually still hold this resolution from the previous draw of the
 		// stage: the views and layouts they inherit are recomputed every draw by RebindImages()
 		// and CommitBindings(), and an entry RebindImages() re-resolved since is the current

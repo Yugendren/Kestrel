@@ -461,6 +461,7 @@ void CommandScheduler::PopPendingOperations() {
 			m_pending_operations.pop();
 		}
 		WaitPriorityOperations(operation.tick);
+		m_deferred_operations_run.fetch_add(1, std::memory_order_relaxed);
 		RunOperation(std::move(operation.callback));
 	}
 }

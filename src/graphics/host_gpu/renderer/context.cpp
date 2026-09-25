@@ -72,7 +72,7 @@ void CommandBuffer::Begin() {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	// A freshly begun command buffer has no dynamic state recorded on it yet.
-	m_dynamic_state.Reset();
+	InvalidateDynamicState();
 }
 
 void CommandBuffer::End() const {
@@ -139,6 +139,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
+	m_render_pass_epoch++;
 	m_render_state = state;
 	m_rendering    = true;
 }

@@ -7,9 +7,11 @@
 // Discovery-memo key types below need the complete HW::RenderTarget / HW::DepthRenderTarget
 // register structs (and their operator==), plus RenderColorInfo, as the memoized value types;
 // a forward declaration is no longer enough once a GenerationMemo<...> of them is a member.
+#include "graphics/guest_gpu/command_processor/drawStateTracker.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawReuse.h"
 #include "graphics/host_gpu/renderer/meshDrawArgs.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/dynamicState.h"
@@ -32,6 +34,7 @@ struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
+struct DrawReuseRequest;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -165,17 +168,33 @@ public:
 	// instead, so it does not record the barrier early (the end-of-pipe writes in sync.cpp follow
 	// most barrier requests and would otherwise defeat the coalescing).
 	[[nodiscard]] vk::CommandBuffer  Handle() const;
+	// The buffer being recorded, for identity comparisons only: unlike Handle() it records nothing.
+	[[nodiscard]] vk::CommandBuffer  PeekHandle() const noexcept { return m_buffer; }
 	[[nodiscard]] GraphicContext&    GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&     GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&       GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&    GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&        GetShaders() const noexcept { return *m_shaders; }
 	[[nodiscard]] bool               IsRendering() const noexcept { return m_rendering; }
+	// Moves with every render pass instance begun on this buffer: two draws that see the same
+	// epoch while rendering are recorded into the same instance.
+	[[nodiscard]] uint64_t           RenderPassEpoch() const noexcept { return m_render_pass_epoch; }
+	// The render state the open render pass instance was begun with; empty when not rendering.
+	[[nodiscard]] const RenderState& CurrentRenderState() const noexcept { return m_render_state; }
 	[[nodiscard]] DynamicStateCache& DynamicState() const noexcept { return m_dynamic_state; }
+	// Moves whenever nothing is known about the buffer's dynamic state anymore (a new recording,
+	// InvalidateDynamicState()), so a draw can tell whether the state an earlier draw recorded is
+	// still the current one.
+	[[nodiscard]] uint64_t DynamicStateInvalidations() const noexcept {
+		return m_dynamic_state_invalidations;
+	}
 	// Called wherever something other than SetGraphicsDynamicParams() (renderDraw.cpp) records
 	// dynamic state on this buffer -- currently blitHelper.cpp binding its own graphics pipelines
 	// -- so the cache does not think a stale value is still current.
-	void InvalidateDynamicState() const noexcept { m_dynamic_state.Reset(); }
+	void InvalidateDynamicState() const noexcept {
+		m_dynamic_state.Reset();
+		m_dynamic_state_invalidations++;
+	}
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -205,7 +224,9 @@ private:
 	// this (see context.cpp); blitHelper.cpp additionally invalidates it after binding its own
 	// graphics pipelines and issuing its own vkCmdSet* calls.
 	mutable DynamicStateCache m_dynamic_state;
+	mutable uint64_t          m_dynamic_state_invalidations = 0;
 	mutable bool              m_rendering   = false;
+	mutable uint64_t          m_render_pass_epoch = 0;
 	// RequestFullBarrier() was called and the barrier has not been recorded yet.
 	mutable bool              m_full_barrier_pending = false;
 	// The last command recorded was a full memory barrier.
@@ -264,6 +285,10 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 
+	// The command processors report every packet they execute here, and DrawIndex()/DrawAuto()
+	// read its verdict (drawStateTracker.h).
+	[[nodiscard]] DrawStateTracker& GetDrawStateTracker() noexcept { return m_draw_state_tracker; }
+
 private:
 	// Records the draw. A draw with `args.indirect == nullptr` is always recorded and returns
 	// true; an indirect draw returns false when the bound guest state cannot be expressed as a
@@ -317,11 +342,41 @@ private:
 	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
 	// False when the prepared draw turned out to be an indirect draw that cannot be recorded; no
-	// commands are written in that case.
+	// commands are written in that case. `reuse` is null for a draw that takes no part in
+	// draw-state reuse (drawReuse.h); otherwise a fully recorded draw is stored for the next one,
+	// and `reuse->previous`, when set, is the draw whose render state this one kept.
 	bool ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable);
+	                         bool primitive_restart_enable, const DrawReuseRequest* reuse);
+	// Draw-state reuse (drawReuse.h). The draw's render state: the previous draw's discovery
+	// result, with this draw's programs, when `keep`, the programs are `previous`'s and its
+	// targets are still live; else a reset state for PrepareDrawRenderState(), in which case
+	// `keep` is cleared.
+	[[nodiscard]] DrawRenderState& SelectDrawRenderState(bool& keep, CommandBuffer& buffer,
+	                                                     const DrawCallInfo&    draw,
+	                                                     uint32_t               render_target_slice_offset,
+	                                                     const DrawReuseRecord& previous);
+	// Re-applies the per-draw half of render-target discovery to the kept targets; false when one
+	// of them is gone and discovery has to run.
+	[[nodiscard]] bool KeepDrawTargets(const DrawRenderState& state);
+	// The previous draw's pipeline when this draw, which kept its render state, may also keep its
+	// render targets' acquisition, pipeline, dynamic state and render pass; null otherwise.
+	[[nodiscard]] PipelineCache::Pipeline* ReusableDrawPipeline(const CommandBuffer&    buffer,
+	                                                            const DrawRenderState&  state,
+	                                                            const DrawReuseRecord&  previous,
+	                                                            const DrawPipelineFeed& feed);
+	// KYTY_DRAW_REUSE_ORACLE=1: run the skipped steps beside a reusing draw and compare; false on
+	// a mismatch, which the draw then answers by taking the full path.
+	[[nodiscard]] bool OracleConfirmsRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                             uint32_t               render_target_slice_offset,
+	                                             const DrawRenderState& kept);
+	[[nodiscard]] bool OracleConfirmsReusedPipeline(
+	    const CommandBuffer& buffer, const DrawRenderState& state, const DrawReuseRecord& previous,
+	    const RenderState& rendering, vk::ImageAspectFlags feedback_aspects,
+	    const PipelineCache::Pipeline& expected, const PipelineCache::Pipeline& reused,
+	    vk::PrimitiveTopology topology, bool primitive_restart_enable);
+	void LogDrawReuseOracleSummary();
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -354,6 +409,9 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	// Whether the latest PrepareBindings() for the pixel stage kept the previous resolution of its
+	// images (m_stage_textures); read by ReusableDrawPipeline().
+	bool                                  m_pixel_bindings_reused = false;
 	std::unordered_set<uint64_t> m_unrepresentable_textures;
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
 	// Per-slot / per-draw memo of render-target discovery, keyed on TextureCache::Generation() --
@@ -363,6 +421,13 @@ private:
 	std::array<GenerationMemo<ColorTargetKey, RenderColorInfo>, RENDER_COLOR_ATTACHMENTS_MAX>
 	                                                             m_color_target_memo;
 	GenerationMemo<HW::DepthRenderTarget, DepthTargetDiscovery> m_depth_target_memo;
+	// Draw-state reuse (drawReuse.h). The tracker is owned here rather than by a command
+	// processor: the graphics and compute command processors all run on the GPU thread and feed
+	// this executor, so one tracker sees every packet executed before the executor's next draw,
+	// whichever queue it came from.
+	DrawStateTracker m_draw_state_tracker;
+	DrawReuseRecord  m_draw_reuse;
+	DrawReuseOracle  m_draw_reuse_oracle;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

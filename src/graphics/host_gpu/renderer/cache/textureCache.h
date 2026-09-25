@@ -69,6 +69,10 @@ public:
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// Whether FindRenderTarget()/FindDepthTarget() for `id` with the same `desc` as the previous
+	// call for that target would find every step already done, apart from the LRU touch
+	// (NoteImageReuse()). Takes the cache lock.
+	[[nodiscard]] bool          TargetAcquisitionRepeats(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);

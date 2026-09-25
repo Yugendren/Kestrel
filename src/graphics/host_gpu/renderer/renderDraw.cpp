@@ -39,12 +39,14 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -321,11 +323,16 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
-static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
-                                     const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderDepthInfo& depth, const RenderState& rendering,
-                                     vk::PrimitiveTopology topology, bool primitive_restart_enable,
-                                     bool mesh_active) {
+// Resolves the per-draw Vulkan dynamic state from the guest registers, the draw's last vertex
+// stage, its depth target and the render pass it records into. SetGraphicsDynamicParams() records
+// it; the draw-reuse oracle compares it against what is already recorded (see
+// OracleConfirmsReusedPipeline()).
+static void ResolveGraphicsDynamicState(const CommandBuffer&         buffer,
+                                        const ShaderVertexInputInfo& vs_input_info,
+                                        const RenderDepthInfo& depth, const RenderState& rendering,
+                                        vk::ImageAspectFlags  feedback_aspects,
+                                        vk::PrimitiveTopology topology, bool primitive_restart_enable,
+                                        bool mesh_active, GraphicsDynamicState& out) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto& ctx = buffer.GetRegisters();
@@ -342,9 +349,11 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
 	static_assert(viewport_slots <= DynamicStateCache::MaxViewports,
 	              "DynamicStateCache stores a full viewport array per command buffer");
-	std::array<vk::Viewport, viewport_slots> viewports {};
-	std::array<vk::Rect2D, viewport_slots>   scissors {};
+	static_assert(viewport_slots <= GraphicsDynamicState::MaxViewports);
+	auto&          viewports      = out.viewports;
+	auto&          scissors       = out.scissors;
 	const uint32_t viewport_count = indexed_viewports ? viewport_slots : 1;
+	out.viewport_count            = viewport_count;
 	for (uint32_t i = 0; i < viewport_count; i++) {
 		const auto& guest    = vp.viewports[i];
 		auto&       viewport = viewports[i];
@@ -386,8 +395,6 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissors[i].extent  = {0, 0};
 		}
 	}
-	buffer.DynamicState().SetViewportWithCount(vk_buffer, viewport_count, viewports.data());
-	buffer.DynamicState().SetScissorWithCount(vk_buffer, viewport_count, scissors.data());
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -400,22 +407,19 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	buffer.DynamicState().SetLineWidth(vk_buffer, line_width);
-	const auto&      blend = ctx.GetBlendColor();
-	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	buffer.DynamicState().SetBlendConstants(vk_buffer, blend_constants.data());
-	buffer.DynamicState().SetDepthTestEnable(vk_buffer, depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	buffer.DynamicState().SetDepthWriteEnable(vk_buffer,
-	                                          depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	buffer.DynamicState().SetDepthCompareOp(vk_buffer, depth.depth_compare_op);
+	out.line_width         = line_width;
+	const auto& blend      = ctx.GetBlendColor();
+	out.blend_constants    = {blend.red, blend.green, blend.blue, blend.alpha};
+	out.depth_test_enable  = depth.depth_test_enable ? VK_TRUE : VK_FALSE;
+	out.depth_write_enable = depth.depth_write_enable ? VK_TRUE : VK_FALSE;
+	out.depth_compare_op   = depth.depth_compare_op;
 #if defined(__APPLE__)
 	// MoltenVK lacks the depthBounds feature; depth-bounds testing stays disabled and the bounds
 	// themselves are never set (see the matching guard in CreatePipelineInternal).
-	buffer.DynamicState().SetDepthBoundsTestEnable(vk_buffer, VK_FALSE);
+	out.depth_bounds_test_enable = VK_FALSE;
 #else
-	buffer.DynamicState().SetDepthBoundsTestEnable(
-	    vk_buffer, depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
-	buffer.DynamicState().SetDepthBounds(vk_buffer, depth.depth_min_bounds, depth.depth_max_bounds);
+	out.depth_bounds_test_enable = depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE;
+	out.depth_bounds             = {depth.depth_min_bounds, depth.depth_max_bounds};
 #endif
 
 	const auto& mode = ctx.GetModeControl();
@@ -432,21 +436,21 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	if (!rect_list && mode.cull_front) {
 		cull_mode |= vk::CullModeFlagBits::eFront;
 	}
-	buffer.DynamicState().SetCullMode(vk_buffer, cull_mode);
-	buffer.DynamicState().SetFrontFace(
-	    vk_buffer, mode.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
-	if (!mesh_active) {
-		// A mesh pipeline has no input-assembly state, matching CreatePipelineInternal's !mesh
-		// guard on these two dynamic states.
-		vk_buffer.setPrimitiveTopology(topology);
-		vk_buffer.setPrimitiveRestartEnable(primitive_restart_enable ? VK_TRUE : VK_FALSE);
+	out.cull_mode  = cull_mode;
+	out.front_face = mode.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise;
+	// A mesh pipeline has no input-assembly state, matching CreatePipelineInternal's !mesh guard on
+	// the topology and primitive-restart dynamic states.
+	out.input_assembly = !mesh_active;
+	if (out.input_assembly) {
+		out.topology          = topology;
+		out.primitive_restart = primitive_restart_enable;
 	}
 
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	buffer.DynamicState().SetDepthBiasEnable(vk_buffer, depth_bias_enable ? VK_TRUE : VK_FALSE);
+	out.depth_bias_enable         = depth_bias_enable ? VK_TRUE : VK_FALSE;
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -455,43 +459,94 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		buffer.DynamicState().SetDepthBias(vk_buffer, constant_factor, poly_offset.clamp,
-		                                   slope_factor);
+		out.depth_bias = {constant_factor, poly_offset.clamp, slope_factor};
 	}
 
-	auto& dynamic_state = buffer.DynamicState();
 	// Every pipeline declares the stencil op, masks and reference dynamic, and Vulkan requires
 	// each declared dynamic state to be set in the command buffer before a draw even when the
 	// stencil test is off. With the test disabled the depth info keeps value-initialised faces
 	// (KEEP ops, zero masks), which are inert.
-	dynamic_state.SetStencilTestEnable(vk_buffer, depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
-	const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-		dynamic_state.SetStencilOp(vk_buffer, face, state.failOp, state.passOp, state.depthFailOp,
-		                           state.compareOp);
-		dynamic_state.SetStencilCompareMask(vk_buffer, face, state.compareMask);
-		dynamic_state.SetStencilWriteMask(vk_buffer, face, state.writeMask);
-		dynamic_state.SetStencilReference(vk_buffer, face, state.reference);
+	out.stencil_test_enable = depth.stencil_test_enable ? VK_TRUE : VK_FALSE;
+	const auto stencil_face = [](const vk::StencilOpState& state) {
+		return GraphicsDynamicState::StencilFace {
+		    .fail_op       = state.failOp,
+		    .pass_op       = state.passOp,
+		    .depth_fail_op = state.depthFailOp,
+		    .compare_op    = state.compareOp,
+		    .compare_mask  = state.compareMask,
+		    .write_mask    = state.writeMask,
+		    .reference     = state.reference,
+		};
 	};
-	set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-	set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+	out.stencil = {stencil_face(depth.stencil_front), stencil_face(depth.stencil_back)};
 
-#if defined(__APPLE__)
+#if !defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
-#else
 	static_assert(RENDER_COLOR_ATTACHMENTS_MAX <= DynamicStateCache::MaxColorAttachments,
 	              "DynamicStateCache stores a full colour-write-enable array per command buffer");
-	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	out.color_write_count = rendering.num_color_attachments;
 	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
-		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
-	}
-	if (rendering.num_color_attachments != 0) {
-		buffer.DynamicState().SetColorWriteEnable(vk_buffer, rendering.num_color_attachments,
-		                                          enable);
-	} else {
-		buffer.DynamicState().ForgetColorWriteEnable();
+		out.color_write_enable[slot] =
+		    rendering.color_attachments[slot].image_view != nullptr ? VK_TRUE : VK_FALSE;
 	}
 #endif
+	out.feedback_loop_dynamic = buffer.GetGraphics().attachment_feedback_loop_enabled;
+	if (out.feedback_loop_dynamic) {
+		out.feedback_aspects = feedback_aspects;
+	}
+}
+
+// Records `state` on `vk_buffer`, going through the buffer's DynamicStateCache for every piece
+// of state it caches.
+static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
+                                     const GraphicsDynamicState& state) {
+	KYTY_PROFILER_FUNCTION();
+
+	auto& cache = buffer.DynamicState();
+	cache.SetViewportWithCount(vk_buffer, state.viewport_count, state.viewports.data());
+	cache.SetScissorWithCount(vk_buffer, state.viewport_count, state.scissors.data());
+	cache.SetLineWidth(vk_buffer, state.line_width);
+	cache.SetBlendConstants(vk_buffer, state.blend_constants.data());
+	cache.SetDepthTestEnable(vk_buffer, state.depth_test_enable);
+	cache.SetDepthWriteEnable(vk_buffer, state.depth_write_enable);
+	cache.SetDepthCompareOp(vk_buffer, state.depth_compare_op);
+	cache.SetDepthBoundsTestEnable(vk_buffer, state.depth_bounds_test_enable);
+#if !defined(__APPLE__)
+	cache.SetDepthBounds(vk_buffer, state.depth_bounds[0], state.depth_bounds[1]);
+#endif
+	cache.SetCullMode(vk_buffer, state.cull_mode);
+	cache.SetFrontFace(vk_buffer, state.front_face);
+	if (state.input_assembly) {
+		vk_buffer.setPrimitiveTopology(state.topology);
+		vk_buffer.setPrimitiveRestartEnable(state.primitive_restart ? VK_TRUE : VK_FALSE);
+	}
+	cache.SetDepthBiasEnable(vk_buffer, state.depth_bias_enable);
+	if (state.depth_bias_enable != VK_FALSE) {
+		cache.SetDepthBias(vk_buffer, state.depth_bias[0], state.depth_bias[1],
+		                   state.depth_bias[2]);
+	}
+	cache.SetStencilTestEnable(vk_buffer, state.stencil_test_enable);
+	const auto faces = std::array {vk::StencilFaceFlagBits::eFront, vk::StencilFaceFlagBits::eBack};
+	for (size_t face = 0; face < faces.size(); face++) {
+		const auto& stencil = state.stencil[face];
+		cache.SetStencilOp(vk_buffer, faces[face], stencil.fail_op, stencil.pass_op,
+		                   stencil.depth_fail_op, stencil.compare_op);
+		cache.SetStencilCompareMask(vk_buffer, faces[face], stencil.compare_mask);
+		cache.SetStencilWriteMask(vk_buffer, faces[face], stencil.write_mask);
+		cache.SetStencilReference(vk_buffer, faces[face], stencil.reference);
+	}
+#if !defined(__APPLE__)
+	if (state.color_write_count != 0) {
+		cache.SetColorWriteEnable(vk_buffer, state.color_write_count,
+		                          state.color_write_enable.data());
+	} else {
+		cache.ForgetColorWriteEnable();
+	}
+#endif
+	if (state.feedback_loop_dynamic) {
+		cache.SetAttachmentFeedbackLoopEnable(vk_buffer, state.feedback_aspects);
+	}
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
@@ -553,11 +608,31 @@ struct DrawRenderState {
 // A DrawRenderState is tens of kilobytes, nearly all of it arrays that only matter up to their
 // counts; value-initialising one per draw showed up as memset in the command processor profile.
 // Each thread keeps one and resets only what the next draw reads. Draws never nest, so one per
-// thread is enough.
-static DrawRenderState& AcquireDrawRenderState() {
+// thread is enough. Between draws it holds the previous draw's state, which a draw that reuses
+// that draw's render state keeps (KeepDrawRenderState()).
+static DrawRenderState& DrawRenderStateStorage() {
 	thread_local auto state = std::make_unique<DrawRenderState>();
-	state->Reset();
 	return *state;
+}
+
+static DrawRenderState& AcquireDrawRenderState() {
+	auto& state = DrawRenderStateStorage();
+	state.Reset();
+	return state;
+}
+
+// The previous draw's state with only the render-state discovery result kept: the colour and
+// depth targets and pixel-stage activity, which depend on registers the draw-state tracker
+// vouched for. The stage inputs and programs are recomputed by RefreshShaders(); every vertex
+// stage is reset, as in Reset().
+static DrawRenderState& KeepDrawRenderState() {
+	auto& state = DrawRenderStateStorage();
+	for (auto& stage: state.vertex_info) {
+		stage.ResetKeepingArrays();
+	}
+	state.ps_input_info = {};
+	state.programs      = {};
+	return state;
 }
 
 struct DrawCallInfo {
@@ -571,6 +646,96 @@ struct DrawCallInfo {
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
+
+// Draw-state reuse (drawReuse.h) is on unless KYTY_DRAW_REUSE=0. Read once.
+static bool DrawReuseEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_DRAW_REUSE_ORACLE=1: every draw that reuses state also runs the steps it skipped and
+// compares the results (OracleConfirmsRenderState(), OracleConfirmsReusedPipeline()). Read once.
+static bool DrawReuseOracleEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_REUSE_ORACLE");
+		return DrawReuseEnabled() && value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// A Vulkan handle as an integer, for identity comparisons.
+template <typename Handle>
+static uint64_t HandleBits(Handle handle) {
+	using Native      = typename Handle::CType;
+	const auto native = static_cast<Native>(handle);
+	if constexpr (std::is_pointer_v<Native>) {
+		return reinterpret_cast<uint64_t>(native);
+	} else {
+		return static_cast<uint64_t>(native);
+	}
+}
+
+static DrawRecordingPosition CurrentRecordingPosition(const CommandBuffer& buffer) {
+	const auto& scheduler = buffer.GetContext().GetCommandScheduler();
+	return {
+	    .tick                        = scheduler.CurrentTick(),
+	    .command_buffer              = HandleBits(buffer.PeekHandle()),
+	    .render_pass_epoch           = buffer.RenderPassEpoch(),
+	    .rendering                   = buffer.IsRendering(),
+	    .dynamic_state_invalidations = buffer.DynamicStateInvalidations(),
+	    .deferred_operations         = scheduler.DeferredOperationsRun(),
+	};
+}
+
+// Read before render-state discovery runs, so `texture_generation` is the generation discovery
+// looked images up at.
+static DrawReuseInputs CurrentDrawReuseInputs(const CommandBuffer& buffer, bool indexed,
+                                              uint32_t index_type_and_size,
+                                              uint32_t render_target_slice_offset) {
+	const auto& shaders = buffer.GetShaders();
+	return {
+	    .position                   = CurrentRecordingPosition(buffer),
+	    .kept_state                 = &DrawRenderStateStorage(),
+	    .texture_generation         = buffer.GetContext().GetTextureCache().Generation(),
+	    .es_address                 = shaders.GetVs().es_regs.data_addr,
+	    .gs_address                 = shaders.GetVs().gs_regs.data_addr,
+	    .ls_address                 = shaders.GetVs().ls_regs.data_addr,
+	    .hs_address                 = shaders.GetVs().hs_regs.data_addr,
+	    .ps_address                 = shaders.GetPs().ps_regs.data_addr,
+	    .render_target_slice_offset = render_target_slice_offset,
+	    .indexed                    = indexed,
+	    .index_type_and_size        = indexed ? index_type_and_size : 0u,
+	};
+}
+
+// Draw-state reuse for one draw: what the next draw compares against once this one is fully
+// recorded, and the previous draw when this one kept its render state.
+struct DrawReuseRequest {
+	DrawReuseInputs        inputs;
+	const DrawReuseRecord* previous = nullptr;
+};
+
+// The programs RefreshShaders() selected for `state`: every vertex stage the draw runs (three for
+// a tessellation draw) and the pixel stage when it is active.
+static DrawPrograms CurrentDrawPrograms(const DrawRenderState& state) {
+	DrawPrograms programs {};
+	static_assert(DrawPrograms::MaxVertexStages == std::tuple_size_v<decltype(state.vertex_info)>);
+	for (uint32_t i = 0; i < state.programs.VertexStageCount(); i++) {
+		programs.vertex_programs[i] = state.vertex_info[i].stage.program;
+		programs.vertex_ids[i]      = state.programs.vertex[i].id;
+		programs.vertex_modules[i]  = HandleBits(state.programs.vertex[i].module);
+	}
+	programs.ps_active = state.ps_active;
+	if (state.ps_active) {
+		programs.ps_program = state.ps_input_info.stage.program;
+		programs.ps_id      = state.programs.pixel.id;
+		programs.ps_module  = HandleBits(state.programs.pixel.module);
+	}
+	return programs;
+}
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
@@ -1523,11 +1688,78 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// What PipelineCache::GetGraphicsPipeline() and ResolveGraphicsDynamicState() take from the draw
+// rather than from the registers or the render targets; see DrawPipelineFeed. The vertex-input
+// half is built exactly as GetGraphicsPipeline() builds GraphicsPipelineKey::vertex_input, from
+// the first vertex stage.
+static void BuildDrawPipelineFeed(const DrawRenderState& state, vk::PrimitiveTopology topology,
+                                  bool primitive_restart_enable, DrawPipelineFeed& feed) {
+	const auto& vs         = state.vertex_info[0];
+	feed.programs          = CurrentDrawPrograms(state);
+	feed.topology          = static_cast<uint32_t>(topology);
+	feed.primitive_restart = primitive_restart_enable;
+	if (state.ps_active) {
+		feed.ps_sample_shading = state.ps_input_info.ps_sample_shading;
+	}
+	if (vs.stage.program == nullptr || vs.stage.program->stage == ShaderType::Mesh ||
+	    vs.stage.program->info.gpu_vertex_fetch || vs.buffers_num < 0 ||
+	    vs.buffers_num > ShaderVertexInputInfo::RES_MAX || vs.resources_num < 0 ||
+	    vs.resources_num > ShaderVertexInputInfo::RES_MAX) {
+		// No fixed-function vertex input, or one GetGraphicsPipeline() rejects outright.
+		return;
+	}
+	auto& input           = feed.vertex_input;
+	input.binding_count   = static_cast<uint8_t>(vs.buffers_num);
+	input.attribute_count = static_cast<uint8_t>(vs.resources_num);
+	for (int binding = 0; binding < vs.buffers_num; binding++) {
+		const auto& buffer      = vs.buffers[binding];
+		input.bindings[binding] = {.stride = buffer.stride, .instance = buffer.fetch_index != 0};
+		for (int attribute = 0;
+		     attribute < buffer.attr_num && attribute < ShaderVertexInputBuffer::ATTR_MAX;
+		     attribute++) {
+			const auto index = buffer.attr_indices[attribute];
+			if (index >= 0 && index < vs.resources_num) {
+				input.attributes[index] = {
+				    .offset  = buffer.attr_offsets[attribute],
+				    .binding = static_cast<uint8_t>(binding),
+				};
+			}
+		}
+	}
+}
+
+// Whether a draw whose target acquisition resolves to `expected` may keep recording into the pass
+// begun with `current`. They must agree on everything except that the open pass may have begun by
+// clearing an attachment the draw would load, which leaves the same contents (see
+// TextureCache::TargetAcquisitionRepeats()).
+static bool RenderPassContinues(const RenderState& current, RenderState expected) {
+	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+		const auto& open  = current.color_attachments[i];
+		auto&       wants = expected.color_attachments[i];
+		if (open.is_clear && !wants.is_clear) {
+			wants.is_clear    = true;
+			wants.clear_value = open.clear_value;
+		}
+	}
+	const auto& open  = current.depth_stencil_attachment;
+	auto&       wants = expected.depth_stencil_attachment;
+	if (open.depth_clear && !wants.depth_clear) {
+		wants.depth_clear    = true;
+		wants.clear_value[0] = open.clear_value[0];
+	}
+	if (open.stencil_clear && !wants.stencil_clear) {
+		wants.stencil_clear  = true;
+		wants.clear_value[1] = open.clear_value[1];
+	}
+	return current == expected;
+}
+
 bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
-	                                     bool primitive_restart_enable) {
+                                         bool primitive_restart_enable,
+                                         const DrawReuseRequest* reuse) {
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1655,17 +1887,47 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			mesh_draw_block_address = stream.BufferDeviceAddress() + offset;
 		}
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "CreatePipeline");
+	// Only a direct, non-mesh draw with guest-memory indices is recorded for the next draw to
+	// reuse; mesh draws and host-expanded indices take the full path every time.
+	const bool reuse_tracked = reuse != nullptr && !mesh_active && draw.indirect == nullptr &&
+	                           index_source.host_data == nullptr;
+	DrawPipelineFeed feed {};
+	if (reuse_tracked) {
+		BuildDrawPipelineFeed(state, topology, primitive_restart_enable, feed);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
-	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	// Non-null when this draw keeps the previous draw's render targets, pipeline, dynamic state
+	// and render pass, and records only its bindings and the draw itself.
+	PipelineCache::Pipeline* reused_pipeline = nullptr;
+	if (reuse_tracked && reuse->previous != nullptr) {
+		reused_pipeline = ReusableDrawPipeline(buffer, state, *reuse->previous, feed);
+	}
+	RenderState              rendering {};
+	vk::ImageAspectFlags     feedback_aspects;
+	PipelineCache::Pipeline* pipeline_found = reused_pipeline;
+	// AcquireRenderTargets() unbinds a depth target whose extent differs from the colour targets'
+	// after the pipeline was looked up with it. The state then no longer holds what the lookup
+	// saw, so such a draw is not recorded for the next one to keep.
+	bool depth_dropped = false;
+	if (reused_pipeline == nullptr || DrawReuseOracleEnabled()) {
+		if (draw.IsIndexed()) {
+			LogDrawPhase(draw.Name(), "CreatePipeline");
+		}
+		pipeline_found = &m_context.GetPipelineCache().GetGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
+		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+		    primitive_restart_enable, state.programs);
+		const bool had_depth = static_cast<bool>(state.depth_info.image_id);
+		rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+		                                 state.depth_info, feedback_aspects, stages);
+		depth_dropped = had_depth && !state.depth_info.image_id;
+		if (reused_pipeline != nullptr &&
+		    !OracleConfirmsReusedPipeline(buffer, state, *reuse->previous, rendering,
+		                                  feedback_aspects, *pipeline_found, *reused_pipeline,
+		                                  topology, primitive_restart_enable)) {
+			reused_pipeline = nullptr;
+		}
+	}
+	auto& pipeline = *pipeline_found;
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1694,10 +1956,16 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering,
-	                         topology, primitive_restart_enable, mesh_active);
-	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-		buffer.DynamicState().SetAttachmentFeedbackLoopEnable(vk_buffer, feedback_aspects);
+	if (reused_pipeline == nullptr) {
+		GraphicsDynamicState dynamic_state {};
+		ResolveGraphicsDynamicState(buffer, vertex_stages.back(), state.depth_info, rendering,
+		                            feedback_aspects, topology, primitive_restart_enable,
+		                            mesh_active, dynamic_state);
+		SetGraphicsDynamicParams(buffer, vk_buffer, dynamic_state);
+		if (DrawReuseOracleEnabled()) {
+			m_draw_reuse_oracle.recorded_dynamic_state       = dynamic_state;
+			m_draw_reuse_oracle.recorded_dynamic_state_known = true;
+		}
 	}
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
@@ -1719,8 +1987,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EmitIndirectArgsBarrier(vk_buffer, indirect_binding);
 		}
 	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	if (reused_pipeline == nullptr) {
+		m_context.GetCommandScheduler().BeginRendering(rendering);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
@@ -1759,6 +2029,12 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
+	// A draw whose shaders write memory ended the pass above; the next draw begins a new one.
+	if (reuse_tracked && !depth_dropped && buffer.IsRendering()) {
+		auto inputs     = reuse->inputs;
+		inputs.position = CurrentRecordingPosition(buffer);
+		m_draw_reuse.Store(inputs, feed, &pipeline);
+	}
 	return true;
 }
 
@@ -1780,6 +2056,206 @@ static void ResolveIndexEncoding(uint32_t index_type_and_size, DrawIndexBufferSo
 			break;
 		default: EXIT("unknown index_type_and_size: %u\n", index_type_and_size);
 	}
+}
+
+bool RenderExecutor::KeepDrawTargets(const DrawRenderState& state) {
+	auto&      cache = m_context.GetTextureCache();
+	const auto live  = [&cache](ImageId id) {
+		const auto* image = cache.m_slot_images.try_get(id);
+		return image != nullptr && image->registered && !image->binding.needs_rebind;
+	};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (!live(state.color_info[i].image_id)) {
+			return false;
+		}
+	}
+	if (state.depth_info.image_id && !live(state.depth_info.image_id)) {
+		return false;
+	}
+	// What discovery still does per draw when its memo hits (ResolveRenderColorTarget(),
+	// ResolveRenderDepthTarget()): the LRU touch and access tick, and marking the image a target
+	// of this draw, so a texture-cache change during resource preparation flags it for rebinding.
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		cache.NoteImageReuse(state.color_info[i].image_id);
+		BindRenderTarget(state.color_info[i].image_id);
+	}
+	if (state.depth_info.image_id) {
+		cache.NoteImageReuse(state.depth_info.image_id);
+		BindRenderTarget(state.depth_info.image_id);
+	}
+	return true;
+}
+
+// Keeping the previous draw's state skips the target half of PrepareDrawRenderState(), which
+// beyond resolving the targets from the registers can
+//  - skip a draw with no target and no active pixel shader,
+//  - look an image up afresh on a memo miss, or deny an image its render scale.
+// None of these can happen to a kept draw: the registers are unchanged, so the previous draw --
+// which was recorded, so was not skipped -- saw the same answers; an image lookup answers the same
+// way while the texture-cache generation DrawReuseInputs compares is unchanged, and a scale denial
+// moves that generation. The colour slots discovery resolves are the pixel program's MRT outputs,
+// so the programs are selected again (RefreshShaders()) and must be the previous draw's; the same
+// programs were not dropped for the previous draw either (DrawHasDroppedProgram()). What discovery
+// does per draw on a memo hit is replayed by KeepDrawTargets().
+DrawRenderState& RenderExecutor::SelectDrawRenderState(bool& keep, CommandBuffer& buffer,
+                                                       const DrawCallInfo&    draw,
+                                                       uint32_t               render_target_slice_offset,
+                                                       const DrawReuseRecord& previous) {
+	if (keep) {
+		auto& state = KeepDrawRenderState();
+		RefreshShaders(buffer, draw, state);
+		if (previous.KeepsPrograms(CurrentDrawPrograms(state)) && KeepDrawTargets(state) &&
+		    (!DrawReuseOracleEnabled() ||
+		     OracleConfirmsRenderState(buffer, draw, render_target_slice_offset, state))) {
+			return state;
+		}
+		keep = false;
+	}
+	return AcquireDrawRenderState();
+}
+
+PipelineCache::Pipeline* RenderExecutor::ReusableDrawPipeline(const CommandBuffer&    buffer,
+                                                              const DrawRenderState&  state,
+                                                              const DrawReuseRecord&  previous,
+                                                              const DrawPipelineFeed& feed) {
+	// Pixel-stage images resolved afresh this draw may include one of the targets, whose
+	// attachment layout and feedback handling then have to be decided again.
+	if (state.ps_active && !m_pixel_bindings_reused) {
+		return nullptr;
+	}
+	auto& cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto& color = state.color_info[i];
+		if (!cache.TargetAcquisitionRepeats(color.image_id, color.desc)) {
+			return nullptr;
+		}
+	}
+	if (state.depth_info.image_id &&
+	    !cache.TargetAcquisitionRepeats(state.depth_info.image_id, state.depth_info.desc)) {
+		return nullptr;
+	}
+	// Resource preparation may have ended the pass (an upload, a CommandBuffer::RequestFullBarrier
+	// from a queued flush) or restarted the command buffer since the draw started.
+	return previous.ReusablePipeline(CurrentRecordingPosition(buffer), feed);
+}
+
+void RenderExecutor::LogDrawReuseOracleSummary() {
+	if (m_draw_reuse_oracle.SummaryDue()) {
+		LOGF("DRAWREUSE-ORACLE checked=%" PRIu64 " mismatches=%" PRIu64 "\n",
+		     m_draw_reuse_oracle.Checked(), m_draw_reuse_oracle.Mismatches());
+	}
+}
+
+bool RenderExecutor::OracleConfirmsRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                               uint32_t               render_target_slice_offset,
+                                               const DrawRenderState& kept) {
+	// A second per-thread state, like DrawRenderStateStorage(), so the kept one stays untouched.
+	thread_local auto scratch_storage = std::make_unique<DrawRenderState>();
+	auto&             scratch         = *scratch_storage;
+	scratch.Reset();
+	m_draw_reuse_oracle.NoteChecked();
+	const bool prepared = PrepareDrawRenderState(buffer, draw, render_target_slice_offset, scratch);
+
+	const auto same_view = [](const ImageViewInfo& a, const ImageViewInfo& b) {
+		return a.base_level == b.base_level && a.level_count == b.level_count &&
+		       a.base_layer == b.base_layer && a.layer_count == b.layer_count &&
+		       a.format == b.format;
+	};
+	const auto same_extent = [](vk::Extent2D a, vk::Extent2D b) {
+		return a.width == b.width && a.height == b.height;
+	};
+	char what[192] {};
+	if (!prepared) {
+		std::snprintf(what, sizeof(what), "discovery would skip the draw");
+	} else if (scratch.ps_active != kept.ps_active) {
+		std::snprintf(what, sizeof(what), "ps_active %d, kept %d", scratch.ps_active ? 1 : 0,
+		              kept.ps_active ? 1 : 0);
+	} else if (scratch.color_count != kept.color_count) {
+		std::snprintf(what, sizeof(what), "color_count %u, kept %u", scratch.color_count,
+		              kept.color_count);
+	}
+	for (uint32_t i = 0; what[0] == 0 && i < kept.color_count; i++) {
+		const auto& a = scratch.color_info[i];
+		const auto& b = kept.color_info[i];
+		if (a.image_id != b.image_id || !same_view(a.desc.view_info, b.desc.view_info) ||
+		    !same_extent(a.Extent(), b.Extent()) || a.target_slot != b.target_slot ||
+		    a.export_mapping.packed != b.export_mapping.packed) {
+			std::snprintf(what, sizeof(what),
+			              "color %u: image %u/%u slot %u, kept image %u/%u slot %u", i,
+			              a.image_id.index, a.image_id.generation, a.target_slot,
+			              b.image_id.index, b.image_id.generation, b.target_slot);
+		}
+	}
+	if (what[0] == 0) {
+		const auto& a = scratch.depth_info;
+		const auto& b = kept.depth_info;
+		// A draw whose depth target AcquireRenderTargets() dropped is never kept (see
+		// ExecutePreparedDraw()), so the kept depth target is discovery's.
+		const bool same_image =
+		    a.image_id == b.image_id &&
+		    (!a.image_id ||
+		     (same_view(a.desc.view_info, b.desc.view_info) && same_extent(a.Extent(), b.Extent())));
+		if (!same_image) {
+			std::snprintf(what, sizeof(what), "depth: image %u/%u, kept image %u/%u",
+			              a.image_id.index, a.image_id.generation, b.image_id.index,
+			              b.image_id.generation);
+		} else if (a.depth_test_enable != b.depth_test_enable ||
+		           a.depth_write_enable != b.depth_write_enable ||
+		           a.depth_compare_op != b.depth_compare_op ||
+		           a.depth_bounds_test_enable != b.depth_bounds_test_enable ||
+		           a.depth_clear_enable != b.depth_clear_enable ||
+		           a.stencil_test_enable != b.stencil_test_enable ||
+		           a.stencil_clear_enable != b.stencil_clear_enable) {
+			std::snprintf(what, sizeof(what), "depth/stencil register state differs");
+		}
+	}
+	if (what[0] != 0 && m_draw_reuse_oracle.NoteMismatch()) {
+		LOGF("DRAWREUSE-ORACLE mismatch: %s: kept render targets: %s\n", draw.Name(), what);
+	}
+	return what[0] == 0;
+}
+
+bool RenderExecutor::OracleConfirmsReusedPipeline(
+    const CommandBuffer& buffer, const DrawRenderState& state, const DrawReuseRecord& previous,
+    const RenderState& rendering, vk::ImageAspectFlags feedback_aspects,
+    const PipelineCache::Pipeline& expected, const PipelineCache::Pipeline& reused,
+    vk::PrimitiveTopology topology, bool primitive_restart_enable) {
+	m_draw_reuse_oracle.NoteChecked();
+	const auto& current = buffer.CurrentRenderState();
+	char        what[192] {};
+	if (!(CurrentRecordingPosition(buffer) == previous.Inputs().position)) {
+		std::snprintf(what, sizeof(what),
+		              "acquiring the targets ended the pass or restarted the buffer");
+	} else if (!RenderPassContinues(current, rendering)) {
+		std::snprintf(what, sizeof(what),
+		              "render pass: %ux%ux%u colors=%u depth_layout=%u depth_clear=%d, open "
+		              "%ux%ux%u colors=%u depth_layout=%u depth_clear=%d",
+		              rendering.width, rendering.height, rendering.num_layers,
+		              rendering.num_color_attachments,
+		              static_cast<uint32_t>(rendering.depth_stencil_attachment.image_layout),
+		              rendering.depth_stencil_attachment.depth_clear ? 1 : 0, current.width,
+		              current.height, current.num_layers, current.num_color_attachments,
+		              static_cast<uint32_t>(current.depth_stencil_attachment.image_layout),
+		              current.depth_stencil_attachment.depth_clear ? 1 : 0);
+	} else if (&expected != &reused) {
+		std::snprintf(what, sizeof(what), "pipeline %p, kept %p (vs=%016" PRIx64 " ps=%016" PRIx64 ")",
+		              static_cast<const void*>(&expected), static_cast<const void*>(&reused),
+		              state.programs.vertex[0].id, state.ps_active ? state.programs.pixel.id : 0u);
+	} else {
+		GraphicsDynamicState dynamic_state {};
+		const auto& last_vertex_stage = state.vertex_info[state.programs.VertexStageCount() - 1];
+		ResolveGraphicsDynamicState(buffer, last_vertex_stage, state.depth_info, rendering,
+		                            feedback_aspects, topology, primitive_restart_enable, false,
+		                            dynamic_state);
+		if (!m_draw_reuse_oracle.recorded_dynamic_state_known ||
+		    !(dynamic_state == m_draw_reuse_oracle.recorded_dynamic_state)) {
+			std::snprintf(what, sizeof(what), "dynamic state differs from the recorded one");
+		}
+	}
+	if (what[0] != 0 && m_draw_reuse_oracle.NoteMismatch()) {
+		LOGF("DRAWREUSE-ORACLE mismatch: kept pipeline and render pass: %s\n", what);
+	}
+	return what[0] == 0;
 }
 
 const char* IndirectDrawSupportName(IndirectDrawSupport support) {
@@ -1856,10 +2332,23 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
+	const bool pm4_state_unchanged = m_draw_state_tracker.TakeDrawVerdict();
 	// An indirect draw carries no host-side counts: `index_count` is the bound index range and
 	// `instance_count` is unused.
 	if (args.indirect == nullptr && (args.index_count == 0 || args.instance_count == 0)) {
 		return true;
+	}
+	// Whatever happens to this draw, the next one may only reuse what it fully recorded.
+	const auto       previous_draw = m_draw_reuse.Take();
+	if (DrawReuseOracleEnabled()) {
+		LogDrawReuseOracleSummary();
+	}
+	DrawReuseRequest reuse {};
+	const bool       reuse_tracked = DrawReuseEnabled() && args.indirect == nullptr &&
+	                           args.offset_source == DrawOffsetSource::DrawState;
+	if (reuse_tracked) {
+		reuse.inputs = CurrentDrawReuseInputs(buffer, true, args.index_type_and_size,
+		                                      args.render_target_slice_offset);
 	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
@@ -1918,8 +2407,15 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance, args.indirect};
-	auto& state = AcquireDrawRenderState();
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	// 8-bit indices are widened on the host into a transient buffer every draw; such a draw is
+	// never recorded for reuse, and never reuses.
+	bool keep_render_state = reuse_tracked && pm4_state_unchanged &&
+	                         index_source.guest_element_size != 1 &&
+	                         previous_draw.KeepsRenderState(reuse.inputs);
+	auto& state = SelectDrawRenderState(keep_render_state, buffer, draw,
+	                                    args.render_target_slice_offset, previous_draw);
+	if (!keep_render_state &&
+	    !PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return true;
 	}
@@ -1936,8 +2432,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
 
+	reuse.previous      = keep_render_state ? &previous_draw : nullptr;
 	const bool recorded = ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit,
-	                                          index_source, primitive_restart);
+	                                          index_source, primitive_restart,
+	                                          reuse_tracked ? &reuse : nullptr);
 	ResetBindings();
 	return recorded;
 }
@@ -1957,9 +2455,21 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
+	const bool pm4_state_unchanged = m_draw_state_tracker.TakeDrawVerdict();
 	// An indirect draw carries no host-side counts; they come from the argument block.
 	if (args.indirect == nullptr && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
+	}
+	// Whatever happens to this draw, the next one may only reuse what it fully recorded.
+	const auto       previous_draw = m_draw_reuse.Take();
+	if (DrawReuseOracleEnabled()) {
+		LogDrawReuseOracleSummary();
+	}
+	DrawReuseRequest reuse {};
+	const bool       reuse_tracked = DrawReuseEnabled() && args.indirect == nullptr &&
+	                           args.offset_source == DrawOffsetSource::DrawState;
+	if (reuse_tracked) {
+		reuse.inputs = CurrentDrawReuseInputs(buffer, false, 0, args.render_target_slice_offset);
 	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
@@ -1997,8 +2507,12 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return true;
 	}
-	auto& state = AcquireDrawRenderState();
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	bool keep_render_state =
+	    reuse_tracked && pm4_state_unchanged && previous_draw.KeepsRenderState(reuse.inputs);
+	auto& state = SelectDrawRenderState(keep_render_state, buffer, draw,
+	                                    args.render_target_slice_offset, previous_draw);
+	if (!keep_render_state &&
+	    !PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return true;
 	}
@@ -2028,8 +2542,9 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_instance = instance_offset;
 
 	DrawIndexBufferSource index_source {};
-	const bool            recorded =
-	    ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
+	reuse.previous      = keep_render_state ? &previous_draw : nullptr;
+	const bool recorded = ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit,
+	                                          index_source, false, reuse_tracked ? &reuse : nullptr);
 	ResetBindings();
 	return recorded;
 }

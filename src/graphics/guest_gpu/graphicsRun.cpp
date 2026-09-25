@@ -100,6 +100,12 @@ private:
 	Common::Mutex& m_mutex;
 };
 
+// Work on the GPU thread outside the PM4 packet stream can change register or renderer state
+// behind the draw-state tracker's back: the next draw must not reuse the previous draw's state.
+static void InvalidateDrawState(RenderContext& renderer, DrawStateTracker::Event event) {
+	renderer.GetRenderExecutor().GetDrawStateTracker().NoteEvent(event);
+}
+
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -141,6 +147,7 @@ bool GuestGpu::IsStopping() {
 void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
+		InvalidateDrawState(m_renderer, DrawStateTracker::Event::QueuedCommand);
 		command();
 		return;
 	}
@@ -165,6 +172,7 @@ void GuestGpu::ProcessCommands(CommandProcessor* processor) {
 		if (processor != nullptr) {
 			processor->FlushPendingReleaseMem();
 		}
+		InvalidateDrawState(m_renderer, DrawStateTracker::Event::QueuedCommand);
 		command();
 	}
 }
@@ -172,6 +180,7 @@ void GuestGpu::ProcessCommands(CommandProcessor* processor) {
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
+		InvalidateDrawState(m_renderer, DrawStateTracker::Event::QueuedCommand);
 		command();
 		return;
 	}
@@ -254,6 +263,7 @@ CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 }
 
 void CommandProcessor::Reset() {
+	InvalidateDrawState(m_renderer, DrawStateTracker::Event::ProcessorReset);
 	m_sh_ctx.Reset();
 	m_ucfg.Reset();
 	m_ctx.Reset();
@@ -297,6 +307,7 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	InvalidateDrawState(m_renderer, DrawStateTracker::Event::Flush);
 	m_release_mem_batch.Reset();
 	GetScheduler().Flush();
 }
@@ -321,11 +332,13 @@ void CommandProcessor::FlushPendingReleaseMem() {
 }
 
 void CommandProcessor::BufferFlushAndWait() {
+	InvalidateDrawState(m_renderer, DrawStateTracker::Event::Flush);
 	m_release_mem_batch.Reset();
 	GetScheduler().FlushAndWait();
 }
 
 void CommandProcessor::BufferWait() {
+	InvalidateDrawState(m_renderer, DrawStateTracker::Event::Flush);
 	BufferInit();
 	GetScheduler().Finish();
 }
@@ -583,6 +596,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			InvalidateDrawState(gpu->m_renderer, DrawStateTracker::Event::QueuedCommand);
 			command();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -618,6 +632,9 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto& cp = GetProcessor(submission.queue_id);
+	// Every slice of every submission starts the comparison afresh: a slice may follow other
+	// queues' work or commands the tracker did not see.
+	InvalidateDrawState(m_renderer, DrawStateTracker::Event::SubmissionSlice);
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -661,10 +678,12 @@ bool GuestGpu::Process(Submission& submission) {
 			if (progressed) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
+					InvalidateDrawState(m_renderer, DrawStateTracker::Event::GarbageCollection);
 				}
 				cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
+				InvalidateDrawState(m_renderer, DrawStateTracker::Event::GarbageCollection);
 			}
 			break;
 		}
@@ -687,15 +706,18 @@ bool GuestGpu::Process(Submission& submission) {
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
+					InvalidateDrawState(m_renderer, DrawStateTracker::Event::GarbageCollection);
 				}
 				cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
+				InvalidateDrawState(m_renderer, DrawStateTracker::Event::GarbageCollection);
 			}
 			break;
 		}
 		case SubmissionType::FlipPreparation:
 			m_renderer.RunGarbageCollector();
+			InvalidateDrawState(m_renderer, DrawStateTracker::Event::GarbageCollection);
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 	}
@@ -729,6 +751,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
+	InvalidateDrawState(m_renderer, DrawStateTracker::Event::SubmissionSlice);
 	ProcessPm4(execution);
 	FlushPendingReleaseMem();
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
@@ -748,6 +771,7 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	auto& draw_state = m_renderer.GetRenderExecutor().GetDrawStateTracker();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands(this);
@@ -825,6 +849,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		draw_state.NotePacket(packet);
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
@@ -1670,6 +1695,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
+	InvalidateDrawState(m_renderer, DrawStateTracker::Event::FlipPreparation);
 	if (g_current_processor != nullptr) {
 		EXIT("invalid graphics-thread CPU flip preparation\n");
 	}
@@ -1685,6 +1711,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 void CommandProcessor::SynchronizeGpu() {
+	InvalidateDrawState(m_renderer, DrawStateTracker::Event::Flush);
 	GetScheduler().Finish();
 }
 
