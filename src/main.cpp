@@ -17,8 +17,35 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 
+#if defined(KYTY_PGO_GENERATE)
+#include <chrono>
+#include <thread>
+#endif
+
 using namespace Common;
 using namespace Emulator;
+
+#if defined(KYTY_PGO_GENERATE)
+// Instrumented PGO builds only (KYTY_PGO=GENERATE). The compiler-rt profile runtime writes its
+// counters at exit(), but benches and training runs stop the emulator with a signal, which would
+// leave no profile at all. A detached thread rewrites the whole profile every few seconds instead.
+// The file name must not contain %m: without merge mode each write replaces the previous snapshot,
+// so the counts stay cumulative and are never added twice.
+extern "C" int  __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_set_filename(const char* name);
+
+static void StartProfileDumpThread() {
+	if (std::getenv("LLVM_PROFILE_FILE") == nullptr) {
+		__llvm_profile_set_filename("kyty-%p.profraw");
+	}
+	std::thread([] {
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(10));
+			__llvm_profile_write_file();
+		}
+	}).detach();
+}
+#endif
 
 static std::string GetBuildString() {
 	Date date = Date::FromMacros(std::string(__DATE__));
@@ -545,6 +572,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+#if defined(KYTY_PGO_GENERATE)
+	StartProfileDumpThread();
+#endif
 	VirtualMemory::Init();
 	InitializeThreads();
 

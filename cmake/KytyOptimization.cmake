@@ -1,4 +1,4 @@
-# Release-performance switches: target ISA, floating-point contraction, ThinLTO.
+# Release-performance switches: target ISA, floating-point contraction, ThinLTO, instrumented PGO.
 #
 # Included from the top-level CMakeLists.txt after config_compiler_and_linker() and before the
 # first add_subdirectory(), so the directory-scoped options below reach every target, including
@@ -8,6 +8,8 @@
 #   KYTY_MARCH        ISA level, e.g. x86-64-v3 (default on x86-64 hosts other than macOS), or
 #                     empty for the compiler's baseline.
 #   KYTY_LTO          ThinLTO for every non-Debug configuration (Clang only).
+#   KYTY_PGO          OFF | GENERATE | USE: instrumented profile-guided optimisation (Clang only).
+#   KYTY_PGO_PROFILE  merged .profdata consumed by KYTY_PGO=USE.
 # Tracy is switched separately by KYTY_TRACY in the top-level CMakeLists.txt.
 
 include_guard(GLOBAL)
@@ -75,4 +77,51 @@ if(KYTY_LTO AND CLANG AND NOT APPLE)
 	endif()
 endif()
 
-message(STATUS "Kyty optimisation: march='${KYTY_MARCH}' lto=${KYTY_LTO}")
+# --- Instrumented PGO -------------------------------------------------------------------------
+# Zen 2 has no LBR, so sampling PGO (AutoFDO/CSSPGO/Propeller) is unavailable; IR instrumentation
+# needs no PMU. GENERATE builds a counting binary that writes kyty-<pid>.profraw into the working
+# directory (see the periodic dump in main.cpp: benches kill the emulator, so the at-exit write
+# never happens). Merge the files with llvm-profdata and rebuild with KYTY_PGO=USE.
+# Profiles are toolchain- and ABI-specific: the Windows (clang-cl) build needs its own training run.
+set(KYTY_PGO "OFF" CACHE STRING "Profile-guided optimisation: OFF, GENERATE or USE (Clang)")
+set_property(CACHE KYTY_PGO PROPERTY STRINGS OFF GENERATE USE)
+set(KYTY_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata file used by KYTY_PGO=USE")
+
+if(NOT KYTY_PGO STREQUAL "OFF")
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_PGO requires Clang")
+	endif()
+	if(KYTY_PGO STREQUAL "GENERATE")
+		kyty_add_driver_compile_option("-fprofile-generate")
+		add_compile_definitions(KYTY_PGO_GENERATE=1)
+		if(KYTY_CLANG_CL)
+			# clang-cl records the profile runtime as a /DEFAULTLIB in each object; lld-link only
+			# needs to be told where compiler-rt lives.
+			execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
+				OUTPUT_VARIABLE KYTY_CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+			# LLVM <= 18 installs it as lib/windows/clang_rt.profile-x86_64.lib, newer releases
+			# use the per-target directory; both names are what clang-cl records.
+			foreach(dir "lib/windows" "lib/x86_64-pc-windows-msvc")
+				if(EXISTS "${KYTY_CLANG_RESOURCE_DIR}/${dir}")
+					add_link_options("/LIBPATH:${KYTY_CLANG_RESOURCE_DIR}/${dir}")
+				endif()
+			endforeach()
+		else()
+			add_link_options("-fprofile-generate")
+		endif()
+	elseif(KYTY_PGO STREQUAL "USE")
+		if(NOT EXISTS "${KYTY_PGO_PROFILE}")
+			message(FATAL_ERROR "KYTY_PGO=USE needs KYTY_PGO_PROFILE pointing at a merged .profdata")
+		endif()
+		kyty_add_driver_compile_option("-fprofile-use=${KYTY_PGO_PROFILE}")
+		# Code that the training run never reached (other titles, error paths) is expected; do not
+		# warn once per function about it.
+		add_compile_options(-Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+		# Ninja does not see the profile as an input; a changed profile needs a clean rebuild.
+		message(STATUS "KYTY_PGO=USE with ${KYTY_PGO_PROFILE} (clean-rebuild after replacing it)")
+	else()
+		message(FATAL_ERROR "KYTY_PGO must be OFF, GENERATE or USE")
+	endif()
+endif()
+
+message(STATUS "Kyty optimisation: march='${KYTY_MARCH}' lto=${KYTY_LTO} pgo=${KYTY_PGO}")
