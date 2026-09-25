@@ -24,6 +24,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -118,6 +119,14 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
 }
 
+bool ShaderProgramMemoOracleEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PROGRAM_MEMO_ORACLE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 static bool ShaderCodeSizeValid(const ShaderMappedData& data) {
 	return data.code_size_bytes != 0 && data.code_size_bytes % sizeof(uint32_t) == 0;
 }
@@ -144,6 +153,13 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 		auto& data = iter->second;
 		if (data.code_hash == 0 && ShaderCodeSizeValid(data)) {
 			data.code_hash = ShaderProgramHash(addr, data);
+		} else if (data.code_hash != 0 && ShaderProgramMemoOracleEnabled()) {
+			if (const auto now = ShaderProgramHash(addr, data); now != data.code_hash) {
+				EXIT("program memo oracle: %s shader=0x%016" PRIx64
+				     " code changed without a new registration: hash 0x%016" PRIx64
+				     " at first use, 0x%016" PRIx64 " now\n",
+				     label, addr, data.code_hash, now);
+			}
 		}
 		return data;
 	}
@@ -1123,6 +1139,80 @@ ShaderParams PrepareProgram(
 	return PreparePixelProgram(regs, sh, target_export_mapping, ps_info, registration);
 }
 
+namespace {
+
+[[noreturn]] void ProgramMemoOracleFail(const char* stage, uint64_t hash, const char* what) {
+	EXIT("program memo oracle: %s hash=0x%016" PRIx64 ": memo and full preparation differ in %s\n",
+	     stage, hash, what);
+}
+
+void CheckPreparedParams(const char* stage, const ShaderParams& memo, const ShaderParams& full) {
+	if (memo.hash != full.hash) {
+		ProgramMemoOracleFail(stage, full.hash, "program hash");
+	}
+	if (memo.code.data() != full.code.data() || memo.code.size() != full.code.size()) {
+		ProgramMemoOracleFail(stage, full.hash, "code");
+	}
+	if (memo.back_code.data() != full.back_code.data() ||
+	    memo.back_code.size() != full.back_code.size()) {
+		ProgramMemoOracleFail(stage, full.hash, "GS back-half code");
+	}
+	if (memo.user_data_count != full.user_data_count || memo.user_data != full.user_data) {
+		ProgramMemoOracleFail(stage, full.hash, "user data");
+	}
+}
+
+template <typename Info>
+void CheckStaticKey(const char* stage, uint64_t hash, const Info& memo, const Info& full) {
+	std::vector<uint32_t> memo_key;
+	std::vector<uint32_t> full_key;
+	BuildStageStaticKey(memo, memo_key);
+	BuildStageStaticKey(full, full_key);
+	if (memo_key != full_key) {
+		ProgramMemoOracleFail(stage, hash, "static key");
+	}
+}
+
+// Beyond the static key: everything the draw consumes per call, including the addresses and
+// record counts the layout comparison deliberately ignores.
+void CheckVertexInputs(uint64_t hash, const ShaderVertexInputInfo& memo,
+                       const ShaderVertexInputInfo& full) {
+	CheckStaticKey("VS", hash, memo, full);
+	if (memo.logical_stage != full.logical_stage) {
+		ProgramMemoOracleFail("VS", hash, "logical stage");
+	}
+	if (memo.fetch_external != full.fetch_external || memo.buffers_num != full.buffers_num) {
+		ProgramMemoOracleFail("VS", hash, "fetch mode or buffer count");
+	}
+	for (int i = 0; i < full.resources_num; i++) {
+		if (!std::equal(std::begin(memo.resources[i].fields), std::end(memo.resources[i].fields),
+		                std::begin(full.resources[i].fields))) {
+			ProgramMemoOracleFail("VS", hash, "attribute V#");
+		}
+	}
+	for (int i = 0; i < full.buffers_num; i++) {
+		const auto& a = memo.buffers[i];
+		const auto& b = full.buffers[i];
+		if (a.addr != b.addr || a.stride != b.stride || a.num_records != b.num_records ||
+		    a.fetch_index != b.fetch_index || a.attr_num != b.attr_num ||
+		    !std::equal(a.attr_indices, a.attr_indices + a.attr_num, b.attr_indices) ||
+		    !std::equal(a.attr_offsets, a.attr_offsets + a.attr_num, b.attr_offsets)) {
+			ProgramMemoOracleFail("VS", hash, "vertex buffer binding");
+		}
+	}
+}
+
+void CheckPixelInputs(uint64_t hash, const ShaderPixelInputInfo& memo,
+                      const ShaderPixelInputInfo& full) {
+	CheckStaticKey("PS", hash, memo, full);
+	if (memo.ps_sample_shading != full.ps_sample_shading ||
+	    memo.ps_execute_on_noop != full.ps_execute_on_noop) {
+		ProgramMemoOracleFail("PS", hash, "sample shading or execute-on-noop");
+	}
+}
+
+} // namespace
+
 VertexProgramMemo::VertexProgramMemo(): m_info(std::make_unique<ShaderVertexInputInfo>()) {}
 
 VertexProgramMemo::~VertexProgramMemo() = default;
@@ -1176,6 +1266,9 @@ ShaderParams VertexProgramMemo::Prepare(const HW::VertexShaderInfo& regs,
 			ShaderSetNggBackUserData(regs, params);
 		}
 		same_program = true;
+		if (ShaderProgramMemoOracleEnabled()) {
+			VerifyAgainstFullPreparation(regs, context, user_config, params, info);
+		}
 		return params;
 	}
 	if (!ShaderFetchVertexInputs(regs.es_regs.data_addr, regs.gs_user_sgpr, m_metadata,
@@ -1188,7 +1281,24 @@ ShaderParams VertexProgramMemo::Prepare(const HW::VertexShaderInfo& regs,
 	if (!same_program) {
 		CopyVertexInputLayout(info, *m_info);
 	}
+	if (ShaderProgramMemoOracleEnabled()) {
+		VerifyAgainstFullPreparation(regs, context, user_config, params, info);
+	}
 	return params;
+}
+
+void VertexProgramMemo::VerifyAgainstFullPreparation(const HW::VertexShaderInfo& regs,
+                                                     const HW::Context&          context,
+                                                     const HW::UserConfig&       user_config,
+                                                     const ShaderParams&         params,
+                                                     const ShaderVertexInputInfo& info) {
+	if (m_oracle_info == nullptr) {
+		m_oracle_info = std::make_unique<ShaderVertexInputInfo>();
+	}
+	VertexProgramSource source;
+	const auto          full = PrepareVertexProgram(regs, context, user_config, *m_oracle_info, source);
+	CheckPreparedParams("VS", params, full);
+	CheckVertexInputs(full.hash, info, *m_oracle_info);
 }
 
 ShaderParams PixelProgramMemo::Prepare(
@@ -1207,6 +1317,14 @@ ShaderParams PixelProgramMemo::Prepare(
 		ShaderSetUserData(
 		    params,
 		    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), 0u);
+		if (ShaderProgramMemoOracleEnabled()) {
+			ShaderPixelInputInfo full_info;
+			uint64_t             registration = 0;
+			const auto           full =
+			    PreparePixelProgram(regs, sh, target_export_mapping, full_info, registration);
+			CheckPreparedParams("PS", params, full);
+			CheckPixelInputs(full.hash, info, full_info);
+		}
 		return params;
 	}
 	uint64_t registration = 0;

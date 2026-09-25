@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -410,15 +411,22 @@ struct PipelineCache::ProgramCache {
 		const bool   from_memo        = memo != nullptr && same_program && memo->entry != nullptr;
 		SourceEntry* source           = from_memo ? memo->entry : nullptr;
 		const size_t memo_permutation = from_memo ? memo->permutation : 0;
-		if (!from_memo) {
+		const bool oracle = from_memo && ShaderProgramMemoOracleEnabled();
+		if (!from_memo || oracle) {
 			lookup_key.stage           = stage;
 			lookup_key.hash            = params.hash;
 			lookup_key.user_data_count = params.user_data_count;
 			lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 			BuildStageStaticKey(input_info, lookup_key.static_state);
-			if (const auto found = programs.find(lookup_key); found != programs.end()) {
-				source = &found->second;
+			const auto  found  = programs.find(lookup_key);
+			auto* const looked = found != programs.end() ? &found->second : nullptr;
+			if (oracle && looked != source) {
+				EXIT("program memo oracle: %s hash=0x%016" PRIx64
+				     ": the program key resolves to a different program-cache entry than the "
+				     "remembered one (static key or program identity changed)\n",
+				     label, params.hash);
 			}
+			source = looked;
 		}
 		// Only a call that resolves a program may leave a memo behind.
 		const auto remember = [&](size_t permutation) {
@@ -458,6 +466,12 @@ struct PipelineCache::ProgramCache {
 			            matches(permutations[memo_permutation])
 			        ? permutations.begin() + static_cast<std::ptrdiff_t>(memo_permutation)
 			        : std::ranges::find_if(permutations, matches);
+			if (oracle && permutation != std::ranges::find_if(permutations, matches)) {
+				EXIT("program memo oracle: %s hash=0x%016" PRIx64
+				     ": the remembered permutation differs from the full search "
+				     "(specialization or push-data layout)\n",
+				     label, params.hash);
+			}
 			if (permutation != permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &source->resources};
@@ -552,6 +566,34 @@ struct PipelineCache::ProgramCache {
 	// Graphics stages only; GetGraphicsPrograms pairs each with the matching PrepareProgram memo.
 	StageMemo                                                   vertex_memo;
 	StageMemo                                                   pixel_memo;
+
+	// Oracle mode only: how often the memos let a draw skip work, logged once per second.
+	struct MemoStats {
+		uint64_t draws           = 0;
+		uint64_t vertex_same     = 0;
+		uint64_t pixel_draws     = 0;
+		uint64_t pixel_same      = 0;
+		uint64_t programs_same   = 0;
+		uint64_t pipelines       = 0;
+		uint64_t pipeline_hits   = 0;
+		std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
+
+		void LogEverySecond() {
+			const auto now = std::chrono::steady_clock::now();
+			if (now - last_log < std::chrono::seconds(1)) {
+				return;
+			}
+			LOGF("program memo: mono_us=%" PRIu64 " draws=%" PRIu64 " vs_same=%" PRIu64
+			     " ps=%" PRIu64 " ps_same=%" PRIu64 " programs_same=%" PRIu64
+			     " pipelines=%" PRIu64 " pipeline_hits=%" PRIu64 "\n",
+			     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                               now.time_since_epoch())
+			                               .count()),
+			     draws, vertex_same, pixel_draws, pixel_same, programs_same, pipelines,
+			     pipeline_hits);
+			*this = {};
+		}
+	} memo_stats;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
@@ -947,6 +989,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		result.vertex[0] = m_program_cache->Get(vertex_params[0], vertex_info[0], push_data_cursor,
 		                                        &m_program_cache->vertex_memo, same_vertex_program);
 	}
+	if (ShaderProgramMemoOracleEnabled()) {
+		auto& stats = m_program_cache->memo_stats;
+		stats.draws++;
+		stats.vertex_same += same_vertex_program ? 1u : 0u;
+		stats.pixel_draws += pixel_active ? 1u : 0u;
+		stats.pixel_same += same_pixel_program ? 1u : 0u;
+		stats.programs_same += same_vertex_program && (!pixel_active || same_pixel_program) ? 1u : 0u;
+	}
 	return result;
 }
 
@@ -1098,7 +1148,22 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	const bool oracle = ShaderProgramMemoOracleEnabled();
+	if (oracle) {
+		m_program_cache->memo_stats.pipelines++;
+		m_program_cache->memo_stats.LogEverySecond();
+	}
 	if (const auto* last = m_last_graphics_pipeline.Find(key, 0); last != nullptr) {
+		if (!oracle) {
+			return **last;
+		}
+		m_program_cache->memo_stats.pipeline_hits++;
+		const auto iter = m_graphics_pipelines.find(key);
+		if (iter == m_graphics_pipelines.end() || iter->second.get() != *last) {
+			EXIT("program memo oracle: pipeline vs=%" PRIu64 " ps=%" PRIu64
+			     ": the remembered pipeline differs from the pipeline-cache lookup\n",
+			     vs_id, ps_id);
+		}
 		return **last;
 	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {

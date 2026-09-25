@@ -23,6 +23,11 @@ namespace Libs::Graphics {
 // registry, the metadata decode and the program-cache key build and lookup. Everything that is
 // per draw (user data, vertex table contents and addresses, SRT materialisation) still runs.
 
+// KYTY_PROGRAM_MEMO_ORACLE=1: every memo hit (program preparation, program cache, graphics
+// pipeline) also runs the path it skipped and EXITs on any difference, and hit counts are logged
+// once per second. Off by default; read once.
+bool ShaderProgramMemoOracleEnabled();
+
 // A by-value key of fixed capacity, so building one per draw never allocates.
 template <size_t Capacity>
 class ShaderMemoKey {
@@ -234,6 +239,10 @@ public:
 	                     bool& same_program);
 
 private:
+	void VerifyAgainstFullPreparation(const HW::VertexShaderInfo& regs, const HW::Context& context,
+	                                  const HW::UserConfig& user_config, const ShaderParams& params,
+	                                  const ShaderVertexInputInfo& info);
+
 	VertexProgramKey          m_key;
 	VertexProgramKey          m_scratch_key;
 	ShaderRegistrationStamp   m_front;
@@ -244,6 +253,8 @@ private:
 	ShaderVertexMetadata      m_metadata;
 	// Prepared scalars of the previous call and the vertex input layout the program cache saw last.
 	std::unique_ptr<ShaderVertexInputInfo> m_info;
+	// Slow-path result for the oracle, allocated on its first use.
+	std::unique_ptr<ShaderVertexInputInfo> m_oracle_info;
 	bool                                   m_valid = false;
 };
 
