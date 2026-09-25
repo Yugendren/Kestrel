@@ -18,14 +18,32 @@ int DbgExitIfHandler(char const* expr, char const* file, int line)
     __attribute__((analyzer_noreturn));
 int DbgNotImplementedHandler(char const* expr, char const* file, int line)
     __attribute__((analyzer_noreturn));
-void DbgExit(int status) __attribute__((analyzer_noreturn));
+[[noreturn]] void DbgExit(int status);
 #else
 int  DbgExitHandler(char const* file, int line, std::string_view text);
 int  DbgExitHandler(char const* file, int line, fmt::text_style style, std::string_view text);
 int  DbgExitIfHandler(char const* expr, char const* file, int line);
 int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
-void DbgExit(int status);
+[[noreturn]] void DbgExit(int status);
 #endif
+
+// EXIT_IF/EXIT_NOT_IMPLEMENTED sit on every hot path of the emulator (thousands per draw) and
+// never fire in a working run. Their failure call goes through one cold, never-inlined, noreturn
+// function and the condition is marked unlikely, so the compiler moves the failure block out of
+// the hot code instead of laying `lea`/`call` sequences inline between the fast-path
+// instructions (i-cache density), and needs no code after the call.
+// Report through DbgExitIfHandler/DbgNotImplementedHandler, then DbgExit(321). Defined here
+// rather than in assert.cpp so test targets that stub the handlers keep linking without it.
+[[noreturn]] KYTY_COLD_NOINLINE inline void DbgExitIfFailed(char const* expr, char const* file,
+                                                            int line) {
+	DbgExitIfHandler(expr, file, line);
+	DbgExit(321);
+}
+[[noreturn]] KYTY_COLD_NOINLINE inline void DbgNotImplementedFailed(char const* expr,
+                                                                    char const* file, int line) {
+	DbgNotImplementedHandler(expr, file, line);
+	DbgExit(321);
+}
 
 } // namespace Common
 
@@ -33,7 +51,7 @@ void DbgExit(int status);
 
 #ifndef KYTY_FINAL
 #define EXIT_IF(x)                                                                                 \
-	((void)((x) && Common::DbgExitIfHandler(#x, __FILE__, __LINE__) != 0 && (EXIT_HALT(), 1) != 0))
+	((void)(KYTY_UNLIKELY_COND(x) && (Common::DbgExitIfFailed(#x, __FILE__, __LINE__), 0)))
 #else
 #define EXIT_IF(x)                                                                                 \
 	do {                                                                                           \
@@ -56,8 +74,7 @@ void DbgExit(int status);
 	} while (0)
 
 #define EXIT_NOT_IMPLEMENTED(x)                                                                    \
-	((void)((x) && Common::DbgNotImplementedHandler(#x, __FILE__, __LINE__) != 0 &&                \
-	        (EXIT_HALT(), 1) != 0))
+	((void)(KYTY_UNLIKELY_COND(x) && (Common::DbgNotImplementedFailed(#x, __FILE__, __LINE__), 0)))
 #define KYTY_NOT_IMPLEMENTED EXIT_NOT_IMPLEMENTED(true)
 
 #endif /* KYTY_COMMON_ASSERT_H_ */

@@ -40,4 +40,12 @@ public:                                                                         
 #define KYTY_FORMAT_PRINTF(a, b) __attribute__((format(printf, a, b)))
 #endif
 
+// Code-layout hints for hot paths (GCC and Clang, including clang-cl, understand both).
+// KYTY_FORCE_INLINE: small accessors that sit on per-draw paths and must not become calls.
+// KYTY_COLD_NOINLINE: failure handlers, kept out of line and out of the hot text.
+// KYTY_UNLIKELY_COND: a condition that is false in every working run.
+#define KYTY_FORCE_INLINE     inline __attribute__((always_inline))
+#define KYTY_COLD_NOINLINE    __attribute__((cold, noinline))
+#define KYTY_UNLIKELY_COND(x) __builtin_expect(static_cast<bool>(x), false)
+
 #endif /* KYTY_COMMON_COMMON_H_ */
