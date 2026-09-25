@@ -56,6 +56,9 @@ enum class Opcode {
 	S_SUBVECTOR_LOOP_BEGIN,
 	S_SUBVECTOR_LOOP_END,
 	S_AND_SAVEEXEC_B32,
+	S_OR_SAVEEXEC_B32,
+	S_XOR_SAVEEXEC_B32,
+	S_ANDN2_SAVEEXEC_B32,
 	S_ORN2_SAVEEXEC_B32,
 	S_ANDN1_SAVEEXEC_B32,
 	S_AND_SAVEEXEC_B64,
@@ -580,6 +583,10 @@ enum class Opcode {
 	IMAGE_GATHER4_C_O,
 	IMAGE_GATHER4_C_LZ_O,
 	IMAGE_GATHER4H,
+	// MIMG 230/231. Ray/BVH-node intersection for ray tracing; no sampler, and the SGPR
+	// operand is a 128-bit BVH T# (Table 49) rather than an image T#.
+	IMAGE_BVH_INTERSECT_RAY,
+	IMAGE_BVH64_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
@@ -733,7 +740,6 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
-	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

@@ -471,6 +471,8 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		// Immediate byte offset of the material key load, applied on top of the record offset.
+		uint32_t selector_immediate = 0;
 		Value    key_count;
 		Value    selector_mask;
 
@@ -561,6 +563,7 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	mutable std::vector<DescriptorValue>    material_candidates;
 	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 };
 
@@ -589,6 +592,8 @@ struct Program: ResourcePlan {
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
+	// Mirrors CompileOptions::lower_wide_movrels (PPSA21564-gated v_movrels lowering).
+	bool                          lower_wide_movrels = false;
 
 };
 

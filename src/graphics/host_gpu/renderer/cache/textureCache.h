@@ -64,8 +64,11 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
-	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
+	// `fill_value` receives the dword the last recognised metadata fill wrote, when known.
+	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
+	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -82,6 +85,9 @@ private:
 
 		Type     type;
 		uint32_t clear_mask = UINT32_MAX;
+		// The dword a recognised uniform fill last wrote (e.g. the HTILE clear value).
+		uint32_t fill_value = 0xffffffffu;
+		bool     fill_known = false;
 	};
 
 	struct OverlapResult {

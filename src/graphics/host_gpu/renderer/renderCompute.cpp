@@ -49,8 +49,15 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
+static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                      uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                      ShaderBufferResource& resolved_descriptor,
+                                      uint32_t& resolved_clear, uint64_t& resolved_size);
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const CommandBuffer&          buffer) {
+                                                const CommandBuffer& buffer, uint32_t group_x,
+                                                uint32_t group_y, uint32_t group_z,
+                                                uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -68,12 +75,23 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	}
 
 	if (!program.info.has_bitwise_xor) {
+		ShaderBufferResource fill_descriptor;
+		uint32_t             fill_value   = 0;
+		uint64_t             fill_size    = 0;
+		const bool           uniform_fill =
+		    ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, fill_descriptor,
+		                             fill_value, fill_size) ||
+		    ResolveComputePatternFill(input, group_x, group_y, group_z, mode, fill_descriptor,
+		                              fill_value, fill_size);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				const bool known =
+				    uniform_fill && descriptor.Base48() == fill_descriptor.Base48();
+				if (known ? cache.ClearMeta(descriptor.Base48(), fill_value)
+				          : cache.ClearMeta(descriptor.Base48())) {
 					return true;
 				}
 			}
@@ -121,6 +139,62 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 		return false;
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
+	resolved_size       = size;
+	return true;
+}
+
+static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                      uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                      ShaderBufferResource& resolved_descriptor,
+                                      uint32_t& resolved_clear, uint64_t& resolved_size) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	const auto& user_data = resources.user_data;
+	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() ||
+	    program.info.uses_dma || input.dispatch_thread_dimensions || mode != 0x41u ||
+	    user_data.size() != 10 || program.user_data_base != 0) {
+		return false;
+	}
+	const auto& resource   = program.info.buffers.front();
+	const auto& raw        = resources.buffers.front();
+	const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(raw);
+	if (!resource.written || resource.read || resource.atomic || resource.scalar ||
+	    resource.max_byte_extent != 4 ||
+	    (resource.formatted && descriptor.Format() != Prospero::BufferFormat::k32UInt) ||
+	    (descriptor.Stride() != 4 && descriptor.Stride() != 0) || descriptor.SwizzleEnabled() ||
+	    descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    resource.packed_stride != descriptor.PackedStride() || raw.dword_count != 4 ||
+	    descriptor.Base48() == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < raw.dword_count; i++) {
+		if (raw.dwords[i] != user_data[i]) {
+			return false;
+		}
+	}
+	const uint32_t clear  = user_data[4];
+	const uint32_t period = user_data[9];
+	const uint32_t slots  = period == 0u ? 4u : std::min(period, 4u);
+	for (uint32_t slot = 1; slot < slots; slot++) {
+		if (user_data[4 + slot] != clear) {
+			return false;
+		}
+	}
+	if (input.threads_num[0] != 64 || input.threads_num[1] != 1 || input.threads_num[2] != 1 ||
+	    group_x == 0 || group_y != 1 || group_z != 1 || !input.group_id[0] || input.group_id[1] ||
+	    input.group_id[2] || input.thread_ids_num != 1 || input.wave_size != 64 ||
+	    input.tg_size_en) {
+		return false;
+	}
+	const uint64_t count = user_data[8];
+	const auto     size  = descriptor.GetSize();
+	if (count == 0 || size == 0 || size > UINT32_MAX || count * sizeof(uint32_t) != size ||
+	    group_x != (count + input.threads_num[0] - 1) / input.threads_num[0]) {
+		return false;
+	}
+	resolved_descriptor = descriptor;
+	resolved_clear      = clear;
 	resolved_size       = size;
 	return true;
 }
@@ -180,7 +254,9 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	uint32_t             packed_clear = 0;
 	uint64_t             size         = 0;
 	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
-	                              size)) {
+	                              size) &&
+	    !ResolveComputePatternFill(input, group_x, group_y, group_z, mode, descriptor,
+	                               packed_clear, size)) {
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
@@ -257,7 +333,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (!compute_program) {
-		// Temporary until RT is implemented.
+		// Soft ladder (PPSA21564): the shader's resources could not be materialised (a
+		// descriptor it builds from a runtime-dynamic / loop-carried SRT pointer, which
+		// KytyPS5 has no bindless path for). Drop the dispatch rather than abort the title --
+		// same handling as a null / invalid CS address.
+		LOGF("GraphicsRenderDispatchDirect: skipping dispatch, shader resources not "
+		     "materialisable, shader=0x%016" PRIx64 "\n",
+		     sh_ctx.GetCs().cs_regs.data_addr);
+		ResetBindings();
 		return;
 	}
 	if (use_thread_dimensions) {
@@ -268,7 +351,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (TryConsumeComputeMetaClear(input_info, buffer, thread_group_x, thread_group_y,
+	                               thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -418,7 +502,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) {
-		// Temporary until RT is implemented.
+		// Resources could not be materialised; drop the dispatch as DispatchDirect does.
+		LOGF("GraphicsRenderDispatchIndirect: skipping dispatch, shader resources not "
+		     "materialisable, shader=0x%016" PRIx64 "\n",
+		     cs_regs.cs_regs.data_addr);
+		ResetBindings();
 		return;
 	}
 	buffer.EndRendering();

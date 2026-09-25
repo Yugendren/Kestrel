@@ -369,21 +369,26 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 }
 
 static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
-                                               TextureCache::BindingType                  binding) {
+                                               TextureCache::BindingType                  binding,
+                                               bool                                       depth = false) {
 	TextureCache::ImageDesc desc {};
-	switch (resource.numeric_class) {
-		case Prospero::TextureNumericClass::Float:
-			desc.info.guest_format = Prospero::BufferFormat::k32Float;
-			break;
-		case Prospero::TextureNumericClass::Uint:
-			desc.info.guest_format = Prospero::BufferFormat::k32UInt;
-			break;
-		case Prospero::TextureNumericClass::Sint:
-			desc.info.guest_format = Prospero::BufferFormat::k32SInt;
-			break;
-		default: EXIT("null image has unsupported numeric class\n");
+	if (depth) {
+		desc.info.guest_format = Prospero::BufferFormat::k32Float;
+	} else {
+		switch (resource.numeric_class) {
+			case Prospero::TextureNumericClass::Float:
+				desc.info.guest_format = Prospero::BufferFormat::k32Float;
+				break;
+			case Prospero::TextureNumericClass::Uint:
+				desc.info.guest_format = Prospero::BufferFormat::k32UInt;
+				break;
+			case Prospero::TextureNumericClass::Sint:
+				desc.info.guest_format = Prospero::BufferFormat::k32SInt;
+				break;
+			default: EXIT("null image has unsupported numeric class\n");
+		}
 	}
-	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
+	desc.info.pixel_format    = depth ? vk::Format::eD32Sfloat : VulkanFormat(desc.info.guest_format);
 	desc.info.type            = Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
@@ -392,7 +397,33 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
-	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
+	switch (resource.dimension) {
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
+			desc.info.type      = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
+			desc.info.samples = 4;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
+			desc.info.samples   = 4;
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		default: break;
+	}
+	desc.view_info.aspect     = depth ? vk::ImageAspectFlagBits::eDepth
+	                                  : vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
@@ -448,12 +479,19 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
-                                     uint32_t view_levels, uint32_t image_layers) {
+                                     uint32_t view_levels, uint32_t image_layers,
+                                     uint32_t resident_base) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
-	view.base_level  = descriptor.BaseLevel();
-	view.level_count = view_levels;
+	// Levels below the resident one hold another texture or nothing at all, so the view must
+	// not expose them: the shader would otherwise sample whatever is there.
+	const auto first_level = std::max<uint32_t>(descriptor.BaseLevel(), resident_base);
+	view.base_level        = first_level;
+	view.level_count =
+	    view_levels > (first_level - descriptor.BaseLevel())
+	        ? view_levels - (first_level - descriptor.BaseLevel())
+	        : 1u;
 	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
 		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
 		     descriptor.MinLod(), descriptor.LastLevel());
@@ -537,8 +575,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
+		// A depth-comparison (shadow) fetch must land on a depth image even when the slot is
+		// empty: a Dref sample against a colour image is illegal and loses the device
+		// (VUID-vkCmd*-None-06479). Storage images are never depth-compared.
+		auto       desc = NullTextureDesc(resource,
+		                                  storage ? TextureCache::BindingType::Storage
+		                                          : TextureCache::BindingType::Texture,
+		                                  !storage && resource.depth_compare);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
 	}
@@ -614,7 +657,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	uint32_t      pitch = 0;
 	TileSizeAlign size {};
-	if (multisampled) {
+	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	const char* rejection = nullptr;
+	if (volume ? depth > limits.maxImageDimension3D : image_layers > limits.maxImageArrayLayers) {
+		rejection = "exceeds host image limits";
+	} else if (multisampled) {
 		const auto bytes = Prospero::NumBytesPerElement(format);
 		pitch            = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
 		                              : TileGetRenderTargetPitch(width, bytes, last_level);
@@ -625,8 +672,45 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		size.size *= image_layers;
 	} else {
 		pitch = TileGetTexturePitch(format, width, tile);
-		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
-		                        physical_levels, tile, volume, size);
+		if (!TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
+		                             physical_levels, tile, volume, size)) {
+			rejection = "footprint exceeds 32 bits";
+		}
+	}
+	if (rejection != nullptr) {
+		const auto report = fmt::format(
+		    "unrepresentable texture ({}): {}x{} depth={} layers={} levels={} format={} tile={} "
+		    "type={} base_array={} array_pitch={} max_mip={} kind={} dimension={} source={} "
+		    "first_use_pc=0x{:08x} indirect_root={} addr=0x{:016x} "
+		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		    rejection, width, height, depth, image_layers, levels, static_cast<uint32_t>(format),
+		    static_cast<uint32_t>(tile), static_cast<uint32_t>(type), descriptor.BaseArray5(),
+		    descriptor.ArrayPitch(), descriptor.MaxMip(), static_cast<uint32_t>(resource.resource_class),
+		    static_cast<uint32_t>(resource.dimension), resource.source, resource.first_use_pc,
+		    resource.indirect_root, address, descriptor.fields[0], descriptor.fields[1],
+		    descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		    descriptor.fields[6], descriptor.fields[7]);
+		if (storage) {
+			EXIT("%s\n", report.c_str());
+		}
+		if (m_unrepresentable_textures.insert(address).second) {
+			LOGF("TextureCache: %s, bound as null\n", report.c_str());
+		}
+		// Same rule as the null-descriptor path above: keep a shadow fetch on a depth image.
+		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture,
+		                                  resource.depth_compare);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	if (tile == Prospero::TileMode::kDepth && m_depth_tiled_reports.insert(address).second) {
+		LOGF("TextureCache: depth-tiled sampled view: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " %ux%u depth=%u layers=%u levels=%u format=%u type=%u base_array=%u kind=%u"
+		     " storage=%d dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     address, static_cast<uint64_t>(size.size), width, height, depth, image_layers, levels,
+		     static_cast<uint32_t>(format), static_cast<uint32_t>(type), descriptor.BaseArray5(),
+		     static_cast<uint32_t>(resource.resource_class), storage ? 1 : 0, descriptor.fields[0],
+		     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+		     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
 	}
 	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
 	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
@@ -638,6 +722,21 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	if (resource.depth_compare) {
 		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
 			pixel_format = depth_format->depth_attachment_format;
+		} else if (DepthAspectTransferFormat(pixel_format) == vk::Format::eUndefined) {
+			// The shader issues a depth-comparison (shadow) fetch, but the bound texture is
+			// not a depth format -- the title left a colour placeholder in a shadow slot it
+			// isn't sampling for real this frame. A Dref sample against a non-depth image is
+			// illegal on desktop Vulkan and loses the device (VUID-vkCmd*-None-06479); bind a
+			// 1x1 depth null image so the fetch stays valid and returns a defined value.
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("descriptors: depth-compare fetch on non-depth guest format %u -- "
+				     "binding null depth image\n",
+				     static_cast<uint32_t>(format));
+			}
+			auto       depth_null = NullTextureDesc(resource, TextureCache::BindingType::Texture, true);
+			const auto depth_id   = texture_cache.FindImage(depth_null);
+			return {depth_id, nullptr, std::move(depth_null)};
 		}
 	}
 	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
@@ -655,6 +754,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.info.extent       = {width, height, volume ? depth : 1u};
 	desc.info.resources    = {levels, image_layers};
 	desc.info.pitch        = pitch;
+	// MIN_LOD (4.8 fixed point) is the finest level the title has actually streamed in. The
+	// coarser ones are unbacked and another texture sits right behind them, so they must not
+	// be read. MIN_LOD_WARN is not usable here: it is a feedback threshold, not a residency
+	// boundary, and clamping to it blacks out levels that are present.
+	desc.info.resident_base_level =
+	    multisampled ? 0u : std::min<uint32_t>(descriptor.MinLod() >> 8u, levels - 1u);
 	desc.info.bytes_per_block =
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
@@ -675,7 +780,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		PopulateTextureMipLayout(desc.info);
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-	                                 view_levels, desc.info.resources.layers);
+	                                 view_levels, desc.info.resources.layers,
+	                                 desc.info.resident_base_level);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
@@ -691,6 +797,22 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else if (resource.depth_compare) {
+		// The descriptor looked depth-capable, but the address resolved to a colour image --
+		// the title re-used this memory as a colour surface, or an earlier non-compare binding
+		// registered it that way. Sampling it with depth comparison is illegal and loses the
+		// device (VUID-vkCmd*-None-06479), and the format policy above cannot see this because
+		// it runs before the cache lookup. Fall back to the depth null image, same as the other
+		// shadow-slot fallbacks.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("descriptors: depth-compare fetch resolved to colour image (format %u, guest %u)"
+			     " -- binding null depth image\n",
+			     static_cast<uint32_t>(image->info.pixel_format), static_cast<uint32_t>(format));
+		}
+		auto       depth_null = NullTextureDesc(resource, TextureCache::BindingType::Texture, true);
+		const auto depth_id   = texture_cache.FindImage(depth_null);
+		return {depth_id, nullptr, std::move(depth_null)};
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());

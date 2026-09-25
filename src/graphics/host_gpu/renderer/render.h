@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -119,6 +120,7 @@ public:
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	[[nodiscard]] bool             IsRendering() const noexcept { return m_rendering; }
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -131,6 +133,7 @@ private:
 	void Begin();
 	void End() const;
 
+	CommandScheduler&   m_scheduler;
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
 	vk::CommandBuffer   m_buffer          = nullptr;
@@ -204,7 +207,9 @@ private:
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
+	                                                     const CommandBuffer& buffer, uint32_t group_x,
+	                                                     uint32_t group_y, uint32_t group_z,
+	                                                     uint32_t mode);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
@@ -217,6 +222,8 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	std::unordered_set<uint64_t> m_unrepresentable_textures;
+	std::unordered_set<uint64_t> m_depth_tiled_reports;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

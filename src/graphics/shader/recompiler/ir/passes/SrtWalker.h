@@ -4,12 +4,15 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <span>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+// Makes a guest range readable (GPU-written data synchronised back) before it is read.
+using SrtMemorySync = bool (*)(void* userdata, uint64_t address, uint64_t size);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -17,6 +20,7 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	SrtMemorySync             sync_memory                = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -25,7 +29,8 @@ enum class RuntimeValueType { Any, Integer };
 // dynamic offsets remain explicit and are never assigned a fake slot.
 void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
+                          RuntimeValueType type = RuntimeValueType::Any,
+                          std::string* reason = nullptr);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
@@ -54,6 +59,8 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// KYTY_SRT_DIAG=1: explains why a descriptor dword did not evaluate.
+	void LogDescriptorDiagnostic(uint32_t source, uint32_t dword);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
@@ -61,6 +68,8 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// Deepest instruction whose evaluation failed during the current descriptor dword.
+	const Inst* m_diag_first_fail = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

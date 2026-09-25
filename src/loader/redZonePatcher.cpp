@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cinttypes>
 #include <climits>
 #include <cstring>
 #include <limits>
@@ -821,7 +822,8 @@ uint64_t ApplyReciprocalSquareRootPatches(const PatchModule& module,
 	       X64InstructionEmulator::PatchReciprocalSquareRoots(trampoline_addr, trampoline_size);
 }
 
-void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& function,
+void RelocateRedZoneInstructions(PatchModule* module, uintptr_t function_start,
+                                const DecodedFunction&                          function,
                                 const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                                 RedZonePatchResult& result) {
 	struct RelocationSpan {
@@ -1000,6 +1002,10 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 		const auto& rewrite = rewrite_sites.at(site);
 		if (rewrite.protect_red_zone && decoded.accesses_memory) {
 			++result.unrelocatable_memory_instruction_count;
+			LOGF("Windows guest red-zone: unprotected memory instruction at +0x%" PRIx64
+			     " in function +0x%" PRIx64 "\n",
+			     static_cast<u64>(site - reinterpret_cast<uintptr_t>(module->start)),
+			     static_cast<u64>(function_start - reinterpret_cast<uintptr_t>(module->start)));
 		}
 	};
 	const auto overlaps_patched_span = [&patched_spans](uintptr_t start, uintptr_t end) {
@@ -1290,7 +1296,7 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 			CollectReciprocalSquareRoots(function, rewrite_sites, reciprocal_sqrt_sites);
 		}
 		if (!rewrite_sites.empty()) {
-			RelocateRedZoneInstructions(module, function, rewrite_sites, result);
+			RelocateRedZoneInstructions(module, function_start, function, rewrite_sites, result);
 		}
 	}
 	// Preserve valid instruction encodings throughout CFG analysis and relocation.

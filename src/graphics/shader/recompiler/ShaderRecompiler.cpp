@@ -16,11 +16,13 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/DynamicBuffer.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
@@ -524,20 +526,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
-	// Temporary workaround for games that compile ray-tracing shaders before
-	// the player can select a mode without ray tracing.
-	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
-		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-		if (!warned.test_and_set(std::memory_order_relaxed)) {
-			const auto& bvh = decoded.instructions.back();
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Warning: ray tracing is not implemented; skipping compute dispatches containing "
-			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
-			    options.shader_hash, bvh.pc, bvh.opcode_id));
-		}
-		return {.skip_dispatch = true};
-	}
-
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
@@ -554,13 +542,51 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
+	bool        dispatcher_fallback = false;
+	std::string dispatcher_reason;
 	if (cfg.irreducible) {
+		dispatcher_fallback = true;
+		dispatcher_reason   = cfg.unsupported_reason;
 		LogDispatcherFallback(options, cfg, "build");
 	} else {
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-		if (!CFG::Structurize(cfg)) {
+		const auto unstructured_cfg = cfg;
+		// Structurize can report success while still leaving a conditional branch without a
+		// merge block. The emitter then writes OpBranchConditional with no OpSelectionMerge in
+		// front of it, which is invalid SPIR-V ("Selection must be structured") -- and nothing
+		// catches it unless --shader-validation is on, so the module ships and the driver is
+		// free to do anything with it. Astro Bot's GI compute kernels all come out that way.
+		// Treat a missing merge as a structurize failure and take the dispatcher fallback,
+		// which handles unstructured control flow correctly.
+		const auto unmerged_selection = [](const CFG::Graph& graph) {
+			return std::ranges::any_of(graph.blocks, [](const CFG::BasicBlock& block) {
+				return block.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+				       !block.terminator.loop_header &&
+				       block.terminator.merge_block == UINT32_MAX;
+			});
+		};
+		// Opt-in: taking the dispatcher for these costs roughly 65x frame time on Astro Bot
+		// (frame 1652 -> 25 over the same wall clock), because the fallback rewrites the whole
+		// program as a state machine. Off by default, so today's behaviour and speed are
+		// unchanged; KYTY_STRICT_STRUCTURED=1 trades the speed for valid SPIR-V. The real fix
+		// is to give CFG::Structurize the merge blocks it is failing to compute, after which
+		// this guard should never fire.
+		static const bool strict_structured = [] {
+			const char* v = std::getenv("KYTY_STRICT_STRUCTURED");
+			return v != nullptr && v[0] != '\0' && v[0] != '0';
+		}();
+		if (!CFG::Structurize(cfg) || (strict_structured && unmerged_selection(cfg))) {
+			dispatcher_fallback      = true;
+			dispatcher_reason        = cfg.unsupported_reason;
+			const auto failure_kind  = cfg.failure_kind;
+			const auto failure_block = cfg.failure_block;
 			LogDispatcherFallback(options, cfg, "structurize");
+			cfg                    = unstructured_cfg;
+			cfg.unsupported        = true;
+			cfg.failure_kind       = failure_kind;
+			cfg.failure_block      = failure_block;
+			cfg.unsupported_reason = dispatcher_reason;
 		} else {
 			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
 			     static_cast<uint64_t>(cfg.blocks.size()));
@@ -584,13 +610,18 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	Frontend::TranslateOptions translate_options {
-	    .stage            = options.stage,
-	    .wave_size        = options.wave_size,
-	    .shader_hash      = options.shader_hash,
-	    .user_data_base   = options.user_data_base,
-	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
-	    .input_info       = options.input_info,
-	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .stage               = options.stage,
+	    .wave_size           = options.wave_size,
+	    .shader_hash         = options.shader_hash,
+	    .user_data_base      = options.user_data_base,
+	    .user_data_count     = static_cast<uint32_t>(options.user_data.size()),
+	    .dispatcher_fallback = dispatcher_fallback,
+	    .lower_wide_movrels  = options.lower_wide_movrels,
+	    .cfg_failure_kind    = cfg.failure_kind,
+	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
+	                                                    : dispatcher_reason,
+	    .input_info          = options.input_info,
+	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
@@ -613,9 +644,29 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	const auto waterfalls = IR::RewriteWaterfallDescriptors(ir);
+	if (waterfalls != 0) {
+		LOGF("%s waterfall descriptor de-scalarization: stage=%s hash=0x%016" PRIx64
+		     " loops=%" PRIu32 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, waterfalls);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (const auto lowered = IR::LowerDynamicBufferReads(ir); lowered != 0) {
+		LOGF("%s dynamic buffer lowering: stage=%s hash=0x%016" PRIx64 " reads=%" PRIu32 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, lowered);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	LowerTessellationMemory(ir, options);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (options.dump_ir && options.early_dump) {
+		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+		     IR::ProgramToString(ir).c_str());
+	}
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
@@ -630,10 +681,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
-	EXIT_IF(translated.skip_dispatch);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	IR::DiscardResourcePlanningInputs(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 

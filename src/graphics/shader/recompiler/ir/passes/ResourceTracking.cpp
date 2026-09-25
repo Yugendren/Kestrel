@@ -5,6 +5,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <unordered_map>
+#include <unordered_set>
 #include <fmt/format.h>
 #include <span>
 #include <utility>
@@ -14,6 +17,8 @@ namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
+constexpr uint32_t DenseIndirectImageShift      = 5u;
+constexpr uint32_t MaxDenseIndirectImageEntries = 4096u;
 
 uint32_t PossibleU32Bits(Value value) {
 	value = value.Resolve();
@@ -275,6 +280,66 @@ private:
 		return Value(&selected);
 	}
 
+	// A phi merging one descriptor dword with null (0) on some paths.
+	bool CollapseNullPhi(Value value, Value& loaded, std::vector<Block*>& null_blocks) const {
+		const auto* phi = value.Resolve().TryInstruction();
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi) {
+			return false;
+		}
+		Value               merged;
+		std::vector<Block*> nulls;
+		for (size_t index = 0; index < phi->NumArgs(); index++) {
+			const auto resolved = ResolveInvariantPhi(m_program, phi->Arg(index));
+			if (resolved.IsEmpty()) {
+				return false;
+			}
+			if (resolved.IsImmediate() && resolved.GetType() == Type::U32 && resolved.U32() == 0u) {
+				nulls.push_back(phi->PhiBlock(index));
+				continue;
+			}
+			if (merged.IsEmpty()) {
+				merged = resolved;
+			} else if (!EquivalentValue(m_program, merged, resolved)) {
+				return false;
+			}
+		}
+		if (nulls.empty() || merged.IsEmpty()) {
+			return false;
+		}
+		std::ranges::sort(nulls);
+		loaded      = merged;
+		null_blocks = std::move(nulls);
+		return true;
+	}
+
+	// A descriptor whose every non-invariant dword is null on the same paths is the loaded
+	// descriptor on the others; those null paths do not use it.
+	void CollapseNullDescriptorPaths(DescriptorSource& descriptor, uint32_t width) const {
+		std::array<Value, 8> collapsed {};
+		std::vector<Block*>  null_blocks;
+		bool                 rewritten = false;
+		for (uint32_t i = 0; i < width; i++) {
+			collapsed[i] = descriptor.dwords[i];
+			if (!ResolveInvariantPhi(m_program, descriptor.dwords[i]).IsEmpty()) {
+				continue;
+			}
+			Value               loaded;
+			std::vector<Block*> blocks;
+			if (!CollapseNullPhi(descriptor.dwords[i], loaded, blocks)) {
+				return;
+			}
+			if (rewritten && blocks != null_blocks) {
+				return;
+			}
+			collapsed[i] = loaded;
+			null_blocks  = std::move(blocks);
+			rewritten    = true;
+		}
+		if (rewritten) {
+			std::copy_n(collapsed.begin(), width, descriptor.dwords.begin());
+		}
+	}
+
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
 	                DescriptorSource& descriptor, uint32_t pc) {
 		if (handle.NumArgs() != width) {
@@ -285,6 +350,7 @@ private:
 		for (uint32_t i = 0; i < width; i++) {
 			descriptor.dwords[i] = LowerDescriptorPhi(handle.Arg(i), handle.Parent());
 		}
+		CollapseNullDescriptorPaths(descriptor, width);
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
 		}
@@ -296,13 +362,18 @@ private:
 		}
 	}
 
-	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword) const {
+	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword,
+	                    std::string* reason = nullptr) const {
 		for (uint32_t i = 0; i < descriptor.dword_count; i++) {
 			bad_dword = i;
 			if (descriptor.dwords[i].Resolve().GetType() != Type::U32) {
+				if (reason != nullptr) {
+					*reason = "value is not 32-bit";
+				}
 				return false;
 			}
-			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i])) {
+			if (!ValidateRuntimeValue(m_program, descriptor.dwords[i], RuntimeValueType::Any,
+			                          reason)) {
 				return false;
 			}
 		}
@@ -321,7 +392,7 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.table_offset != b.table_offset ||
+				    a.table_offset != b.table_offset || a.selector_immediate != b.selector_immediate ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -379,6 +450,20 @@ private:
 		           : nullptr;
 	}
 
+	const MemoryInfo* AddressReadMemory(const Inst& read, uint32_t& index) const {
+		if (read.GetOpcode() != ValueOpcode::LoadAddressU32 || read.NumArgs() != 4u) {
+			return nullptr;
+		}
+		index = read.Flags<MemoryFlags>().index;
+		if (index >= m_program.memory_info.size()) {
+			return nullptr;
+		}
+		const auto& memory = m_program.memory_info[index];
+		return memory.kind == ResourceKind::ScalarAddress && memory.data_bits == 32u &&
+		               memory.data_dwords == 1u
+		           ? &memory
+		           : nullptr;
+	}
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
 		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
@@ -632,6 +717,15 @@ private:
 			out.stride <<= immediate;
 			out.offset <<= immediate;
 			return out.stride <= UINT32_MAX && out.offset <= UINT32_MAX;
+		}
+		if (inst->GetOpcode() == ValueOpcode::IMul32 && inst->NumArgs() == 2u) {
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
+				if (!ImmediateU32(inst->Arg(arg), immediate)) continue;
+				if (!MatchAffineOffset(inst->Arg(arg ^ 1u), guard, out, depth + 1u)) return false;
+				out.stride *= immediate;
+				out.offset *= immediate;
+				return out.stride <= UINT32_MAX && out.offset <= UINT32_MAX;
+			}
 		}
 		out.index = value;
 		out.stride = 1u;
@@ -942,7 +1036,7 @@ private:
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
 			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset != 0u || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+			    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;
 			}
 			Value selector;
@@ -950,6 +1044,8 @@ private:
 			                         indirect.selector_offset)) {
 				return false;
 			}
+			// The key load's own immediate offset is applied on top of the record offset.
+			indirect.selector_immediate = memory->offset;
 			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
 			const std::array<const Inst*, 1> material_users {shift};
 			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {
@@ -976,6 +1072,557 @@ private:
 		plan.source = InternSource(image_source);
 		plan.key = key;
 		plan.roots = image_source.dwords;
+		return true;
+	}
+
+	bool MatchDenseTable(const Inst& handle, Inst*& heap_handle, const Inst*& based,
+	                     std::array<Inst*, 8>& reads, std::array<uint32_t, 8>& memory_indices) {
+		for (uint32_t dword = 0; dword < handle.NumArgs(); dword++) {
+			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+			    read->NumArgs() != 4u) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = AddressReadMemory(*read, memory_index);
+			auto*       offset       = read->Arg(1).Resolve().TryInstruction();
+			if (memory == nullptr || !MemoryIndexBelongsTo(memory_index, *read) ||
+			    offset == nullptr) {
+				return false;
+			}
+			uint32_t extra = 0;
+			if (based == nullptr) {
+				based = offset;
+			} else if (offset != based) {
+				uint32_t    immediate = 0;
+				const Inst* inner     = nullptr;
+				if (offset->GetOpcode() != ValueOpcode::IAdd32 || offset->NumArgs() != 2u) {
+					return false;
+				}
+				if (ImmediateU32(offset->Arg(1), immediate)) {
+					inner = offset->Arg(0).Resolve().TryInstruction();
+				} else if (ImmediateU32(offset->Arg(0), immediate)) {
+					inner = offset->Arg(1).Resolve().TryInstruction();
+				} else {
+					return false;
+				}
+				if (inner != based) {
+					return false;
+				}
+				extra = immediate;
+			}
+			if (extra + memory->offset != dword * sizeof(uint32_t)) {
+				return false;
+			}
+			auto* address = read->Arg(0).Resolve().TryInstruction();
+			if (address == nullptr || address->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (heap_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(heap_handle), Value(address)))) {
+				return false;
+			}
+			heap_handle           = address;
+			reads[dword]          = read;
+			memory_indices[dword] = memory_index;
+		}
+		return based != nullptr && heap_handle != nullptr;
+	}
+
+	static bool IsBooleanOperator(ValueOpcode opcode) {
+		return opcode == ValueOpcode::LogicalAnd || opcode == ValueOpcode::LogicalOr ||
+		       opcode == ValueOpcode::LogicalXor || opcode == ValueOpcode::LogicalNot ||
+		       opcode == ValueOpcode::SelectU1;
+	}
+
+	static bool WaveUniformOpcode(ValueOpcode opcode) {
+		switch (opcode) {
+			case ValueOpcode::Phi:
+			case ValueOpcode::Identity:
+			case ValueOpcode::GetUserData:
+			case ValueOpcode::ReadConst:
+			case ValueOpcode::ReadConstBuffer:
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadLane:
+			case ValueOpcode::Ballot:
+			case ValueOpcode::AnyLane:
+			case ValueOpcode::CompositeExtractU32x4:
+			case ValueOpcode::BitFieldUExtract:
+			case ValueOpcode::BitFieldSExtract:
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::ShiftRightArithmetic32:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::SMin32:
+			case ValueOpcode::UMin32:
+			case ValueOpcode::SMax32:
+			case ValueOpcode::UMax32:
+			case ValueOpcode::SLessThan32:
+			case ValueOpcode::ULessThan32:
+			case ValueOpcode::SLessThanEqual32:
+			case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::SGreaterThan32:
+			case ValueOpcode::UGreaterThan32:
+			case ValueOpcode::SGreaterThanEqual32:
+			case ValueOpcode::UGreaterThanEqual32:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+			case ValueOpcode::LogicalXor:
+			case ValueOpcode::LogicalNot: return true;
+			default: return false;
+		}
+	}
+
+	static bool UniformResult(ValueOpcode opcode) {
+		return opcode == ValueOpcode::GetUserData || opcode == ValueOpcode::ReadConst ||
+		       opcode == ValueOpcode::ReadFirstLane || opcode == ValueOpcode::ReadLane ||
+		       opcode == ValueOpcode::Ballot || opcode == ValueOpcode::AnyLane;
+	}
+
+	static bool WaveUniform(const Inst& inst, std::unordered_set<const Inst*>& visiting) {
+		if (!WaveUniformOpcode(inst.GetOpcode())) {
+			return false;
+		}
+		if (UniformResult(inst.GetOpcode()) || !visiting.insert(&inst).second) {
+			return true;
+		}
+		for (size_t arg = 0; arg < inst.NumArgs(); arg++) {
+			if (!WaveUniform(inst.Arg(arg), visiting)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	static bool WaveUniform(Value value, std::unordered_set<const Inst*>& visiting) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			return true;
+		}
+		const auto* inst = value.TryInstruction();
+		return inst != nullptr && WaveUniform(*inst, visiting);
+	}
+
+	static bool WaveUniform(Value value) {
+		std::unordered_set<const Inst*> visiting;
+		return WaveUniform(value, visiting);
+	}
+
+	static bool WaveUniform(const Inst& inst) {
+		std::unordered_set<const Inst*> visiting;
+		return WaveUniform(inst, visiting);
+	}
+
+	static bool PredicateImplies(Value predicate, bool negated, const Inst& fact) {
+		for (const auto* top = predicate.Resolve().TryInstruction(); top != nullptr;
+		     top             = predicate.Resolve().TryInstruction()) {
+			if (top->GetOpcode() == ValueOpcode::LogicalNot) {
+				negated   = !negated;
+				predicate = top->Arg(0);
+			} else if (top->GetOpcode() == ValueOpcode::AnyLane &&
+			           (WaveUniform(top->Arg(0)) || WaveUniform(fact))) {
+				predicate = top->Arg(0);
+			} else {
+				break;
+			}
+		}
+		constexpr size_t                MaxAtoms = 12;
+		std::vector<const Inst*>        atoms;
+		std::vector<const Inst*>        pending;
+		std::unordered_set<const Inst*> seen;
+		const auto                      visit = [&](Value value) {
+			const auto* inst = value.Resolve().TryInstruction();
+			if (inst != nullptr && seen.insert(inst).second) {
+				pending.push_back(inst);
+			}
+		};
+		visit(predicate);
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (IsBooleanOperator(inst->GetOpcode())) {
+				for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+					visit(inst->Arg(arg));
+				}
+			} else if (inst->GetOpcode() == ValueOpcode::AnyLane && WaveUniform(inst->Arg(0))) {
+				visit(inst->Arg(0));
+			} else {
+				atoms.push_back(inst);
+			}
+		}
+		const auto fact_atom = std::ranges::find(atoms, &fact);
+		if (fact_atom == atoms.end() || atoms.size() > MaxAtoms) {
+			return false;
+		}
+		const auto fact_index = static_cast<size_t>(fact_atom - atoms.begin());
+		for (uint32_t assignment = 0; assignment < (1u << atoms.size()); assignment++) {
+			const auto evaluate = [&](auto& self, Value value) -> bool {
+				value = value.Resolve();
+				if (value.IsImmediate()) {
+					return value.U1();
+				}
+				const auto* inst = value.TryInstruction();
+				switch (inst->GetOpcode()) {
+					case ValueOpcode::LogicalAnd:
+						return self(self, inst->Arg(0)) && self(self, inst->Arg(1));
+					case ValueOpcode::LogicalOr:
+						return self(self, inst->Arg(0)) || self(self, inst->Arg(1));
+					case ValueOpcode::LogicalXor:
+						return self(self, inst->Arg(0)) != self(self, inst->Arg(1));
+					case ValueOpcode::LogicalNot: return !self(self, inst->Arg(0));
+					case ValueOpcode::SelectU1:
+						return self(self, inst->Arg(0)) ? self(self, inst->Arg(1))
+						                                : self(self, inst->Arg(2));
+					default: {
+						const auto index =
+						    static_cast<size_t>(std::ranges::find(atoms, inst) - atoms.begin());
+						return ((assignment >> index) & 1u) != 0u;
+					}
+				}
+			};
+			if (evaluate(evaluate, predicate) != negated &&
+			    ((assignment >> fact_index) & 1u) == 0u) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool BlockRunsOnlyWhen(const Block& block, const Inst& fact) const {
+		const auto& blocks = m_program.blocks;
+		if (blocks.empty() || !CanReach(blocks.front(), &block, nullptr)) {
+			return false;
+		}
+		std::unordered_map<const Block*, size_t> indices;
+		for (size_t index = 0; index < blocks.size(); index++) {
+			indices.emplace(blocks[index], index);
+		}
+		const auto target = indices.at(&block);
+		std::vector<std::vector<bool>> dominators(blocks.size(),
+		                                          std::vector<bool>(blocks.size(), true));
+		dominators.front().assign(blocks.size(), false);
+		dominators.front().front() = true;
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t index = 1; index < blocks.size(); index++) {
+				std::vector<bool> next(blocks.size(), true);
+				for (const auto* predecessor: blocks[index]->ImmPredecessors()) {
+					const auto found = indices.find(predecessor);
+					if (found == indices.end()) {
+						return false;
+					}
+					for (size_t candidate = 0; candidate < next.size(); candidate++) {
+						next[candidate] = next[candidate] && dominators[found->second][candidate];
+					}
+				}
+				next[index] = true;
+				if (next != dominators[index]) {
+					dominators[index] = std::move(next);
+					changed           = true;
+				}
+			}
+		}
+		for (size_t index = 0; index < blocks.size(); index++) {
+			const auto* branch = blocks[index];
+			const auto& info   = m_program.block_info[index];
+			if (branch == &block || !dominators[target][index] ||
+			    info.terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
+			    info.condition.IsEmpty()) {
+				continue;
+			}
+			const auto* taken     = FindBlock(info.terminator.true_block);
+			const auto* not_taken = FindBlock(info.terminator.false_block);
+			if (taken == nullptr || not_taken == nullptr || taken == not_taken) {
+				continue;
+			}
+			const bool via_taken     = CanReach(taken, &block, branch);
+			const bool via_not_taken = CanReach(not_taken, &block, branch);
+			if (via_taken != via_not_taken && PredicateImplies(info.condition, via_not_taken, fact)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool MatchLoopKeyBound(const Inst& key, const Inst& handle, Value& bound) const {
+		if (key.GetOpcode() != ValueOpcode::Phi || key.NumArgs() != 2u ||
+		    handle.Parent() == nullptr) {
+			return false;
+		}
+		bool starts_at_zero = false;
+		bool steps_by_one   = false;
+		for (size_t operand = 0; operand < 2u; operand++) {
+			const auto value     = key.Arg(operand).Resolve();
+			uint32_t   immediate = 0;
+			if (ImmediateU32(value, immediate)) {
+				starts_at_zero = starts_at_zero || immediate == 0u;
+				continue;
+			}
+			const auto* step = value.TryInstruction();
+			if (step == nullptr || step->GetOpcode() != ValueOpcode::IAdd32 ||
+			    step->NumArgs() != 2u) {
+				continue;
+			}
+			for (size_t arg = 0; arg < 2u; arg++) {
+				uint32_t one = 0;
+				steps_by_one = steps_by_one ||
+				               (step->Arg(arg).Resolve().TryInstruction() == &key &&
+				                ImmediateU32(step->Arg(1u - arg), one) && one == 1u);
+			}
+		}
+		if (!starts_at_zero || !steps_by_one) {
+			return false;
+		}
+		for (const auto& use: key.Uses()) {
+			const auto* compare = use.user;
+			if (compare == nullptr || use.operand != 0u || compare->NumArgs() != 2u ||
+			    (compare->GetOpcode() != ValueOpcode::SLessThan32 &&
+			     compare->GetOpcode() != ValueOpcode::ULessThan32) ||
+			    compare->Arg(1).Resolve().TryInstruction() == &key ||
+			    !BlockRunsOnlyWhen(*handle.Parent(), *compare)) {
+				continue;
+			}
+			bound = compare->Arg(1).Resolve();
+			return true;
+		}
+		return false;
+	}
+
+	static void CollectConjuncts(Value predicate, std::vector<const Inst*>& out) {
+		std::vector<Value> pending {predicate};
+		while (!pending.empty()) {
+			const auto value = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || std::ranges::find(out, inst) != out.end()) {
+				continue;
+			}
+			out.push_back(inst);
+			if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+				pending.push_back(inst->Arg(0));
+				pending.push_back(inst->Arg(1));
+			} else if (inst->GetOpcode() == ValueOpcode::AnyLane && WaveUniform(inst->Arg(0))) {
+				pending.push_back(inst->Arg(0));
+			} else if (inst->GetOpcode() == ValueOpcode::SelectU1) {
+				const auto alternative = inst->Arg(2).Resolve();
+				if (alternative.IsImmediate() && !alternative.U1()) {
+					pending.push_back(inst->Arg(0));
+					pending.push_back(inst->Arg(1));
+				}
+			}
+		}
+	}
+
+	bool ConjunctBound(std::span<const Inst* const> conjuncts, Value item, uint32_t& bound) const {
+		for (const auto* conjunct: conjuncts) {
+			const auto opcode = conjunct->GetOpcode();
+			const bool less =
+			    opcode == ValueOpcode::SLessThan32 || opcode == ValueOpcode::ULessThan32;
+			const bool greater =
+			    opcode == ValueOpcode::SGreaterThan32 || opcode == ValueOpcode::UGreaterThan32;
+			if ((!less && !greater) || conjunct->NumArgs() != 2u) {
+				continue;
+			}
+			const auto subject = less ? conjunct->Arg(0) : conjunct->Arg(1);
+			const auto limit   = less ? conjunct->Arg(1) : conjunct->Arg(0);
+			uint32_t   value   = 0;
+			if (!EquivalentValue(m_program, subject, item) || !ImmediateU32(limit, value) ||
+			    value == 0u) {
+				continue;
+			}
+			bound = value;
+			return true;
+		}
+		return false;
+	}
+
+	const MemoryInfo* PerLaneAddressReadMemory(const Inst& read, uint32_t& index) const {
+		if (read.GetOpcode() != ValueOpcode::LoadAddressU32 || read.NumArgs() != 4u) {
+			return nullptr;
+		}
+		index = read.Flags<MemoryFlags>().index;
+		if (index >= m_program.memory_info.size()) {
+			return nullptr;
+		}
+		const auto& memory = m_program.memory_info[index];
+		return IsAddressResourceKind(memory.kind) && memory.kind != ResourceKind::Scratch &&
+		               memory.data_bits == 32u && memory.data_dwords == 1u
+		           ? &memory
+		           : nullptr;
+	}
+
+	// Keys a readlane picks from a per-lane record load whose index the load's enable bounds by
+	// an immediate: every admitted record supplies a candidate key.
+	bool MatchReadLaneProbe(const Inst& key, uint32_t pc, DescriptorSource& material_source,
+	                        DescriptorSource::IndirectImage& indirect, std::string& reason) {
+		if (key.GetOpcode() != ValueOpcode::ReadLane || key.NumArgs() != 2u) {
+			reason = "key is not a readlane of a per-lane value";
+			return false;
+		}
+		const Inst* load = key.Arg(0).Resolve().TryInstruction();
+		Value       predicate;
+		if (load != nullptr && load->GetOpcode() == ValueOpcode::SelectU32) {
+			// A lane whose record load is disabled must read back as key 0, which the
+			// enumeration always includes.
+			uint32_t fallback = UINT32_MAX;
+			if (!ImmediateU32(load->Arg(2), fallback) || fallback != 0u) {
+				reason = "a disabled record lane does not read back as key 0";
+				return false;
+			}
+			predicate = load->Arg(0).Resolve();
+			load      = load->Arg(1).Resolve().TryInstruction();
+		}
+		uint32_t memory_index = 0;
+		if (load == nullptr || PerLaneAddressReadMemory(*load, memory_index) == nullptr ||
+		    !MemoryIndexBelongsTo(memory_index, *load)) {
+			reason = "per-lane key is not a 32-bit address load";
+			return false;
+		}
+		if (predicate.IsEmpty()) {
+			predicate = load->Arg(3).Resolve();
+		} else if (load->Arg(3).Resolve() != predicate) {
+			reason = "the select around the key load is not the load's enable";
+			return false;
+		}
+		const auto* material_handle = load->Arg(0).Resolve().TryInstruction();
+		if (material_handle == nullptr) {
+			reason = "key load has no address resource";
+			return false;
+		}
+		AffineOffset offset;
+		if (!MatchAffineOffset(load->Arg(1), predicate, offset) || offset.index.IsEmpty() ||
+		    offset.stride == 0u) {
+			reason = "key load offset is not record index times stride plus a constant";
+			return false;
+		}
+		std::vector<const Inst*> conjuncts;
+		CollectConjuncts(predicate, conjuncts);
+		uint32_t bound = 0;
+		if (!ConjunctBound(conjuncts, offset.index, bound)) {
+			reason = "record index has no immediate upper bound in the key load's enable";
+			return false;
+		}
+		if (bound > MaxDenseIndirectImageEntries) {
+			reason = "record index bound exceeds the enumeration cap";
+			return false;
+		}
+		if (material_handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    !MakeRuntimeTableSource(*material_handle, pc, material_source)) {
+			reason = "record table address cannot be evaluated before the draw";
+			return false;
+		}
+		indirect.selector_offset = static_cast<uint32_t>(offset.offset);
+		indirect.selector_stride = static_cast<uint32_t>(offset.stride);
+		indirect.key_count       = Value(bound);
+		return true;
+	}
+
+	bool MatchKeyBound(const Inst& key, uint32_t& bound) const {
+		for (const auto& use: key.Uses()) {
+			uint32_t limit = 0;
+			if (use.user == nullptr || use.user->GetOpcode() != ValueOpcode::ULessThan32 ||
+			    use.user->NumArgs() != 2u || use.operand != 0u ||
+			    !ImmediateU32(use.user->Arg(1), limit) || limit == 0u ||
+			    limit > MaxDenseIndirectImageEntries) {
+				continue;
+			}
+			bound = limit;
+			return true;
+		}
+		return false;
+	}
+
+	// Address tables whose key bound the matchers above do not prove: an immediate unsigned bound
+	// on the key, a loop bound proven by dominating branches, or keys a readlane probes from a
+	// bounded record table.
+	bool TryMakeDenseIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+		Inst*                   heap_handle = nullptr;
+		const Inst*             based       = nullptr;
+		std::array<Inst*, 8>    reads {};
+		std::array<uint32_t, 8> memory_indices {};
+		if (!MatchDenseTable(handle, heap_handle, based, reads, memory_indices)) {
+			return false;
+		}
+		uint32_t table_offset = 0;
+		Value    scaled_value;
+		if (based->GetOpcode() != ValueOpcode::IAdd32 || based->NumArgs() != 2u) {
+			return false;
+		}
+		if (ImmediateU32(based->Arg(1), table_offset)) {
+			scaled_value = based->Arg(0);
+		} else if (ImmediateU32(based->Arg(0), table_offset)) {
+			scaled_value = based->Arg(1);
+		} else {
+			return false;
+		}
+		const auto* scaled = scaled_value.Resolve().TryInstruction();
+		uint32_t    shift  = 0;
+		if (scaled == nullptr || scaled->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    scaled->NumArgs() != 2u || !ImmediateU32(scaled->Arg(1), shift) ||
+		    shift != DenseIndirectImageShift) {
+			return false;
+		}
+		auto* key = scaled->Arg(0).Resolve().TryInstruction();
+		if (key == nullptr) {
+			return false;
+		}
+		DescriptorSource                material_source;
+		DescriptorSource::IndirectImage indirect;
+		uint32_t                        bound = 0;
+		Value                           loop_bound;
+		if (MatchKeyBound(*key, bound)) {
+			indirect.key_count = Value(bound);
+		} else if (MatchLoopKeyBound(*key, handle, loop_bound)) {
+			if (!ValidateRuntimeValue(m_program, loop_bound, RuntimeValueType::Integer)) {
+				return false;
+			}
+			indirect.key_count = loop_bound;
+		} else if (MatchReadLaneProbe(*key, pc, material_source, indirect, m_indirect_reason)) {
+			indirect.material_source = InternSource(material_source);
+		} else {
+			return false;
+		}
+		const std::array<const Inst*, 1> image_users {&handle};
+		for (const auto* read: reads) {
+			if (!UsesOnly(*read, image_users)) {
+				return false;
+			}
+		}
+
+		DescriptorSource table_source;
+		if (heap_handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    !MakeRuntimeTableSource(*heap_handle, pc, table_source)) {
+			return false;
+		}
+		indirect.table_source = InternSource(table_source);
+		indirect.table_offset = table_offset;
+
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		std::copy_n(material_source.dwords.begin(), material_source.dword_count,
+		            image_source.dwords.begin());
+		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
+		            image_source.dwords.begin() + 4u);
+		image_source.indirect_image = indirect;
+
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = Value(key);
+		plan.roots  = image_source.dwords;
+		std::copy(memory_indices.begin(), memory_indices.end(), plan.memory.begin());
+		std::copy(reads.begin(), reads.end(), plan.reads.begin());
 		return true;
 	}
 
@@ -1007,8 +1654,13 @@ private:
 					continue;
 				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				const auto        pc = inst.Flags<MemoryFlags>().pc;
+				m_indirect_reason.clear();
+				if (TryMakeIndirectImage(*handle, pc, plan) ||
+				    TryMakeDenseIndirectImage(*handle, pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
+				} else if (!m_indirect_reason.empty()) {
+					m_indirect_reasons[handle] = m_indirect_reason;
 				}
 			}
 		}
@@ -1022,15 +1674,32 @@ private:
 		}
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
-		uint32_t bad_dword = 0;
-		if (!ValidateSource(descriptor, bad_dword)) {
+		uint32_t    bad_dword = 0;
+		std::string reason;
+		while (!ValidateSource(descriptor, bad_dword, &reason)) {
 			if (expected == ValueOpcode::GetBufferResource &&
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			// Soft ladder (PPSA21564): a sampler S# anisotropy / LOD-clamp / border dword (2-3)
+			// the shader left holding non-descriptor scratch (a loop-counter phi,
+			// min(iter, 0x3c), ...) that CanonicalizeSamplerScratchDwords did not catch. Those
+			// fields are don't-care for the fetch, so zero them and carry on. Dwords 0-1 and
+			// every image / buffer / address dword stay strict -- a real unresolved descriptor
+			// still aborts loudly.
+			if (expected == ValueOpcode::GetSamplerResource && bad_dword >= 2 &&
+			    bad_dword < descriptor.dword_count && !descriptor.dwords[bad_dword].IsImmediate()) {
+				descriptor.dwords[bad_dword] = Value(0u);
+				handle->SetArg(bad_dword, Value(0u));
+				continue;
+			}
+			const auto indirect = m_indirect_reasons.find(handle);
+			Fail(pc, fmt::format("{} dword {} is not a valid runtime value: {}{}",
+			                     ValueOpcodeName(expected), bad_dword, reason,
+			                     indirect != m_indirect_reasons.end()
+			                         ? " (indirect table: " + indirect->second + ")"
+			                         : ""));
 		}
 		source = InternSource(descriptor);
 		return true;
@@ -1320,6 +1989,9 @@ private:
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+	// Why an image handle was not recognised as an indirect table, for the failure message.
+	std::unordered_map<const Inst*, std::string> m_indirect_reasons;
+	std::string                                  m_indirect_reason;
 };
 
 } // namespace

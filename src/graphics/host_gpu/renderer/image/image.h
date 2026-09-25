@@ -124,6 +124,7 @@ public:
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
+
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)

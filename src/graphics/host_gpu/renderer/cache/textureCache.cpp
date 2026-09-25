@@ -24,6 +24,7 @@
 #include <limits>
 #include <mutex>
 #include <span>
+#include <vector>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -672,6 +673,32 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+static bool GrowImageToLayers(ImageInfo& info, uint32_t layers) {
+	const auto current = info.resources.layers;
+	if (info.resources.levels != 1 || current == 0 || layers <= current ||
+	    info.mip_layout[0].offset != 0 || info.mip_layout[0].size != info.data.size) {
+		return false;
+	}
+	const auto stretch = [&](GuestRange& range) {
+		if (range.Empty()) {
+			return true;
+		}
+		if (range.size % current != 0) {
+			return false;
+		}
+		range.size = range.size / current * layers;
+		return true;
+	};
+	auto grown = info;
+	if (!stretch(grown.data) || !stretch(grown.stencil) || !stretch(grown.metadata.range)) {
+		return false;
+	}
+	grown.mip_layout[0].size = grown.data.size;
+	grown.resources.layers   = layers;
+	info                     = grown;
+	return true;
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -735,7 +762,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.resources  = cached.info.resources;
 		info.mip_layout = cached.info.mip_layout;
 	} else {
-		info.resources = std::max(requested.resources, cached.info.resources);
+		auto merged = std::max(requested.resources, cached.info.resources);
+		if (merged.layers > requested.resources.layers &&
+		    !GrowImageToLayers(info, merged.layers)) {
+			merged.layers = requested.resources.layers;
+		}
+		info.resources = merged;
 	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
@@ -965,6 +997,13 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	transfer.regions = TextureBuildImageCopies(transfer.layout);
+	const auto tile_base =
+	    direction == TransferDirection::Upload ? info.resident_base_level : 0u;
+	if (tile_base != 0) {
+		std::erase_if(transfer.regions, [tile_base](const vk::BufferImageCopy& region) {
+			return region.imageSubresource.mipLevel < tile_base;
+		});
+	}
 	if (info.IsDepth()) {
 		for (auto& region: transfer.regions) {
 			region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
@@ -972,7 +1011,7 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	}
 	if (transfer.layout.surface.description.tile_mode != Prospero::TileMode::kLinear) {
 		if (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
-		                              info.resources.levels, transfer.tiles)) {
+		                              info.resources.levels, transfer.tiles, tile_base)) {
 			return transfer;
 		}
 	}
@@ -1088,6 +1127,54 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
+namespace {
+
+// A BC7 block encodes its mode as the position of the lowest set bit of its first byte, so a
+// zero first byte is not a legal block - it is memory nobody wrote. A streaming title only
+// backs the levels it has pulled in and packs other textures immediately behind them, and
+// MIN_LOD only tells us about some of those. Sampling each level for unwritten blocks finds
+// the boundary for the rest: a level that is really there reads back clean.
+[[nodiscard]] uint32_t FindResidentBaseLevel(const ImageInfo& info) {
+	constexpr uint32_t kBlockBytes    = 16;
+	constexpr uint32_t kMaxSamples    = 2048;
+	constexpr uint32_t kUnwrittenPart = 8;  // more than one block in eight means not resident
+	if (info.guest_format != Prospero::BufferFormat::kBc7UNorm &&
+	    info.guest_format != Prospero::BufferFormat::kBc7Srgb) {
+		return 0;
+	}
+	std::array<uint8_t, kBlockBytes> block {};
+	uint32_t                         base = 0;
+	for (uint32_t level = 0; level + 1 < info.resources.levels; level++) {
+		const auto& mip = info.mip_layout[level];
+		if (mip.size < kBlockBytes) {
+			break;
+		}
+		const auto blocks = static_cast<uint32_t>(mip.size / kBlockBytes);
+		const auto step   = std::max(1u, blocks / kMaxSamples);
+		uint32_t   seen   = 0;
+		uint32_t   empty  = 0;
+		for (uint32_t i = 0; i < blocks; i += step) {
+			const auto at = info.data.address + mip.offset + static_cast<uint64_t>(i) * kBlockBytes;
+			if (!Libs::LibKernel::Memory::TryReadBacking(at, block.data(), 1)) {
+				break;
+			}
+			seen++;
+			if (block[0] == 0) {
+				empty++;
+			}
+		}
+		// Do not stop at the first level that reads clean: the coarsest levels of an
+		// overrunning surface land on a neighbouring texture and look like perfectly good
+		// blocks. Keep going and take the level after the last one that is clearly unwritten.
+		if (seen != 0 && empty * kUnwrittenPart > seen) {
+			base = level + 1;
+		}
+	}
+	return base;
+}
+
+} // namespace
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
@@ -1102,6 +1189,9 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	if (image.info.samples > 1) {
 		return;
+	}
+	if (image.info.resident_base_level == 0) {
+		image.info.resident_base_level = FindResidentBaseLevel(image.info);
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
@@ -1263,8 +1353,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
+			auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
+				// The cached image keeps whatever resident_base_level it first admitted;
+				// streaming can only add finer mips over time, never take them away, so if
+				// this request now sees a lower (more complete) level, adopt it and mark
+				// the image for re-upload so InitializeImage() actually pulls the newly
+				// resident levels in instead of leaving them permanently skipped.
+				if (desc.info.resident_base_level < image.info.resident_base_level) {
+					image.info.resident_base_level = desc.info.resident_base_level;
+					image.MarkBufferModified();
+				}
 				result = id;
 			}
 		}
@@ -1303,6 +1402,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		auto& image = m_slot_images[result];
+		if (desc.info.tile_mode == Prospero::TileMode::kDepth &&
+		    (desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+		    (image.info.data.size != desc.info.data.size ||
+		     !(image.info.resources == desc.info.resources))) {
+			LOGF("TextureCache: depth-tiled view matched a differently shaped image: requested"
+			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " levels=%u layers=%u extent=%ux%u,"
+			     " image addr=0x%016" PRIx64 " size=0x%016" PRIx64 " levels=%u layers=%u"
+			     " extent=%ux%u fmt=%u depth=%d usage=%s%s%s%s gpu_modified=%d cpu_dirty=%d"
+			     " view_mip=%d view_layer=%d\n",
+			     desc.info.data.address, desc.info.data.size, desc.info.resources.levels,
+			     desc.info.resources.layers, desc.info.extent.width, desc.info.extent.height,
+			     image.info.data.address, image.info.data.size, image.info.resources.levels,
+			     image.info.resources.layers, image.info.extent.width, image.info.extent.height,
+			     static_cast<uint32_t>(image.info.guest_format), image.info.IsDepth() ? 1 : 0,
+			     image.usage.texture ? "texture " : "", image.usage.storage ? "storage " : "",
+			     image.usage.render_target ? "render_target " : "",
+			     image.usage.depth_target ? "depth_target " : "", image.IsGpuModified() ? 1 : 0,
+			     image.IsCpuDirty() ? 1 : 0, view_mip, view_layer);
+		}
 		if (view_mip >= 0) {
 			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
 		}
@@ -1902,11 +2020,18 @@ bool TextureCache::IsMeta(uint64_t address) {
 	return found != m_surface_metas.end();
 }
 
-bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
+bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value,
+                                 bool* fill_known) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
+	}
+	if (fill_value != nullptr) {
+		*fill_value = found->second.fill_value;
+	}
+	if (fill_known != nullptr) {
+		*fill_known = found->second.fill_known;
 	}
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
@@ -1918,6 +2043,19 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_known = false;
+	return true;
+}
+
+bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_value = fill_value;
+	found->second.fill_known = true;
 	return true;
 }
 

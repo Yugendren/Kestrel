@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -829,6 +830,16 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00:
 			m_predicate_skip = false;
 			return;
+		case 0x02: { // primitive-count predication
+			// No emulated primitive counter -- treat as unpredicated (draw everything) rather
+			// than risk wrongly culling.
+			m_predicate_skip = false;
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1) < 32) {
+				LOGF("\t predication op 0x%08" PRIx32 " (primcount) treated as unpredicated\n", op);
+			}
+			return;
+		}
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			// One begin/end pair per DB; bit 63 marks each counter ready.
@@ -906,6 +917,16 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
+	        m_draw_indirect_args_base_addr + data_offset,
+	        indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs))) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("DrawIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     m_draw_indirect_args_base_addr + data_offset);
+		}
+	}
 
 	if (!indexed) {
 		DrawIndirectArgs args {};
@@ -963,6 +984,15 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
+		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(reinterpret_cast<uint64_t>(count_addr),
+		                                                  sizeof(uint32_t))) {
+			static std::atomic<uint32_t> sync_fallback_logs {0};
+			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DrawIndirectMulti: failed to synchronise the draw count at 0x%016" PRIx64
+				     " (image-owned range, reading guest memory)\n",
+				     reinterpret_cast<uint64_t>(count_addr));
+			}
+		}
 		draw_count = *count_addr;
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
@@ -975,6 +1005,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
+	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
+	        m_draw_indirect_args_base_addr + data_offset,
+	        static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes + args_size)) {
+		static std::atomic<uint32_t> sync_fallback_logs {0};
+		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("DrawIndirectMulti: failed to synchronise indirect arguments at 0x%016" PRIx64
+			     " (image-owned range, reading guest memory)\n",
+			     m_draw_indirect_args_base_addr + data_offset);
+		}
+	}
 
 	uint64_t index_size = 0;
 	if (indexed) {
@@ -1092,8 +1132,20 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		// Thread-dimension counts are converted on the host, so GPU-written arguments must reach
+		// guest memory before they are read.
+		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr,
+		                                                  sizeof(vk::DispatchIndirectCommand))) {
+			static std::atomic<uint32_t> sync_fallback_logs {0};
+			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
+				     " (image-owned range, reading guest memory)\n",
+				     args_addr);
+			}
+		}
+		vk::DispatchIndirectCommand args {};
+		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
@@ -1409,15 +1461,21 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			// Real Vulkan occlusion query where the sample can be serviced (render pass open,
+			// pool available): the begin/end dump pair maps onto beginQuery/endQuery around the
+			// one occlusion-tested draw the guest brackets. SampleOcclusion writes the block.
+			if (GetScheduler().Active() && GetScheduler().SampleOcclusion(event_address)) {
+				break;
+			}
+
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
+				std::printf("Warning: occlusion query could not be serviced by a host query; "
+				            "falling back to always-visible (culling lost for this sample).\n");
 			});
 
-			// Until host occlusion queries are implemented, publish an always-visible result. The
-			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
+			// Fallback: publish an always-visible result. The PS5 layout contains one interleaved
+			// begin/end pair per DB, and bit 63 marks a result ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
