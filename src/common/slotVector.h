@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/abi.h"
+#include "common/common.h"
 
 #include <compare>
 #include <cstddef>
@@ -41,6 +42,12 @@ struct SlotId {
 // bytes into the slot, a cache line the caller never touches otherwise, so every lookup paid an
 // extra miss), and indexing is shift/mask plus two loads instead of std::deque's
 // iterator arithmetic.
+//
+// The lookup path (operator[], try_get, is_allocated) is forced inline: it is a bounds check,
+// two loads and a compare, and the texture cache calls it for every candidate image of every
+// lookup. Left to the inliner, operator[] became an out-of-line call with a full frame for each
+// T. The EXIT_IF failure branch is cold (see common/assert.h), so inlining adds no call sequence
+// to the caller's hot path.
 template <typename T>
 class SlotVector {
 public:
@@ -54,23 +61,23 @@ public:
 	}
 	KYTY_CLASS_NO_COPY(SlotVector);
 
-	[[nodiscard]] T& operator[](SlotId id) noexcept {
+	[[nodiscard]] KYTY_FORCE_INLINE T& operator[](SlotId id) noexcept {
 		EXIT_IF(!is_allocated(id));
 		return *Value(id.index);
 	}
 
-	[[nodiscard]] const T& operator[](SlotId id) const noexcept {
+	[[nodiscard]] KYTY_FORCE_INLINE const T& operator[](SlotId id) const noexcept {
 		EXIT_IF(!is_allocated(id));
 		return *Value(id.index);
 	}
 
-	[[nodiscard]] T* try_get(SlotId id) noexcept { return is_allocated(id) ? Value(id.index) : nullptr; }
+	[[nodiscard]] KYTY_FORCE_INLINE T* try_get(SlotId id) noexcept { return is_allocated(id) ? Value(id.index) : nullptr; }
 
-	[[nodiscard]] const T* try_get(SlotId id) const noexcept {
+	[[nodiscard]] KYTY_FORCE_INLINE const T* try_get(SlotId id) const noexcept {
 		return is_allocated(id) ? Value(id.index) : nullptr;
 	}
 
-	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
+	[[nodiscard]] KYTY_FORCE_INLINE bool is_allocated(SlotId id) const noexcept {
 		if (!id || id.index >= m_meta.size()) {
 			return false;
 		}
@@ -148,7 +155,7 @@ private:
 		bool     alive      = false;
 	};
 
-	[[nodiscard]] T* Value(uint32_t index) const noexcept {
+	[[nodiscard]] KYTY_FORCE_INLINE T* Value(uint32_t index) const noexcept {
 		return std::launder(reinterpret_cast<T*>(m_chunks[index >> CHUNK_SHIFT][index & CHUNK_MASK].bytes));
 	}
 
