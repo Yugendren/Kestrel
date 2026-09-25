@@ -960,10 +960,6 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 
-bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
-	return std::memcmp(this, &other, sizeof(*this)) == 0;
-}
-
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -1102,7 +1098,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	if (const auto* last = m_last_graphics_pipeline.Find(key, 0); last != nullptr) {
+		return **last;
+	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		m_last_graphics_pipeline.Store(key, 0, iter->second.get());
 		return *iter->second;
 	}
 
@@ -1125,8 +1125,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	auto [iter, inserted] = m_graphics_pipelines.emplace(key, std::move(cached));
 	EXIT_IF(!inserted);
+	m_last_graphics_pipeline.Store(key, 0, iter->second.get());
 
 	// m_mutex is already held by the LockGuard above, so MaybeSaveLocked() (not Save()) here.
 	MaybeSaveLocked();

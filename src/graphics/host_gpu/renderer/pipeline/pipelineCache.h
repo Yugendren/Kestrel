@@ -66,7 +66,9 @@ struct PipelineStaticParameters {
 	bool                   separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                   blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 
-	bool operator==(const PipelineStaticParameters& other) const noexcept;
+	bool operator==(const PipelineStaticParameters& other) const noexcept {
+		return std::memcmp(this, &other, sizeof(*this)) == 0;
+	}
 };
 
 #pragma pack(pop)
@@ -129,6 +131,20 @@ static_assert(sizeof(PipelineVertexInputState) ==
               2 + (sizeof(PipelineVertexInputState::Binding) +
                    sizeof(PipelineVertexInputState::Attribute)) *
                       ShaderVertexInputInfo::RES_MAX);
+
+struct GraphicsPipelineKey {
+	PipelineRenderingState   rendering;
+	std::array<uint64_t, 3>  vertex_shader_ids {};
+	uint64_t                 ps_shader_id = 0;
+	PipelineVertexInputState vertex_input;
+	PipelineStaticParameters static_params;
+
+	bool operator==(const GraphicsPipelineKey& other) const {
+		return rendering == other.rendering && vertex_shader_ids == other.vertex_shader_ids &&
+		       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
+		       static_params == other.static_params;
+	}
+};
 
 struct ShaderProgram {
 	uint64_t         id     = 0;
@@ -215,20 +231,6 @@ private:
 
 	struct ProgramCache;
 
-	struct GraphicsPipelineKey {
-		PipelineRenderingState   rendering;
-		std::array<uint64_t, 3>  vertex_shader_ids {};
-		uint64_t                 ps_shader_id = 0;
-		PipelineVertexInputState vertex_input;
-		PipelineStaticParameters static_params;
-
-		bool operator==(const GraphicsPipelineKey& other) const {
-			return rendering == other.rendering && vertex_shader_ids == other.vertex_shader_ids &&
-			       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
-			       static_params == other.static_params;
-		}
-	};
-
 	// Hashing used to mix the key byte-by-byte / field-by-field (109 Mix() calls just for
 	// static_params, plus a Mix() per vertex-input field), which measured ~155 ns/op for a
 	// real 696-byte key. GraphicsPipelineKeyHash below instead runs XXH3 once over each
@@ -287,6 +289,11 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// The previous draw's pipeline key and pipeline. Consecutive draws mostly rebuild an identical
+	// key, and comparing it with the last one is cheaper than hashing it and probing the map.
+	// Pipelines are never evicted, so a remembered answer never goes stale: the generation is
+	// always 0.
+	GenerationMemo<GraphicsPipelineKey, Pipeline*> m_last_graphics_pipeline;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 

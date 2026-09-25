@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/shaderProgramMemo.h"
 
 #include <array>
@@ -15,6 +16,9 @@ using Libs::Graphics::BuildPixelProgramKey;
 using Libs::Graphics::BuildVertexProgramKey;
 using Libs::Graphics::CopyVertexInputLayout;
 using Libs::Graphics::DstSel;
+using Libs::Graphics::GenerationMemo;
+using Libs::Graphics::GraphicsPipelineKey;
+using Libs::Graphics::PipelineTopologyClass;
 using Libs::Graphics::PixelProgramKey;
 using Libs::Graphics::ShaderRegistrationStamp;
 using Libs::Graphics::ShaderVertexInputInfo;
@@ -352,6 +356,83 @@ void TestLayoutFields() {
 	}
 }
 
+// ---- Graphics pipeline key -----------------------------------------------------------------
+
+GraphicsPipelineKey BasePipelineKey() {
+	GraphicsPipelineKey key {};
+	key.vertex_shader_ids[0]                  = 11;
+	key.ps_shader_id                          = 12;
+	key.rendering.color_count                 = 1;
+	key.rendering.color_formats[0]            = vk::Format::eR8G8B8A8Unorm;
+	key.rendering.depth_format                = vk::Format::eD32Sfloat;
+	key.vertex_input.binding_count            = 1;
+	key.vertex_input.attribute_count          = 1;
+	key.vertex_input.bindings[0]              = {.stride = 32, .instance = false};
+	key.vertex_input.attributes[0]            = {.offset = 0, .binding = 0};
+	key.static_params.samples                 = 1;
+	key.static_params.topology_class          = PipelineTopologyClass::Triangle;
+	key.static_params.color_mask[0]           = 0xf;
+	key.static_params.polygon_mode            = vk::PolygonMode::eFill;
+	return key;
+}
+
+void TestPipelineMemo() {
+	using Memo = GenerationMemo<GraphicsPipelineKey, int>;
+	Memo memo;
+	memo.Store(BasePipelineKey(), 0, 1);
+	const auto* hit = memo.Find(BasePipelineKey(), 0);
+	Check(hit != nullptr && *hit == 1, "an equal pipeline key hits");
+
+	struct PipelineCase {
+		const char*                               name;
+		std::function<void(GraphicsPipelineKey&)> mutate;
+	};
+	const std::vector<PipelineCase> cases = {
+	    {"vs program id", [](auto& k) { k.vertex_shader_ids[0] = 21; }},
+	    {"hs program id", [](auto& k) { k.vertex_shader_ids[1] = 31; }},
+	    {"tes program id", [](auto& k) { k.vertex_shader_ids[2] = 41; }},
+	    {"ps program id", [](auto& k) { k.ps_shader_id = 22; }},
+	    {"color_count", [](auto& k) { k.rendering.color_count = 2; }},
+	    {"color format", [](auto& k) { k.rendering.color_formats[0] = vk::Format::eB8G8R8A8Unorm; }},
+	    {"depth format", [](auto& k) { k.rendering.depth_format = vk::Format::eD16Unorm; }},
+	    {"stencil format",
+	     [](auto& k) { k.rendering.stencil_format = vk::Format::eD32SfloatS8Uint; }},
+	    {"binding_count", [](auto& k) { k.vertex_input.binding_count = 2; }},
+	    {"attribute_count", [](auto& k) { k.vertex_input.attribute_count = 2; }},
+	    {"binding stride", [](auto& k) { k.vertex_input.bindings[0].stride = 16; }},
+	    {"binding input rate", [](auto& k) { k.vertex_input.bindings[0].instance = true; }},
+	    {"attribute offset", [](auto& k) { k.vertex_input.attributes[0].offset = 4; }},
+	    {"attribute binding", [](auto& k) { k.vertex_input.attributes[0].binding = 1; }},
+	    {"negative_one_to_one", [](auto& k) { k.static_params.negative_one_to_one = true; }},
+	    {"depth_clip_enable", [](auto& k) { k.static_params.depth_clip_enable = false; }},
+	    {"topology class",
+	     [](auto& k) { k.static_params.topology_class = PipelineTopologyClass::Line; }},
+	    {"samples", [](auto& k) { k.static_params.samples = 4; }},
+	    {"sample_shading_enable", [](auto& k) { k.static_params.sample_shading_enable = true; }},
+	    {"color_mask", [](auto& k) { k.static_params.color_mask[0] = 0x7; }},
+	    {"provoking_vtx_last", [](auto& k) { k.static_params.provoking_vtx_last = true; }},
+	    {"polygon_mode", [](auto& k) { k.static_params.polygon_mode = vk::PolygonMode::eLine; }},
+	    {"color_srcblend", [](auto& k) { k.static_params.color_srcblend[0] = 4; }},
+	    {"color_comb_fcn", [](auto& k) { k.static_params.color_comb_fcn[0] = 1; }},
+	    {"color_destblend", [](auto& k) { k.static_params.color_destblend[0] = 5; }},
+	    {"alpha_srcblend", [](auto& k) { k.static_params.alpha_srcblend[0] = 4; }},
+	    {"alpha_comb_fcn", [](auto& k) { k.static_params.alpha_comb_fcn[0] = 1; }},
+	    {"alpha_destblend", [](auto& k) { k.static_params.alpha_destblend[0] = 5; }},
+	    {"separate_alpha_blend", [](auto& k) { k.static_params.separate_alpha_blend[0] = true; }},
+	    {"blend_enable", [](auto& k) { k.static_params.blend_enable[0] = true; }},
+	    {"blend state of attachment 7", [](auto& k) { k.static_params.blend_enable[7] = true; }},
+	};
+	for (const auto& c: cases) {
+		auto key = BasePipelineKey();
+		c.mutate(key);
+		if (memo.Find(key, 0) != nullptr) {
+			std::fprintf(stderr, "ProgramMemoTests: pipeline memo ignores %s\n", c.name);
+			std::abort();
+		}
+		g_cases++;
+	}
+}
+
 } // namespace
 
 int main() {
@@ -362,6 +443,7 @@ int main() {
 	TestRegistrationStamp();
 	TestLayoutIgnoresAddressesAndRecordCounts();
 	TestLayoutFields();
+	TestPipelineMemo();
 	std::printf("ProgramMemoTests: all %d cases passed\n", g_cases);
 	return 0;
 }
