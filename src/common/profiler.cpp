@@ -2,10 +2,13 @@
 
 #include "common/emulatorConfig.h"
 
+#include <cstdio>
+
+#ifdef TRACY_ENABLE
+
 #include <algorithm>
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
-#include <cstdio>
 #include <tracy/Tracy.hpp>
 #include <vector>
 
@@ -72,3 +75,24 @@ void Shutdown() {
 }
 
 } // namespace Profiler
+
+#else // TRACY_ENABLE
+
+namespace Profiler {
+
+void EndBlock() {}
+
+void SetThreadName(const char* /*name*/) {}
+
+void Initialize() {
+	if (Config::ProfilerEnabled()) {
+		::printf("--profile ignored: this build has Tracy compiled out (configure with "
+		         "-DKYTY_TRACY=ON)\n");
+	}
+}
+
+void Shutdown() {}
+
+} // namespace Profiler
+
+#endif // TRACY_ENABLE

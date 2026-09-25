@@ -5,7 +5,9 @@
 
 #include <cstdint>
 #include <optional>
+#ifdef TRACY_ENABLE
 #include <tracy/Tracy.hpp> // IWYU pragma: export
+#endif
 
 namespace profiler::colors {
 
@@ -23,6 +25,7 @@ inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 
 namespace Profiler {
 
+#ifdef TRACY_ENABLE
 class ScopedBlock {
 public:
 	explicit ScopedBlock(const tracy::SourceLocationData* source_location);
@@ -37,6 +40,7 @@ public:
 private:
 	std::optional<tracy::ScopedZone> m_zone;
 };
+#endif
 
 void EndBlock();
 void SetThreadName(const char* name);
@@ -52,6 +56,8 @@ struct Lifecycle {
 };
 
 } // namespace Profiler
+
+#ifdef TRACY_ENABLE
 
 #define KYTY_PROFILER_CONCAT_IMPL(a, b) a##b
 #define KYTY_PROFILER_CONCAT(a, b)      KYTY_PROFILER_CONCAT_IMPL(a, b)
@@ -81,5 +87,17 @@ struct Lifecycle {
 #define KYTY_PROFILER_END_BLOCK Profiler::EndBlock()
 
 #define KYTY_PROFILER_THREAD(name) Profiler::SetThreadName(name)
+
+#else // TRACY_ENABLE
+
+// Tracy compiled out (KYTY_TRACY=OFF): a zone then costs nothing, not even the out-of-line
+// constructor/destructor pair and ProfilerAvailable() check that a disabled Tracy still pays on
+// every PM4 packet and draw.
+#define KYTY_PROFILER_BLOCK(name, ...)  static_cast<void>(0)
+#define KYTY_PROFILER_FUNCTION(...)     static_cast<void>(0)
+#define KYTY_PROFILER_END_BLOCK         static_cast<void>(0)
+#define KYTY_PROFILER_THREAD(name)      static_cast<void>(name)
+
+#endif // TRACY_ENABLE
 
 #endif /* KYTY_COMMON_PROFILER_H_ */

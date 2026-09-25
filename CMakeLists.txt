@@ -194,6 +194,11 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/KytyOptimization.cmake")
 
+# Tracy client. OFF compiles every KYTY_PROFILER_* zone to nothing (a disabled but compiled-in
+# Tracy still costs an out-of-line call pair per PM4 packet and per draw); --profile then only
+# prints that the build has no profiler.
+option(KYTY_TRACY "Compile in the Tracy profiler client (--profile)" ON)
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
