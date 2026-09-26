@@ -1164,7 +1164,7 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	transfer.regions = TextureBuildImageCopies(transfer.layout);
 	const auto tile_base =
-	    direction == TransferDirection::Upload ? info.resident_base_level : 0u;
+	    direction == TransferDirection::Upload ? info.uploaded_base_level : 0u;
 	if (tile_base != 0) {
 		std::erase_if(transfer.regions, [tile_base](const vk::BufferImageCopy& region) {
 			return region.imageSubresource.mipLevel < tile_base;
@@ -1300,6 +1300,12 @@ namespace {
 // backs the levels it has pulled in and packs other textures immediately behind them, and
 // MIN_LOD only tells us about some of those. Sampling each level for unwritten blocks finds
 // the boundary for the rest: a level that is really there reads back clean.
+//
+// A level's allocation is larger than its texels, though: tiled levels are padded out to whole
+// tiles and the smallest levels share one packed mip tail, and that padding is legitimately
+// zero. A 1600x256 BC7 surface, for example, has 400 blocks of texels in the 1024 its fourth
+// level occupies. Only zero blocks beyond what padding explains count as unwritten; otherwise
+// every padded level of a fully resident texture reads as missing.
 [[nodiscard]] uint32_t FindResidentBaseLevel(const ImageInfo& info) {
 	constexpr uint32_t kBlockBytes    = 16;
 	constexpr uint32_t kMaxSamples    = 2048;
@@ -1317,6 +1323,11 @@ namespace {
 		}
 		const auto blocks = static_cast<uint32_t>(mip.size / kBlockBytes);
 		const auto step   = std::max(1u, blocks / kMaxSamples);
+		const auto slices =
+		    info.IsVolume() ? std::max(info.extent.depth >> level, 1u) : info.resources.layers;
+		const uint64_t texel_blocks =
+		    static_cast<uint64_t>((std::max(info.extent.width >> level, 1u) + 3) / 4) *
+		    ((std::max(info.extent.height >> level, 1u) + 3) / 4) * slices;
 		uint32_t   seen   = 0;
 		uint32_t   empty  = 0;
 		for (uint32_t i = 0; i < blocks; i += step) {
@@ -1332,7 +1343,11 @@ namespace {
 		// Do not stop at the first level that reads clean: the coarsest levels of an
 		// overrunning surface land on a neighbouring texture and look like perfectly good
 		// blocks. Keep going and take the level after the last one that is clearly unwritten.
-		if (seen != 0 && empty * kUnwrittenPart > seen) {
+		const uint64_t padding =
+		    texel_blocks < blocks ? static_cast<uint64_t>(seen) * (blocks - texel_blocks) / blocks
+		                          : 0;
+		if (seen > padding && empty > padding &&
+		    (empty - padding) * kUnwrittenPart > seen - padding) {
 			base = level + 1;
 		}
 	}
@@ -1356,11 +1371,15 @@ void TextureCache::InitializeImage(ImageId id) {
 	if (image.info.samples > 1) {
 		return;
 	}
-	if (image.info.resident_base_level == 0) {
-		image.info.resident_base_level = FindResidentBaseLevel(image.info);
-	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		// Residency is re-derived from the bytes being uploaded rather than stored into
+		// resident_base_level: that field is what the guest's MIN_LOD declares, and FindImage()
+		// lowers it when a descriptor declares more. Folding a detected level into it made
+		// every cache hit whose descriptor declares nothing look like new residency, and each
+		// of those re-uploaded the image just to detect the same level again.
+		image.info.uploaded_base_level =
+		    std::max(image.info.resident_base_level, FindResidentBaseLevel(image.info));
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1935,6 +1954,24 @@ bool TextureCache::IsSampledViewCurrent(const Image& image, const ImageDesc& des
 	       !samples_stencil && image.IsSampleReady();
 }
 
+// The request's view starts at the level MIN_LOD declares resident, but the upload may have
+// stopped at a coarser level whose finer neighbours read back unwritten. Those levels were never
+// transferred, so a view exposing them samples undefined image memory. Start the view at the
+// first uploaded level instead, keeping the absolute LOD clamp and the last level unchanged.
+namespace {
+
+[[nodiscard]] ImageViewInfo ClampViewToUploadedLevels(ImageViewInfo view, const ImageInfo& info) {
+	const auto end      = view.base_level + view.level_count;
+	const auto min_lod  = view.base_level * 256u + view.min_lod;
+	view.base_level     = std::min(info.uploaded_base_level, end - 1u);
+	view.level_count    = end - view.base_level;
+	const auto base_lod = view.base_level * 256u;
+	view.min_lod        = min_lod > base_lod ? min_lod - base_lod : 0u;
+	return view;
+}
+
+} // namespace
+
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
@@ -1990,8 +2027,15 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	const auto view = image.FindView(desc.view_info);
+	const bool clamp_to_uploaded = desc.type == BindingType::Texture &&
+	                               desc.view_info.base_level < image.info.uploaded_base_level;
+	const auto view = image.FindView(clamp_to_uploaded
+	                                     ? ClampViewToUploadedLevels(desc.view_info, image.info)
+	                                     : desc.view_info);
 	if (desc.type == BindingType::Texture) {
+		// Keyed on the requested view: uploaded_base_level only moves on an upload, and an upload
+		// needs the image dirty, which fails IsSampleReady() and so the memo, until this path
+		// re-derives the clamped view.
 		image.last_sampled_view = {desc.view_info, view, gc_tick};
 	}
 	return view;

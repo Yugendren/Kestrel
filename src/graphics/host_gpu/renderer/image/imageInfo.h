@@ -69,6 +69,10 @@ struct ImageInfo {
 	// Smallest mip the guest says is resident (T# MIN_LOD, 4.8 fixed point). The larger mips
 	// are unbacked and another texture is packed right behind them, so they must not be read.
 	uint32_t                     resident_base_level = 0;
+	// First level the last upload actually transferred: resident_base_level, raised further when
+	// a finer level's guest bytes read back unwritten. Owned by the texture cache (a request's
+	// value is never adopted), and sampled views never expose a level below it.
+	uint32_t                     uploaded_base_level = 0;
 	uint32_t                     pitch           = 0;
 	uint32_t                     bytes_per_block = 0;
 	uint32_t                     samples         = 1;
