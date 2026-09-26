@@ -151,6 +151,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							break;
 						case StageInputKind::TessCoord:
 						case StageInputKind::WorkgroupId:
+						case StageInputKind::NumWorkgroups:
 						case StageInputKind::LocalInvocationId:
 						case StageInputKind::GlobalInvocationId:
 							if (component >= 3u) {
@@ -318,6 +319,9 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::GlobalInvocationId:
 					AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 					break;
+				case StageInputKind::NumWorkgroups:
+					AddInput(info, kind, 0, 3, "gl_NumWorkGroups");
+					break;
 				case StageInputKind::PackedAncillary:
 				case StageInputKind::Parameter: break;
 			}
@@ -424,6 +428,14 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		default: return Fail("unsupported shader stage for info collection");
 	}
 	CollectBuiltinInputs(program, next);
+	if (program.tile_rescale.Enabled()) {
+		// The invocation-remap prologue the backend emits reads these whether or not the
+		// program itself does.
+		AddInput(next, StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex");
+		AddInput(next, StageInputKind::LocalInvocationId, 0, 3, "gl_LocalInvocationID");
+		AddInput(next, StageInputKind::WorkgroupId, 0, 3, "gl_WorkGroupID");
+		AddInput(next, StageInputKind::NumWorkgroups, 0, 3, "gl_NumWorkGroups");
+	}
 	CollectOutputs(program, input_info, next);
 	program.info                 = std::move(next);
 	program.shader_info_complete = true;
