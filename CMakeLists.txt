@@ -568,6 +568,12 @@ add_executable(render_target_memo_tests EXCLUDE_FROM_ALL
 target_link_libraries(render_target_memo_tests common fmt::fmt Vulkan::Headers)
 target_include_directories(render_target_memo_tests PRIVATE ${inc_headers})
 
+# Header-only: the pass-scale decision (passScale.h) is a pure function of attachment scales.
+add_executable(pass_scale_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PassScaleTests.cpp"
+)
+target_include_directories(pass_scale_tests PRIVATE ${inc_headers})
+
 add_executable(dynamic_state_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DynamicStateCacheTests.cpp"
 )
@@ -652,6 +658,7 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME render_target_memo COMMAND $<TARGET_FILE:render_target_memo_tests>)
 	add_test(NAME dynamic_state_cache COMMAND $<TARGET_FILE:dynamic_state_cache_tests>)
+	add_test(NAME pass_scale COMMAND $<TARGET_FILE:pass_scale_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
@@ -718,6 +725,7 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		render_target_memo_tests
 		dynamic_state_cache_tests
+		pass_scale_tests
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests

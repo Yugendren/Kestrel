@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/passScale.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1247,14 +1248,52 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-// A Vulkan render pass has a single render area, so every attachment of a pass must share one
-// scale. Discovery can produce a mixed group when one attachment range is not eligible for
-// scaling, for example because it is smaller than the scaling threshold or its format cannot be
-// blitted. Converge the whole pass onto the native resolution; the denial is permanent, so later
-// frames discover a uniform group.
+// Whether the draw can write colour attachment `target` at all. The colour block writes a slot
+// only where CB_TARGET_MASK enables it and the pixel shader exports it: CB_SHADER_MASK carries the
+// exported channels and SPI_SHADER_COL_FORMAT a non-zero export format. Without an active pixel
+// shader nothing reaches a colour attachment.
+static bool DrawWritesColorTarget(const CommandBuffer& buffer, const RenderColorInfo& target) {
+	const auto& ctx  = buffer.GetRegisters();
+	const auto& sh   = ctx.GetShaderRegisters();
+	const auto  slot = target.target_slot;
+	return render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
+	       render_target_mask_slot(sh.m_cbShaderMask, slot) != 0 &&
+	       sh.target_output_mode[slot] != 0;
+}
+
+// Shrinks the pass to its first `kept` colour attachments. Discovery already marked every slot a
+// target of this draw (BindRenderTarget()); a dropped image that is not also a kept attachment
+// must lose that mark, or a texture binding of it in the same draw would be treated as a
+// feedback read of an attachment that AcquireRenderTargets() never sets up.
+static void DropColorTargets(TextureCache& cache, DrawRenderState& state, uint32_t kept) {
+	for (uint32_t i = kept; i < state.color_count; i++) {
+		const auto id   = state.color_info[i].image_id;
+		bool       live = state.depth_info.image_id == id;
+		for (uint32_t k = 0; k < kept && !live; k++) {
+			live = state.color_info[k].image_id == id;
+		}
+		if (!live && id) {
+			cache.GetImage(id).binding.is_target = false;
+		}
+	}
+	state.color_count = kept;
+}
+
+// A Vulkan render pass has a single render area and the draw a single viewport transform, so
+// every attachment of a pass must share one scale. Discovery can produce a mixed group in two ways:
+//  - a colour slot the draw never writes is still enabled from an earlier pass (see
+//    PassScale::Decide). It is dropped from this pass; its image and its scale are left alone.
+//    Denying scale here instead used to make the transient leftover permanent and spread it:
+//    Astro's Playroom's reflection-cube pass pushed all five G-buffer targets and the scene depth
+//    back to native within a frame, about 6 ms of GPU time per frame from then on.
+//  - attachments the draw really writes disagree, for example because one range is not eligible
+//    for scaling (smaller than the threshold, or its format cannot be blitted). The whole pass
+//    converges onto the native resolution; that denial is permanent, so later frames discover a
+//    uniform group.
 // DenyImageScale() below bumps TextureCache::Generation() when it denies a new address, so the
 // discovery memo's stale color/depth entries simply miss on the next draw; nothing else here
-// needs to invalidate them.
+// needs to invalidate them. Dropping a slot depends only on registers and image scales, which the
+// draw-reuse inputs and that generation already cover.
 void RenderExecutor::UnifyRenderTargetScale(CommandBuffer& buffer, DrawRenderState& state) {
 	if (!RenderScale::Enabled()) {
 		return;
@@ -1279,7 +1318,24 @@ void RenderExecutor::UnifyRenderTargetScale(CommandBuffer& buffer, DrawRenderSta
 	if (!mixed) {
 		return;
 	}
+
+	const bool ps_active = DrawHasActivePixelShader(buffer);
+	std::array<PassScale::ColorAttachment, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		colors[i].scale   = state.color_info[i].ScaleFactor();
+		colors[i].written = ps_active && DrawWritesColorTarget(buffer, state.color_info[i]);
+	}
+	std::optional<float> depth_scale;
+	if (state.depth_info.image_id) {
+		depth_scale = state.depth_info.ScaleFactor();
+	}
+	const auto decision =
+	    PassScale::Decide(std::span {colors.data(), state.color_count}, depth_scale);
 	auto& cache = buffer.GetContext().GetTextureCache();
+	if (decision.uniform) {
+		DropColorTargets(cache, state, decision.color_count);
+		return;
+	}
 	for (uint32_t i = 0; i < state.color_count; i++) {
 		auto& target = state.color_info[i];
 		if (target.image_id) {
