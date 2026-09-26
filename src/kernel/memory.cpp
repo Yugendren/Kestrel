@@ -72,6 +72,15 @@ static uint64_t                      g_flexible_memory_size        = DEFAULT_FLE
 static bool                          g_flexible_memory_size_frozen = false;
 static Graphics::RenderContext*       g_gpu_resources               = nullptr;
 
+// Advances after every guest unmap and protection change (GuestAddressSpace), so a proof that a
+// page reads current through the guest mapping (CurrentMappingEpoch) lapses when the mapping
+// itself changes.
+static std::atomic<uint64_t> g_guest_mapping_changes {0};
+
+static void NoteGuestMappingChange() noexcept {
+	g_guest_mapping_changes.fetch_add(1, std::memory_order_release);
+}
+
 static Graphics::RenderContext& GetGpuResources() {
 	EXIT_IF(g_gpu_resources == nullptr);
 	return *g_gpu_resources;
@@ -948,15 +957,38 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
-bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
-	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
-			return false;
-		}
+bool IsGpuCleanRange(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return true;
 	}
-	return TryReadBacking(vaddr, data, size);
+	return Graphics::GuestGpu::IsGpuThread() &&
+	       !GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	       !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size);
+}
+
+uint64_t CurrentMappingEpoch() {
+	if (!Graphics::GuestGpu::IsGpuThread()) {
+		return 0;
+	}
+	// Every counter only grows, so their sum moves whenever any of them does.
+	auto epoch = 1u + g_guest_mapping_changes.load(std::memory_order_acquire);
+	if (g_gpu_resources != nullptr) {
+		epoch += GetGpuResources().GetBufferCache().GpuWriteRequests() +
+		         GetGpuResources().GetTextureCache().GpuModifiedAdditions();
+	}
+	return epoch;
+}
+
+bool IsGuestMappingCurrent(uint64_t vaddr, uint64_t size) {
+	// The tracker read-protects exactly the pages it marks GPU-modified; the texture cache only
+	// ever write-protects.
+	return IsGpuCleanRange(vaddr, size) &&
+	       (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	        !GetGpuResources().GetBufferCache().IsRegionGpuModified(vaddr, size));
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return IsGpuCleanRange(vaddr, size) && TryReadBacking(vaddr, data, size);
 }
 
 bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {

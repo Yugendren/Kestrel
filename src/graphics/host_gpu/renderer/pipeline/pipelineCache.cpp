@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/cache/cleanPageMemo.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -115,9 +116,31 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+// Resource materialisation reads shader resource tables a dword at a time, and each such read
+// used to prove its own bytes GPU-clean (buffer-cache and texture-cache queries) before copying
+// them from the backing. The tables share few pages, so the program cache keeps the pages it has
+// proven (userdata: a CleanPageMemo bounded by the GPU-write epoch), and the dwords on them are
+// loaded straight through the guest mapping. The proof, IsGuestMappingCurrent(), is that no byte
+// of the page has GPU data pending and the tracker does not read-protect it, so a load returns
+// the current value without faulting.
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	const auto size          = values.size_bytes();
+	auto*      current_pages = static_cast<CleanPageMemo*>(userdata);
+	if (current_pages != nullptr &&
+	    current_pages->Contains(address, size, Libs::LibKernel::Memory::IsGuestMappingCurrent)) {
+		const auto* bytes = reinterpret_cast<const void*>(address);
+		// Nearly every read is one SRT dword: a fixed-size copy is a single load.
+		if (values.size() == 1) {
+			std::memcpy(values.data(), bytes, sizeof(uint32_t));
+		} else {
+			std::memcpy(values.data(), bytes, size);
+		}
+		return true;
+	}
+	return Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), size);
 }
 
 // Raw current guest memory, no GPU-clean gate. Shader resource tables (SRTs) are CPU-written
@@ -437,10 +460,13 @@ struct PipelineCache::ProgramCache {
 		if (memo != nullptr) {
 			*memo = {};
 		}
+		// Pages proven since the last GPU write or guest mapping change stay proven.
+		current_pages.Begin(Libs::LibKernel::Memory::CurrentMappingEpoch());
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ShaderMappedMemoryReaderForTitle(),
+		    .userdata                   = &current_pages,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
 		    // The clean-gated reader proves per byte that nothing the GPU wrote is pending, so
@@ -569,6 +595,9 @@ struct PipelineCache::ProgramCache {
 	// Graphics stages only; GetGraphicsPrograms pairs each with the matching PrepareProgram memo.
 	StageMemo                                                   vertex_memo;
 	StageMemo                                                   pixel_memo;
+	// Guest pages materialisation may load directly (see ReadShaderGuestMemory). Used only under
+	// the pipeline cache lock, and only the GPU thread gets a nonzero epoch to trust it with.
+	CleanPageMemo                                               current_pages;
 
 	// Oracle mode only: how often the memos let a draw skip work, logged once per second.
 	struct MemoStats {

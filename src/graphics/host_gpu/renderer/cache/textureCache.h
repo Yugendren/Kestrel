@@ -89,6 +89,11 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Advances whenever an image may have become GPU-modified, so a range IsRegionGpuModified()
+	// cleared stays clear while this is unchanged.
+	[[nodiscard]] uint64_t GpuModifiedAdditions() const noexcept {
+		return m_gpu_modified_page_cover.Additions();
+	}
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	// `fill_value` receives the dword the last recognised metadata fill wrote, when known.

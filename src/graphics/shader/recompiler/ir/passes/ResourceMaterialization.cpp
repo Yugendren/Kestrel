@@ -234,6 +234,19 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 	return true;
 }
 
+// The capture takes the runtime's userdata, so the callbacks it does not record still need the
+// source's own userdata forwarded to them. A current read stands in for an ordinary load through
+// the guest mapping, which the capture has never recorded.
+bool ForwardCurrentRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	return capture.source.read_current_memory(capture.source.userdata, address, values);
+}
+
+bool ForwardSync(void* userdata, uint64_t address, uint64_t size) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	return capture.source.sync_memory(capture.source.userdata, address, size);
+}
+
 bool WrittenBuffersDisjoint(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                             std::span<const std::pair<uint64_t, uint64_t>> reads) {
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
@@ -1194,6 +1207,8 @@ bool MaterializeResources(const ResourcePlan& program, const CompiledSrtPlan* co
 		observed.userdata = &capture;
 		observed.read_specialization_memory = CaptureStrictRead;
 		if (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;
+		if (observed.read_current_memory != nullptr) observed.read_current_memory = ForwardCurrentRead;
+		if (observed.sync_memory != nullptr) observed.sync_memory = ForwardSync;
 	}
 	SrtRefresh refresh(program, observed, compiled);
 	auto&      clean  = refresh.Clean();

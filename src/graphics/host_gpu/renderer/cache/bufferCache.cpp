@@ -707,6 +707,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		// Ahead of the scope lookup: a repeated written request is still a new write.
 		ForgetGpuFills(vaddr, size);
+		m_gpu_write_requests++;
 	}
 	if (const auto* reused = FindInScope(vaddr, size, is_written, is_texel_buffer);
 	    reused != nullptr) {

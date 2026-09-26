@@ -85,6 +85,10 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Counts ObtainBuffer() requests for writing, the only way guest bytes become GPU-dirty (and
+	// their tracker pages read-protected). A range HasGpuDirtyBytes() and IsRegionGpuModified()
+	// found clean stays clean while this is unchanged: only downloads change it otherwise.
+	[[nodiscard]] uint64_t GpuWriteRequests() const noexcept { return m_gpu_write_requests; }
 	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const noexcept {
 		return m_memory_tracker.CpuModificationEpoch(vaddr, size);
 	}
@@ -251,6 +255,7 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	uint64_t                                          m_gpu_write_requests = 0;
 	// See RecordGpuFill(). Keyed by start address; entries never overlap.
 	struct GpuFill {
 		uint64_t end   = 0;

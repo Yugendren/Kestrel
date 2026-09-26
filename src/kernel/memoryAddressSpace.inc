@@ -1072,16 +1072,17 @@ private:
 		if (it != m_mapped.begin()) {
 			--it;
 		}
-		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
+		bool ok = true;
+		for (; ok && it != m_mapped.end() && it->second.vaddr < end; ++it) {
 			const auto& region      = it->second;
 			const auto  range_start = std::max(vaddr, region.vaddr);
 			const auto  range_end   = std::min(end, region.vaddr + region.size);
-			if (range_start < range_end &&
-			    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
-				return false;
-			}
+			ok = range_start >= range_end ||
+			     VirtualMemory::Protect(range_start, range_end - range_start, mode);
 		}
-		return true;
+		// After the change, even a partial one: see CurrentMappingEpoch().
+		NoteGuestMappingChange();
+		return ok;
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
@@ -1161,6 +1162,9 @@ private:
 			}
 			current = part_end;
 		}
+		// Every unmap removes its range here once the host mapping is gone: see
+		// CurrentMappingEpoch().
+		NoteGuestMappingChange();
 		return true;
 	}
 

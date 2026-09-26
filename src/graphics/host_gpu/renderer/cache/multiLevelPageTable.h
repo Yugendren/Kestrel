@@ -286,6 +286,13 @@ public:
 				EXIT("PageCounters: page counter overflow\n");
 			}
 		});
+		m_additions.fetch_add(1, std::memory_order_release);
+	}
+
+	// Advances with every Add(). A range Any() found uncounted stays uncounted while this is
+	// unchanged, so a reader may keep relying on that answer without asking again.
+	[[nodiscard]] uint64_t Additions() const noexcept {
+		return m_additions.load(std::memory_order_acquire);
 	}
 
 	void Remove(uint64_t address, uint64_t size) {
@@ -348,6 +355,7 @@ private:
 	}
 
 	std::unique_ptr<std::atomic<Bucket*>[]> m_buckets;
+	std::atomic<uint64_t>                   m_additions {0};
 };
 
 } // namespace Libs::Graphics

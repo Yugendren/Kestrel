@@ -456,6 +456,11 @@ add_executable(clean_range_memo_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(clean_range_memo_tests PRIVATE ${inc_headers})
 
+add_executable(clean_page_memo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CleanPageMemoTests.cpp"
+)
+target_include_directories(clean_page_memo_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"

@@ -109,6 +109,17 @@ void                   RegisterCallbacks(callback_func_t alloc_func, callback_fu
 void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// True when the backing already holds every byte of the range: no GPU write to it is pending
+// in the buffer cache and no GPU-modified image covers it. Only the GPU thread can prove that.
+[[nodiscard]] bool     IsGpuCleanRange(uint64_t vaddr, uint64_t size);
+// Advances whenever a range IsGuestMappingCurrent() proved may stop being so: a guest range may
+// have become GPU-dirty or GPU-modified by an image, or guest memory was unmapped or reprotected.
+// 0 -- never trusted -- off the GPU thread.
+[[nodiscard]] uint64_t CurrentMappingEpoch();
+// True when a plain load through the guest mapping returns the current value of every byte of
+// the range without faulting: IsGpuCleanRange(), and no page of it is read-protected for GPU
+// data. Only the GPU thread can prove that.
+[[nodiscard]] bool     IsGuestMappingCurrent(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   SyncGpuCleanBacking(uint64_t vaddr, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
