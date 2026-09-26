@@ -583,6 +583,14 @@ add_executable(program_memo_tests EXCLUDE_FROM_ALL
 target_link_libraries(program_memo_tests common fmt::fmt Vulkan::Headers xxhash)
 target_include_directories(program_memo_tests PRIVATE ${inc_headers})
 
+# Header-only: the driver pipeline cache file format and its accept/reject decision
+# (driverCacheBlob.h) need only fmt and xxHash, so this is testable without a GPU.
+add_executable(driver_cache_blob_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DriverCacheBlobTests.cpp"
+)
+target_link_libraries(driver_cache_blob_tests fmt::fmt xxhash)
+target_include_directories(driver_cache_blob_tests PRIVATE ${inc_headers})
+
 # Header-only: the draw-state tracker (drawStateTracker.h) and the draw-reuse record
 # (drawReuse.h, which pulls in pipelineCache.h for the vertex input layout) need nothing beyond
 # common, fmt, xxHash and the Vulkan headers.

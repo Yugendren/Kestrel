@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCacheBlob.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -84,15 +85,17 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 	}
 }
 
+static_assert(DriverCacheBlob::kUuidSize == VK_UUID_SIZE);
+
+// Keyed on the driver, not the emulator build -- see driverCacheBlob.h for why.
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
-	constexpr char hex[] = "0123456789abcdef";
-	std::string    uuid(VK_UUID_SIZE * 2, '0');
-	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
-		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
-		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
-	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	DriverCacheBlob::DeviceIdentity device;
+	std::copy_n(properties.pipelineCacheUUID.data(), VK_UUID_SIZE,
+	            device.pipeline_cache_uuid.begin());
+	device.vendor_id      = properties.vendorID;
+	device.device_id      = properties.deviceID;
+	device.driver_version = properties.driverVersion;
+	return DriverCacheBlob::Signature(device);
 }
 
 std::string PipelineCacheTitleId() {
@@ -695,36 +698,25 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
 	}
-	std::vector<uint8_t> initial_data;
+	std::vector<uint8_t>     file_data;
+	std::span<const uint8_t> initial_data;
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
-			std::string cached_signature(signature.size(), '\0');
-			uint64_t    payload_hash = 0;
-			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
-			uint32_t signature_read = 0;
-			uint32_t hash_read      = 0;
-			uint32_t payload_read   = 0;
-			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
-			          &signature_read);
-			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
-			          &payload_read);
-			file.Close();
-			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
-			    payload_read != initial_data.size() || cached_signature != signature ||
-			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
-				initial_data.clear();
-				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
-				    path);
-			}
+		if (file_size <= std::numeric_limits<uint32_t>::max()) {
+			file_data.resize(file_size);
+			uint32_t read = 0;
+			file.Read(file_data.data(), static_cast<uint32_t>(file_data.size()), &read);
+			file_data.resize(read);
+		}
+		file.Close();
+		const auto signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+		const auto check     = DriverCacheBlob::Check(file_data, signature);
+		if (check.verdict == DriverCacheBlob::Verdict::Accepted) {
+			initial_data = check.payload;
 		} else {
-			file.Close();
-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
+			PipelineCacheLog("Vulkan pipeline cache: invalidating {} ({})", path,
+			                 DriverCacheBlob::VerdictText(check.verdict));
 		}
 	}
 
@@ -735,7 +727,7 @@ void PipelineCache::InitializeDriverCache() {
 	if (result != vk::Result::eSuccess && !initial_data.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
 		                 vk::to_string(result));
-		initial_data.clear();
+		initial_data = {};
 		create.initialDataSize = 0;
 		create.pInitialData    = nullptr;
 		result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
@@ -828,8 +820,9 @@ void PipelineCache::SerializeAndWrite() {
 		return;
 	}
 
-	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	const auto prefix =
+	    DriverCacheBlob::Prefix(DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()),
+	                            payload);
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return;
