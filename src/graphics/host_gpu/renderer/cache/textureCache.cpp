@@ -1727,6 +1727,17 @@ bool TextureCache::CanTwinScale(const ImageInfo& info) const {
 	       (!info.IsDepth() || m_blit_helper.CanResampleDepth(info));
 }
 
+// Whether a TexelSpace::ScaledGuest binding of `info` can take the scaled image itself: its
+// scale is exactly the render scale (the one scale the shader's shift describes) and it is one
+// plain subresource, which is all a shifted texel address can index. A storage binding also has
+// to be a colour 2D image, the form compute writes through.
+static bool BindsScaledTexels(const ImageInfo& info, TextureCache::BindingType binding) {
+	return info.scale == RenderScale::Factor() && info.samples == 1 &&
+	       info.resources.levels == 1 && !info.IsBlock() &&
+	       (binding != TextureCache::BindingType::Storage ||
+	        (info.type == Prospero::ImageType::kColor2D && !info.IsDepth()));
+}
+
 // Internal resolution scaling would otherwise have to pick a single resolution per guest range.
 // Rasterisation wants the scaled image; a compute shader addressing the same range as a storage
 // image wants guest texels, because it indexes absolute coordinates and is dispatched with
@@ -1738,6 +1749,13 @@ ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
 	auto& image = m_slot_images[id];
 	if (desc.type == BindingType::Storage || desc.texel_addressed) {
 		if (!image.info.IsScaled()) {
+			return id;
+		}
+		// A tile-rescaled dispatch addresses the scaled half directly. Only an image the shift
+		// by log2 of the render scale maps exactly qualifies; anything else keeps the guest-texel
+		// resolution below, and the renderer's gate sees that it did.
+		if (desc.texel_space == TexelSpace::ScaledGuest &&
+		    BindsScaledTexels(image.info, desc.type)) {
 			return id;
 		}
 		// An absolute texel address has to reach the half of the pair whose resolution matches
@@ -1783,6 +1801,40 @@ ImageId TextureCache::ResolveScaleBinding(const ImageDesc& desc, ImageId id) {
 	auto scaled  = image.info;
 	scaled.scale = ResolveImageScale(image.info, desc.type);
 	return ExpandImage(scaled, id);
+}
+
+// A storage binding of the scaled half itself, from a tile-rescaled dispatch: the shader writes
+// the scaled image, so it must first hold whatever compute last left in the twin, and the twin is
+// stale afterwards -- a later guest-texel binding resamples it back from here. This is the
+// render-target write path, reached from compute.
+void TextureCache::PrepareScaledStorageBinding(ImageId id) {
+	auto& image = m_slot_images[id];
+	SyncScaledContents(id);
+	image.MarkScaledNewest();
+	CommitGpuWrite(image);
+}
+
+ImageId TextureCache::AcquireScratchImage(const ImageInfo& shape) {
+	std::scoped_lock lock {m_lock};
+	// Built like a scale twin: it owns no guest range, so nothing but its holder can reach it.
+	auto info             = shape;
+	info.scale            = 1.0F;
+	info.data             = {};
+	info.stencil          = {};
+	info.metadata         = {};
+	info.htile_clear_mask = UINT32_MAX;
+	return InsertImage(info);
+}
+
+void TextureCache::ReleaseScratchImage(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	// No descriptor resolution can hold the id -- the image was never registered -- so, unlike
+	// FreeScaleTwin(), Generation() does not have to move. The GPU may still name the image.
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+	} else {
+		m_slot_images.erase(id);
+	}
 }
 
 ImageId TextureCache::AcquireScaleTwin(ImageId owner_id) {
@@ -2039,6 +2091,9 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		case BindingType::Storage:
 			if (const auto owner = image.ScaleTwinOwner()) {
 				PrepareScaleTwinBinding(owner);
+			} else if (image.info.IsScaled() && !image.info.data.Empty()) {
+				// Only a TexelSpace::ScaledGuest binding reaches a scaled image as storage.
+				PrepareScaledStorageBinding(id);
 			} else if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
 			}

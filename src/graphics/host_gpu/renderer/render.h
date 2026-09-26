@@ -277,7 +277,10 @@ public:
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
 
-	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	// `compute_space` is the space a compute stage's texel addresses are resolved in; other
+	// stages always address the resolution of their render targets.
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared,
+	                     TextureCache::TexelSpace compute_space = TextureCache::TexelSpace::Guest);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -312,11 +315,14 @@ private:
 	// Consecutive draws on a stage present the same materialised image and sampler descriptors
 	// about nine times out of ten, and resolving an image descriptor searches the texture cache
 	// for every image of every draw. The previous resolution is kept per stage and reused while
-	// the descriptors, the program and the texture cache generation are all unchanged; the
-	// per-draw half of binding an image -- refreshing its contents, LRU, download tracking --
-	// still runs, in RebindImages().
+	// the descriptors, the program, the texel space and the texture cache generation are all
+	// unchanged; the per-draw half of binding an image -- refreshing its contents, LRU, download
+	// tracking -- still runs, in RebindImages().
 	struct StageTextures {
 		const ShaderRecompiler::IR::CompiledShaderInfo*    program = nullptr;
+		// The space a compute stage resolved in (PrepareBindings()); the same descriptors resolve
+		// differently for a tile-rescaled dispatch.
+		TextureCache::TexelSpace texel_space = TextureCache::TexelSpace::Guest;
 		std::vector<ShaderRecompiler::IR::DescriptorValue> image_values;
 		std::vector<ShaderRecompiler::IR::DescriptorValue> sampler_values;
 		std::vector<TextureBinding>                        images;
@@ -326,9 +332,16 @@ private:
 		uint64_t                                           resolution = 0;
 	};
 
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value,
-	                                            ShaderType                                   stage);
+	[[nodiscard]] TextureBinding
+	ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	               const ShaderRecompiler::IR::DescriptorValue& value, ShaderType stage,
+	               TextureCache::TexelSpace compute_space = TextureCache::TexelSpace::Guest);
+	// The image half of PrepareBindings(): resolves (or reuses) every image and sampler of the
+	// stage `prepared` belongs to and binds the images. Called again, after ResetBindings(), to
+	// resolve the same descriptors in another texel space.
+	void ResolveImages(PreparedBindings& prepared, TextureCache::TexelSpace compute_space);
+	// Sets one shader-data dword after RebindBuffers() may already have uploaded the block.
+	void SetShaderDataWord(PreparedBindings& prepared, uint32_t dword, uint32_t value);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,

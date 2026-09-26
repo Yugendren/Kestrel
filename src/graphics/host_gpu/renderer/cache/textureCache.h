@@ -35,8 +35,11 @@ public:
 	// Coordinate space an absolute texel address computed by a shader lives in. A rasterising
 	// stage derives it from its own fragment position, so it is expressed in the resolution of
 	// the render targets of the draw and moves with internal resolution scaling. A compute
-	// dispatch is launched with guest-sized workgroup counts, so it stays in guest texels.
-	enum class TexelSpace : uint8_t { Guest, RenderTarget };
+	// dispatch is launched with guest-sized workgroup counts, so it stays in guest texels. A
+	// dispatch of a tile-rescaled program (renderer/computeRescale.h) shifts its texel addresses
+	// at runtime: they are guest texels >> s, s = log2 of 1/render scale, which is the space of
+	// an image scaled at exactly the render scale.
+	enum class TexelSpace : uint8_t { Guest, RenderTarget, ScaledGuest };
 
 	struct ImageDesc {
 		ImageInfo     info;
@@ -83,6 +86,14 @@ public:
 	// the native replacement (the old id is freed). Used when a render pass would otherwise mix
 	// scaled and native attachments, which a single Vulkan render area cannot express.
 	[[nodiscard]] ImageId DenyImageScale(ImageId id);
+
+	// A private native-resolution image with the shape of `shape` and no guest range: no lookup,
+	// invalidation or garbage collection ever reaches it, exactly like a scale twin. The
+	// tile-rescale dual-run check (renderer/computeRescale.h) replays a dispatch into one.
+	[[nodiscard]] ImageId AcquireScratchImage(const ImageInfo& shape);
+	// Frees an image from AcquireScratchImage() once the work already recorded against it has
+	// completed.
+	void                  ReleaseScratchImage(ImageId id);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -206,6 +217,7 @@ private:
 	[[nodiscard]] bool        ReportImageScale(const ImageInfo& info, BindingType binding);
 	[[nodiscard]] bool        CanTwinScale(const ImageInfo& info) const;
 	[[nodiscard]] ImageId     ResolveScaleBinding(const ImageDesc& desc, ImageId id);
+	void                      PrepareScaledStorageBinding(ImageId id);
 	[[nodiscard]] ImageId     AcquireScaleTwin(ImageId owner_id);
 	void                      PrepareScaleTwinBinding(ImageId owner_id);
 	void                      PrepareScaleTwinRead(ImageId owner_id);

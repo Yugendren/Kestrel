@@ -35,6 +35,9 @@ struct PreparedBindings {
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	// The space a compute stage's texel addresses were resolved for (TextureCache::TexelSpace);
+	// a re-resolution in RebindImages() has to land in the same one.
+	TextureCache::TexelSpace  texel_space = TextureCache::TexelSpace::Guest;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;

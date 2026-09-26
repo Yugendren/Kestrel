@@ -567,7 +567,8 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
-                                              ShaderType                                   stage) {
+                                              ShaderType                                   stage,
+                                              TextureCache::TexelSpace compute_space) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
@@ -787,9 +788,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.texel_addressed = resource.texel_addressed;
 	// Everything but compute reaches this image from a draw, so an absolute texel address it
 	// computes is in the resolution of that draw's render targets; a dispatch is launched with
-	// guest-sized workgroup counts, so its addresses are in guest texels. The texture cache uses
-	// this to pick the half of a resolution-scaled pair that matches.
-	desc.texel_space     = stage == ShaderType::Compute ? TextureCache::TexelSpace::Guest
+	// guest-sized workgroup counts, so its addresses are in guest texels -- or, for a
+	// tile-rescaled dispatch, in scaled guest texels. The texture cache uses this to pick the
+	// half of a resolution-scaled pair that matches.
+	desc.texel_space     = stage == ShaderType::Compute ? compute_space
 	                                                    : TextureCache::TexelSpace::RenderTarget;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
@@ -881,7 +883,8 @@ void RenderExecutor::ResetBindings() {
 }
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
-                                     PreparedBindings& prepared) {
+                                     PreparedBindings&         prepared,
+                                     TextureCache::TexelSpace  compute_space) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -893,12 +896,35 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.buffer_sources.clear();
 	prepared.buffers.clear();
 	prepared.shader_data.clear();
-	auto&      last       = m_stage_textures[static_cast<size_t>(program.stage)];
+	ResolveImages(prepared, compute_space);
+	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
+	for (const auto reg: program.bindings.user_data_registers) {
+		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	}
+	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	if (ShaderRecompiler::IR::FindBinding(
+	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
+		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
+	}
+}
+
+void RenderExecutor::ResolveImages(PreparedBindings&        prepared,
+                                   TextureCache::TexelSpace compute_space) {
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = *prepared.runtime->resources;
+	auto&       last     = m_stage_textures[static_cast<size_t>(program.stage)];
+	prepared.texel_space = compute_space;
+
 	const auto generation = m_context.GetTextureCache().Generation();
 	// Only the search for the host image behind a descriptor is carried over. Everything the
 	// binding itself does per draw still happens: BindImage() below, and the content refresh and
-	// download tracking that RebindImages() drives through the texture cache.
-	const bool reused = last.program == &program && last.texture_generation == generation &&
+	// download tracking that RebindImages() drives through the texture cache. The texel space
+	// is part of the key: the same descriptors resolve differently for a tile-rescaled dispatch,
+	// and switching spaces must miss here without invalidating every other stage's resolution
+	// through the texture-cache generation.
+	const bool reused = last.program == &program && last.texel_space == compute_space &&
+	                    last.texture_generation == generation &&
 	                    std::ranges::equal(last.image_values, snapshot.images) &&
 	                    std::ranges::equal(last.sampler_values, snapshot.samplers);
 	if (program.stage == ShaderType::Pixel) {
@@ -922,8 +948,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	} else {
 		prepared.images.resize(program.info.images.size());
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto binding =
-			    ResolveTexture(program.info.images[i], snapshot.images[i], program.stage);
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i],
+			                              program.stage, compute_space);
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 			binding.mip_views.swap(prepared.images[i].mip_views);
 			binding.mip_views.clear();
@@ -934,7 +960,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 			prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
 		}
-		last.program = &program;
+		last.program     = &program;
+		last.texel_space = compute_space;
 		last.image_values.assign(snapshot.images.begin(), snapshot.images.end());
 		last.sampler_values.assign(snapshot.samplers.begin(), snapshot.samplers.end());
 		last.images   = prepared.images;
@@ -943,15 +970,6 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		last.texture_generation     = m_context.GetTextureCache().Generation();
 		last.resolution             = ++m_texture_resolutions;
 		prepared.texture_resolution = last.resolution;
-	}
-	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
-	for (const auto reg: program.bindings.user_data_registers) {
-		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
-	}
-	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
-	if (ShaderRecompiler::IR::FindBinding(
-	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
-		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
 }
 
@@ -988,8 +1006,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	prepared.buffers.clear();
 	prepared.buffers.reserve(program.info.buffers.size());
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
+	// Only the memory offsets are rebuilt here; the rescale control word after them belongs to
+	// the dispatch (SetShaderDataWord()).
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
-	          prepared.shader_data.end(), 0);
+	          prepared.shader_data.begin() + layout.MemoryOffsetEndDword(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -1012,6 +1032,17 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+void RenderExecutor::SetShaderDataWord(PreparedBindings& prepared, uint32_t dword,
+                                       uint32_t value) {
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	prepared.shader_data.at(dword) = value;
+	// Push data is copied at CommitBindings(); a shader-data buffer that RebindBuffers() already
+	// uploaded has to be uploaded again to carry the new word.
+	if (prepared.shader_data_buffer.buffer != nullptr) {
+		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+	}
+}
+
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -1027,7 +1058,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i], program.stage);
+			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i], program.stage,
+			                           prepared.texel_space);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
