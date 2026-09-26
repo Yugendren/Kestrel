@@ -444,7 +444,9 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);
-		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg)));
+		// Marked so analyses can tell a rung from an exec merge (IR::SelectFlags).
+		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg),
+		                               IR::SelectFlags {.indexed_register_write = true}));
 	}
 }
 

@@ -6,13 +6,20 @@ IREmitter::IREmitter(Block* value_block): block(value_block) {
 	EXIT_IF(block == nullptr);
 }
 
+IREmitter::IREmitter(Block* value_block, Block::iterator value_insertion_point)
+    : block(value_block), insertion_point(value_insertion_point) {
+	EXIT_IF(block == nullptr);
+}
+
 void IREmitter::SetBlock(Block* value_block) {
 	EXIT_IF(value_block == nullptr);
 	block = value_block;
+	insertion_point.reset();
 }
 
 Value IREmitter::Emit(ValueOpcode opcode, std::initializer_list<Value> args, uint64_t flags) {
-	auto& inst = block->AppendNewInst(opcode, args, flags);
+	auto& inst = insertion_point ? *block->PrependNewInst(*insertion_point, opcode, args, flags)
+	                             : block->AppendNewInst(opcode, args, flags);
 	return TypeOf(opcode) == Type::Void ? Value {} : Value(&inst);
 }
 
@@ -200,6 +207,10 @@ U32 IREmitter::BitwiseNot(U32 value) {
 
 U32 IREmitter::Select(U1 condition, U32 true_value, U32 false_value) {
 	return U32(Emit(ValueOpcode::SelectU32, {condition, true_value, false_value}));
+}
+
+U32 IREmitter::Select(U1 condition, U32 true_value, U32 false_value, SelectFlags flags) {
+	return U32(Emit(ValueOpcode::SelectU32, {condition, true_value, false_value}, flags));
 }
 
 U1 IREmitter::IEqual(U32 lhs, U32 rhs) {

@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <initializer_list>
+#include <optional>
 #include <type_traits>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -11,6 +12,9 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class IREmitter {
 public:
 	explicit IREmitter(Block* block);
+	// Emits in front of `insertion_point` instead of appending, for passes that rewrite an
+	// already translated block.
+	IREmitter(Block* block, Block::iterator insertion_point);
 
 	void SetBlock(Block* block);
 
@@ -70,6 +74,7 @@ public:
 	U32 BitwiseXor(U32 lhs, U32 rhs);
 	U32 BitwiseNot(U32 value);
 	U32 Select(U1 condition, U32 true_value, U32 false_value);
+	U32 Select(U1 condition, U32 true_value, U32 false_value, SelectFlags flags);
 	U1  IEqual(U32 lhs, U32 rhs);
 	U1  INotEqual(U32 lhs, U32 rhs);
 	U1  ULessThan(U32 lhs, U32 rhs);
@@ -80,7 +85,8 @@ public:
 	U1  AnyLane(U1 value);
 
 private:
-	Block* block = nullptr;
+	Block*                         block = nullptr;
+	std::optional<Block::iterator> insertion_point;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
