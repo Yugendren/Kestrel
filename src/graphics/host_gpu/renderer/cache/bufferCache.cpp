@@ -704,6 +704,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
+	if (is_written) {
+		// Ahead of the scope lookup: a repeated written request is still a new write.
+		ForgetGpuFills(vaddr, size);
+	}
 	if (const auto* reused = FindInScope(vaddr, size, is_written, is_texel_buffer);
 	    reused != nullptr) {
 		if (reused->stream) {
@@ -809,9 +813,54 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		return;
 	}
 
+	const auto epoch = CpuModificationEpoch(vaddr, size);
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	RecordGpuFill(vaddr, size, value, epoch);
+}
+
+void BufferCache::RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value, uint64_t epoch) {
+	if (epoch == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	ForgetGpuFills(vaddr, size);
+	m_gpu_fills.emplace(vaddr, GpuFill {.end = vaddr + size, .value = value, .epoch = epoch});
+}
+
+std::optional<uint32_t> BufferCache::KnownGpuFill(uint64_t vaddr, uint64_t size) const {
+	if (!GuestGpu::IsGpuThread() || m_gpu_fills.empty() || !GuestRange {vaddr, size}.Valid()) {
+		return std::nullopt;
+	}
+	auto fill = m_gpu_fills.upper_bound(vaddr);
+	if (fill == m_gpu_fills.begin()) {
+		return std::nullopt;
+	}
+	--fill;
+	const auto begin = fill->first;
+	if (vaddr + size > fill->second.end ||
+	    CpuModificationEpoch(begin, fill->second.end - begin) != fill->second.epoch) {
+		return std::nullopt;
+	}
+	return fill->second.value;
+}
+
+void BufferCache::ForgetGpuFills(uint64_t vaddr, uint64_t size) {
+	if (m_gpu_fills.empty()) {
+		return;
+	}
+	// A partially overwritten fill is dropped whole: its remaining bytes are still the fill value,
+	// but nothing asks about a fragment often enough to be worth splitting the record.
+	const auto end   = vaddr + size;
+	auto       first = m_gpu_fills.lower_bound(vaddr);
+	if (first != m_gpu_fills.begin() && std::prev(first)->second.end > vaddr) {
+		--first;
+	}
+	auto last = first;
+	while (last != m_gpu_fills.end() && last->first < end) {
+		++last;
+	}
+	m_gpu_fills.erase(first, last);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

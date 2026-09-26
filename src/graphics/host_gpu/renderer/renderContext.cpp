@@ -148,6 +148,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 
 void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
+	// A program reaching memory through device addresses can write any guest byte without a
+	// written binding, so no recorded fill can be trusted to still be the newest write.
+	m_buffer_cache.ForgetAllGpuFills();
 	// Shaders reach guest memory through the buffer-device-address page table, so every cached
 	// buffer has to hold what the guest last wrote. Only the buffers whose bytes have actually
 	// changed since the previous preparation can be out of date, and every point that can change

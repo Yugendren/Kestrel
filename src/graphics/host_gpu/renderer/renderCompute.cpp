@@ -54,6 +54,17 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
                                       ShaderBufferResource& resolved_descriptor,
                                       uint32_t& resolved_clear, uint64_t& resolved_size);
 
+// Either shape of the guest's buffer-fill kernels: every dword of the resolved range is written
+// with the resolved value and nothing else is written.
+static bool ResolveComputeFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                               uint32_t group_y, uint32_t group_z, uint32_t mode,
+                               ShaderBufferResource& descriptor, uint32_t& value, uint64_t& size) {
+	return ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, value,
+	                                size) ||
+	       ResolveComputePatternFill(input, group_x, group_y, group_z, mode, descriptor, value,
+	                                 size);
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer& buffer, uint32_t group_x,
                                                 uint32_t group_y, uint32_t group_z,
@@ -78,11 +89,8 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		ShaderBufferResource fill_descriptor;
 		uint32_t             fill_value   = 0;
 		uint64_t             fill_size    = 0;
-		const bool           uniform_fill =
-		    ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, fill_descriptor,
-		                             fill_value, fill_size) ||
-		    ResolveComputePatternFill(input, group_x, group_y, group_z, mode, fill_descriptor,
-		                              fill_value, fill_size);
+		const bool           uniform_fill = ResolveComputeFill(
+		    input, group_x, group_y, group_z, mode, fill_descriptor, fill_value, fill_size);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
@@ -254,10 +262,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	ShaderBufferResource descriptor;
 	uint32_t             packed_clear = 0;
 	uint64_t             size         = 0;
-	if (!ResolveComputeBufferFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
-	                              size) &&
-	    !ResolveComputePatternFill(input, group_x, group_y, group_z, mode, descriptor,
-	                               packed_clear, size)) {
+	if (!ResolveComputeFill(input, group_x, group_y, group_z, mode, descriptor, packed_clear,
+	                        size)) {
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
@@ -362,6 +368,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
+	// A fill kernel that still has to run leaves a value the cache can know without reading it
+	// back (see BufferCache::RecordGpuFill); the epoch is taken before its binding is obtained.
+	ShaderBufferResource fill_descriptor;
+	uint32_t             fill_value = 0;
+	uint64_t             fill_size  = 0;
+	const bool           is_fill =
+	    !program.info.has_bitwise_xor &&
+	    ResolveComputeFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                       fill_descriptor, fill_value, fill_size);
+	const uint64_t fill_epoch =
+	    is_fill ? m_context.GetBufferCache().CpuModificationEpoch(fill_descriptor.Base48(), fill_size)
+	            : 0;
 	const bool large_workgroup =
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const bool                   has_sampler = !program.info.samplers.empty();
@@ -460,6 +478,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	RebindBuffers(bindings);
+	if (is_fill) {
+		m_context.GetBufferCache().RecordGpuFill(fill_descriptor.Base48(), fill_size, fill_value,
+		                                         fill_epoch);
+	}
 
 	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;

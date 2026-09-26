@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -84,6 +85,24 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const noexcept {
+		return m_memory_tracker.CpuModificationEpoch(vaddr, size);
+	}
+
+	// GPU writes whose bytes are fully known when they are recorded: a DMA fill, or a dispatch of
+	// one of the guest's fill kernels (see ResolveComputeBufferFill()). Remembering the value lets
+	// a caller that only needs to know what such a range holds -- the DCC fast-clear check --
+	// answer without waiting for the GPU to finish everything queued before it can read it back.
+	// `epoch` is CpuModificationEpoch() of the range, read before the write was obtained, so a
+	// guest CPU write racing it leaves the record stale. Every other GPU write to the range forgets
+	// the record (ObtainBuffer() for written bindings, and ForgetAllGpuFills() for programs that
+	// reach memory through device addresses). GPU-thread serialised, like the cache index.
+	void RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value, uint64_t epoch);
+	// The dword every aligned word of [vaddr, vaddr + size) holds after the last recorded fill
+	// covering it, if that fill is still the newest write to the range; nullopt when unknown,
+	// including off the GPU thread.
+	[[nodiscard]] std::optional<uint32_t> KnownGpuFill(uint64_t vaddr, uint64_t size) const;
+	void                                  ForgetAllGpuFills() { m_gpu_fills.clear(); }
 	// Appends the copies for guest memory the CPU reads every frame to the command buffer that is
 	// about to be submitted, so the read waits on that submission instead of draining everything
 	// recorded after it. Called by CommandScheduler just before it closes the buffer.
@@ -196,6 +215,7 @@ private:
 	// `copied`, when given, receives the guest byte ranges the download will publish.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                        std::vector<ReadbackWindow>* copied = nullptr);
+	void ForgetGpuFills(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -231,6 +251,13 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// See RecordGpuFill(). Keyed by start address; entries never overlap.
+	struct GpuFill {
+		uint64_t end   = 0;
+		uint32_t value = 0;
+		uint64_t epoch = 0;
+	};
+	std::map<uint64_t, GpuFill>                       m_gpu_fills;
 	// Windows the guest has read back at least once. Draining the GPU, not copying, is what a
 	// readback costs, so every drain also flushes these: the next read of a known-hot window
 	// then finds clean memory and needs no drain of its own.

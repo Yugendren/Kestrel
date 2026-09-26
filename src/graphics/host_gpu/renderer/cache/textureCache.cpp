@@ -1424,28 +1424,47 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: DCC view exceeds its native metadata slices\n");
 	}
-	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
-	// so discovery runs before final draw uploads and never holds the texture lock across it.
+	// The verdict needs the metadata bytes the GPU last wrote. When that write was a fill the
+	// buffer cache recorded -- a DMA fill, a guest fill kernel, or the 0xff keys published below --
+	// every byte is already known. Reading it back instead would stall the command processor
+	// behind all queued GPU work at each render-target bind of a range the guest refills every
+	// frame. Any other GPU write is still read back: finish native metadata writes before reading
+	// backing bytes. This can submit the scheduler, so discovery runs before final draw uploads
+	// and never holds the texture lock across it.
+	std::optional<uint32_t> known_fill;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		known_fill = m_buffer_cache.KnownGpuFill(range.address, range.size);
+		if (!known_fill) {
+			m_buffer_cache.ReadMemory(range.address, range.size, false);
+		}
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+		if (known_fill) {
+			code = static_cast<uint8_t>(*known_fill);
+		} else if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read DCC metadata backing\n");
 		}
 		vk::ClearValue clear {};
 		if (!DecodeDccClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read DCC metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			continue;
+		if (known_fill) {
+			// A fill leaves one key in every byte only when its dword repeats that byte.
+			if (*known_fill != static_cast<uint32_t>(code) * 0x01010101u) {
+				continue;
+			}
+		} else {
+			std::vector<uint8_t> bytes(slice_size);
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read DCC metadata slice\n");
+			}
+			if (!std::all_of(bytes.begin(), bytes.end(),
+			                 [code](uint8_t byte) { return byte == code; })) {
+				continue;
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};
