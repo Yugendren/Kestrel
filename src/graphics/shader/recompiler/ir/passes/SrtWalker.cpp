@@ -861,13 +861,14 @@ bool ScalarAddressReadAddress(uint64_t base, int64_t immediate, uint64_t offset,
 	return AddSignedAddress(base & ~uint64_t {3}, relative, address);
 }
 
-bool ReadSrtWord(SrtMemoryReader reader, void* userdata, uint64_t address, uint64_t& result) {
+bool ReadSrtWord(SrtMemoryReader reader, SrtMemoryReader current_reader, void* userdata,
+                 uint64_t address, uint64_t& result) {
 	uint32_t word = 0;
 	if (reader != nullptr) {
 		if (!reader(userdata, address, {&word, 1})) {
 			return false;
 		}
-	} else {
+	} else if (current_reader == nullptr || !current_reader(userdata, address, {&word, 1})) {
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
@@ -1049,7 +1050,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	} else if (!ScalarAddressReadAddress(base, immediate, offset, address)) {
 		return false;
 	}
-	return ReadSrtWord(m_runtime.read_memory, m_runtime.userdata, address, result);
+	return ReadSrtWord(m_runtime.read_memory, m_runtime.read_current_memory, m_runtime.userdata,
+	                   address, result);
 }
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
@@ -1782,7 +1784,8 @@ bool CompiledSrtPlan::Execute(const Op& op, const SrtRuntime& runtime, uint64_t&
 			}
 			// The strict walk reads as CleanRuntime does: never through the ordinary reader.
 			const auto reader = op.clean ? CleanRuntime(runtime).read_memory : runtime.read_memory;
-			return ReadSrtWord(reader, runtime.userdata, address, result);
+			return ReadSrtWord(reader, runtime.read_current_memory, runtime.userdata, address,
+			                   result);
 		}
 		default: return false;
 	}

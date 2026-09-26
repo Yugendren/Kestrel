@@ -23,6 +23,11 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	SrtMemorySync             sync_memory                = nullptr;
+	// Answers an ordinary read (read_memory == nullptr) when the bytes are already current, or
+	// returns false. Such a read otherwise loads straight through the guest mapping, and a page
+	// that still holds GPU-written bytes faults and waits for their download first, even when
+	// the table dwords being read are not among them.
+	SrtMemoryReader           read_current_memory        = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

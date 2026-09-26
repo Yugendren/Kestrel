@@ -443,6 +443,9 @@ struct PipelineCache::ProgramCache {
 		    .read_memory                = ShaderMappedMemoryReaderForTitle(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
+		    // The clean-gated reader proves per byte that nothing the GPU wrote is pending, so
+		    // it gives the value an ordinary load would, without that load's fault.
+		    .read_current_memory        = ReadShaderGuestMemory,
 		};
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (source != nullptr) {
