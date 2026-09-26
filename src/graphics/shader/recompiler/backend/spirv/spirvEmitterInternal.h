@@ -110,6 +110,13 @@ struct EmitterState {
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
 	uint32_t                   entry_label                           = 0;
+	// Results of the tile-rescale invocation-remap prologue (EmitTileRescalePrologue), which
+	// replace the builtins the program reads; 0 when the program has no prologue.
+	struct {
+		uint32_t local_x = 0;
+		uint32_t local_y = 0;
+		uint32_t group_x = 0;
+	} tile_rescale;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;

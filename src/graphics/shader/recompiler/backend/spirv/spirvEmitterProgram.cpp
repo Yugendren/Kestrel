@@ -494,6 +494,76 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	EmitReturn(ctx);
 }
 
+// Invocation remap of a tile-rescaled program (ir/passes/TileRescale.h), active while the
+// RescaleControl remap bit is set. Workgroup slot j = i >> slot_shift, a run of (W*H)/k^2
+// consecutive invocations and so of whole warps, stands in for guest workgroup
+// k^2*WorkGroupID.x + j, and its invocation i sees the top-left guest pixel of one k x k block.
+// Slots past the dispatch return at once; accepted programs have no barrier to strand them at.
+// Only the remap bit is read at runtime: the shape and k are fixed at compile time.
+void EmitTileRescalePrologue(EmitterState& state) {
+	const auto& program = state.program;
+	const auto* compute =
+	    program.stage == ShaderType::Compute ? state.input_info.compute : nullptr;
+	if (compute == nullptr || state.lane_count != 1 || program.dispatcher_fallback ||
+	    !program.bindings.HasRescaleControl()) {
+		EXIT("tile rescale prologue: hash=0x%016" PRIx64
+		     " needs a single-lane-half structured compute program with a control word\n",
+		     program.shader_hash);
+	}
+	const uint32_t width  = compute->threads_num[0];
+	const uint32_t height = compute->threads_num[1];
+	const uint32_t scale  = program.tile_rescale.scale_log2;
+	if (!std::has_single_bit(width) || !std::has_single_bit(height) ||
+	    static_cast<uint32_t>(std::countr_zero(width)) < scale ||
+	    static_cast<uint32_t>(std::countr_zero(height)) < scale) {
+		EXIT("tile rescale prologue: hash=0x%016" PRIx64
+		     " workgroup %ux%u cannot hold %u^2 slots\n",
+		     program.shader_hash, width, height, 1u << scale);
+	}
+	const auto width_log2 = static_cast<uint32_t>(std::countr_zero(width));
+	const auto slot_shift =
+	    width_log2 + static_cast<uint32_t>(std::countr_zero(height)) - 2u * scale;
+
+	const auto control = EmitShaderDataDwordLoad(state, program.bindings.rescale_control_dword);
+	const auto remap   = EmitCompareU32Constant(
+	    state, spv::OpINotEqual,
+	    EmitShiftRightConstant(state, control, IR::RescaleControl::RemapBit), 0u);
+	const auto index   = EmitLocalInvocationIndex(state);
+	const auto slot    = EmitShiftRightConstant(state, index, slot_shift);
+	const auto sub     = EmitAndConstant(state, index, (1u << slot_shift) - 1u);
+	const auto shift   = ConstantU32(state, scale);
+	const auto rx      = EmitBinaryU32(state, spv::OpShiftLeftLogical,
+	                                   EmitAndConstant(state, sub, (width >> scale) - 1u), shift);
+	const auto ry      = EmitBinaryU32(state, spv::OpShiftLeftLogical,
+	                                   EmitShiftRightConstant(state, sub, width_log2 - scale), shift);
+	const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+	const auto group   = EmitAddU32(state,
+	                                EmitBinaryU32(state, spv::OpShiftLeftLogical, group_x,
+	                                              ConstantU32(state, 2u * scale)),
+	                                slot);
+
+	state.tile_rescale.local_x = EmitSelectValueU32(
+	    state, remap, rx, EmitInputComponentU32(state, IR::StageInputKind::LocalInvocationId, 0));
+	state.tile_rescale.local_y = EmitSelectValueU32(
+	    state, remap, ry, EmitInputComponentU32(state, IR::StageInputKind::LocalInvocationId, 1));
+	state.tile_rescale.group_x = EmitSelectValueU32(state, remap, group, group_x);
+
+	const auto past = state.builder.AllocateId();
+	const auto done = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), past, group,
+	                          EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0));
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), done, remap, past);
+	const auto return_label = state.builder.AllocateId();
+	const auto body_label   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, body_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, done, return_label, body_label);
+	EmitLabel(state, return_label);
+	state.builder.AddFunction(spv::OpReturn);
+	// The program's first block keeps its own label and is branched to from here, so no phi or
+	// loop header ever names the function's entry block as a predecessor.
+	EmitLabel(state, body_label);
+}
+
 } // namespace
 
 uint32_t TypeId(EmitterState& state, IR::Type type) {
@@ -863,6 +933,9 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.loop_fuel_variable, ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
+	if (program.tile_rescale.Enabled()) {
+		EmitTileRescalePrologue(state);
+	}
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

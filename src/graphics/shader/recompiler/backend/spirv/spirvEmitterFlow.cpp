@@ -20,6 +20,14 @@ bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& 
 }
 
 uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
+	if (const auto& remapped = state.tile_rescale; remapped.group_x != 0) {
+		if (kind == IR::StageInputKind::LocalInvocationId && component < 2u) {
+			return component == 0u ? remapped.local_x : remapped.local_y;
+		}
+		if (kind == IR::StageInputKind::WorkgroupId && component == 0u) {
+			return remapped.group_x;
+		}
+	}
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}

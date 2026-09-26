@@ -364,6 +364,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::BaryCoordSmooth: return spv::BuiltInBaryCoordKHR;
 		case IR::StageInputKind::BaryCoordNoPerspective: return spv::BuiltInBaryCoordNoPerspKHR;
 		case IR::StageInputKind::WorkgroupId: return spv::BuiltInWorkgroupId;
+		case IR::StageInputKind::NumWorkgroups: return spv::BuiltInNumWorkgroups;
 		case IR::StageInputKind::LocalInvocationId: return spv::BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return spv::BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return spv::BuiltInGlobalInvocationId;
@@ -415,6 +416,7 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId: type = TypeI32(state); break;
 			case IR::StageInputKind::WorkgroupId:
+			case IR::StageInputKind::NumWorkgroups:
 			case IR::StageInputKind::LocalInvocationId:
 			case IR::StageInputKind::GlobalInvocationId: type = TypeU32Vector(state, 3); break;
 			case IR::StageInputKind::FragCoord: type = TypeF32Vector(state, 4); break;
