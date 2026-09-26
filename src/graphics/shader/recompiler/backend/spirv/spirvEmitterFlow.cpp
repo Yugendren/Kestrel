@@ -655,6 +655,13 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return result;
 }
 
+uint32_t EmitGetRescaleControl(EmitterState& state) {
+	const auto& bindings = state.program.bindings;
+	return bindings.HasRescaleControl()
+	           ? EmitShaderDataDwordLoad(state, bindings.rescale_control_dword)
+	           : ConstantU32(state, 0);
+}
+
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {
 
 	uint32_t dword = 0;

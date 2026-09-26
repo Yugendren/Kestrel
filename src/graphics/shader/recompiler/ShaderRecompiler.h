@@ -26,6 +26,10 @@ struct CompileOptions {
 	// traversal loop descends one branch per node instead of up to four. Independent of
 	// bvh_always_miss, which removes the traversal entirely.
 	bool                        bvh_reduced                = false;
+	// Compute only: log2 of the power-of-two render downscale (render scale 2^-s) that the
+	// tile-rescale pass may prove the program for; 0 disables the pass (--compute-rescale off,
+	// or a render scale that is not an exact power-of-two downscale).
+	uint32_t                    tile_rescale_log2          = 0;
 	// Vertex stage only: keep the guest's own attribute-table and V# reads and fetch vertex data
 	// through the BDA page table instead of fixed-function vertex input.
 	bool                        gpu_vertex_fetch           = false;

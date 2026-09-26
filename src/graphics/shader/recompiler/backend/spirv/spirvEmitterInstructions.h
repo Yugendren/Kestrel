@@ -158,6 +158,7 @@ uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Ins
 uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
+uint32_t              EmitGetRescaleControl(EmitterState& state);
 uint32_t              EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index);
 uint32_t              EmitUndefU1(EmitterState& state, const IR::Inst& inst);
 inline constexpr auto EmitUndefU8  = EmitUndefU1;

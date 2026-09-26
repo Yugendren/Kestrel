@@ -14,6 +14,8 @@ VALUE_OPCODE(TessellationBase, U32, U32)
 VALUE_OPCODE(GetTessellationAttribute, U32, U32, U32, U1)
 VALUE_OPCODE(SetTessellationAttribute, Void, U32, U32, U32, U1)
 VALUE_OPCODE(GetBuiltin, U32, U32, U32)
+// Runtime tile-rescale control word (IR::RescaleControl); 0 when the program has none.
+VALUE_OPCODE(GetRescaleControl, U32)
 VALUE_OPCODE(GetThreadBitScalarRegister, U1, ScalarReg)
 VALUE_OPCODE(SetThreadBitScalarRegister, Void, ScalarReg, U1)
 VALUE_OPCODE(GetScalarMaskTag, U1, ScalarReg)

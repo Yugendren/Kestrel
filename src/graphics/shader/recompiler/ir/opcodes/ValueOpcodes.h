@@ -44,6 +44,17 @@ struct DppMoveFlags {
 static_assert(sizeof(DppMoveFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<DppMoveFlags>);
 
+// SelectU32 flags. An indexed register write (V_MOVRELD) is translated into one select per
+// register of the window, each firing only when M0 names that register. The translator marks
+// those rungs so analyses can tell them from the exec-merge selects of divergent control flow:
+// a guest indexed write stays inside its array, so a rung never really retargets a register that
+// holds some unrelated live value (see passes/TileRescale.h, assumption A1).
+struct SelectFlags {
+	bool indexed_register_write = false;
+};
+static_assert(sizeof(SelectFlags) <= sizeof(uint64_t));
+static_assert(std::is_trivially_copyable_v<SelectFlags>);
+
 struct PermlaneFlags {
 	bool x16            = false;
 	bool fetch_inactive = false;

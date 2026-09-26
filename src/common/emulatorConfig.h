@@ -43,11 +43,19 @@ constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 // every BVH intersection report a miss so RT-dependent passes take their no-hit branch.
 enum class RtMode { Full, Reduced, Off };
 
+// Resolution rescaling of per-pixel tile compute (shader recompiler pass TileRescale). Off runs
+// every dispatch at guest resolution against native twins of scaled images. Auto runs a program
+// the recompiler proved safe at the render resolution, after a dual-run check of its first
+// dispatches. Verify never rescales but dual-run checks every dispatch of such a program (a test
+// mode: frames look like Off, the log reports mismatches).
+enum class ComputeRescale { Off, Auto, Verify };
+
 // Host-side graphics fidelity knobs. Every default reproduces the guest's intent exactly, so a
 // default-constructed GraphicsSettings leaves every code path unchanged.
 struct GraphicsSettings {
 	float  render_scale = 1.0F;
 	RtMode rt_mode      = RtMode::Full;
+	ComputeRescale compute_rescale = ComputeRescale::Off;
 
 	// Sampler-translation overrides. max_anisotropy 0 follows the guest descriptor; any other
 	// value is an upper bound on the anisotropic ratio. lod_bias is added to the guest's mip
@@ -143,6 +151,7 @@ bool     AmdCpuEnabled();
 uint32_t GetVblankFrequency();
 float GetRenderScale();
 RtMode GetRtMode();
+ComputeRescale GetComputeRescale();
 uint32_t GetMaxAnisotropy();
 float    GetLodBias();
 inline float    GetPostScale() { return Detail::g_hot_values.post_scale; }

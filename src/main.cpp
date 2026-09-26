@@ -97,6 +97,9 @@ static void PrintUsage() {
 	         "                                       --render-scale if both are given.\n");
 	::printf("  --rt-mode <full|reduced|off>         Ray tracing fidelity. off makes every BVH\n"
 	         "                                       intersection report a miss. Default: full.\n");
+	::printf("  --compute-rescale <off|auto|verify>  Run per-pixel tile compute the recompiler\n"
+	         "                                       proves safe at the render resolution.\n"
+	         "                                       verify only cross-checks it. Default: off.\n");
 	::printf("  --anisotropy <0|1|2|4|8|16>          Cap the anisotropic filter ratio. 0 follows\n"
 	         "                                       the guest descriptor. Default: 0.\n");
 	::printf("  --lod-bias <float>                   Added to the guest mip LOD bias (-4..4).\n"
@@ -227,6 +230,26 @@ static bool ParseInternalResolution(const std::string& value, float& out) {
 		}
 	}
 
+	return false;
+}
+
+static bool ParseComputeRescale(const std::string& value, Config::ComputeRescale& out) {
+	struct Mode {
+		const char*            name;
+		Config::ComputeRescale mode;
+	};
+	static constexpr Mode MODES[] = {
+	    {"off", Config::ComputeRescale::Off},
+	    {"auto", Config::ComputeRescale::Auto},
+	    {"verify", Config::ComputeRescale::Verify},
+	};
+
+	for (const auto& mode: MODES) {
+		if (Common::EqualNoCase(value, mode.name)) {
+			out = mode.mode;
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -452,6 +475,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.graphics.render_scale = mapped;
+		} else if (arg == "--compute-rescale") {
+			if (!ParseComputeRescale(value, options.config.graphics.compute_rescale)) {
+				::printf("invalid compute rescale mode: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--rt-mode") {
 			if (!ParseRtMode(value, options.config.graphics.rt_mode)) {
 				::printf("invalid rt mode: %s\n", value.c_str());

@@ -144,6 +144,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .scratch_dwords  = scratch_dwords,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
+	    .tile_rescale    = tile_rescale,
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {

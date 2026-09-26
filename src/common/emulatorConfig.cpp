@@ -106,6 +106,10 @@ RtMode GetRtMode() {
 	return g_config->graphics.rt_mode;
 }
 
+ComputeRescale GetComputeRescale() {
+	return g_config->graphics.compute_rescale;
+}
+
 uint32_t GetMaxAnisotropy() {
 	const uint32_t cap = g_config->graphics.max_anisotropy;
 	return cap == 0 ? 0 : std::clamp(cap, 1u, 16u);

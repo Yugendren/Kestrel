@@ -198,6 +198,8 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	// Host-only: only the tile-rescale prologue reads it (passes/TileRescale.h).
+	NumWorkgroups,
 };
 
 enum class StageOutputKind {
@@ -426,15 +428,50 @@ struct DescriptorBinding {
 	bool operator==(const DescriptorBinding& other) const = default;
 };
 
+// Layout of the runtime control word a tile-rescaled compute program (passes/TileRescale.h)
+// reads from its shader data at BindingLayout::rescale_control_dword. The renderer fills it per
+// dispatch; an all-zero word runs the program exactly as translated.
+struct RescaleControl {
+	// Bit i: image resource i is bound at 1/2^scale of its guest extent, so texel addresses into
+	// it are shifted right by `scale`.
+	static constexpr uint32_t ImageMaskBits = 16;
+	// log2 of the downscale factor k of the scaled bindings and of the invocation remap.
+	static constexpr uint32_t ScaleShift = 28;
+	static constexpr uint32_t ScaleBits  = 2;
+	// Float conversions of the invocation's own pixel coordinate get +0.5*(k-1), moving the
+	// shading point from the representative guest pixel to the centre of the scaled texel.
+	static constexpr uint32_t CentreBit = 30;
+	// Each workgroup runs k^2 guest workgroups, one whole-warp slot of (W*H)/k^2 invocations
+	// each, and every invocation one representative guest pixel of a k x k block.
+	static constexpr uint32_t RemapBit = 31;
+
+	[[nodiscard]] static constexpr uint32_t Encode(uint32_t image_mask, uint32_t scale_log2,
+	                                               bool remap, bool centre) {
+		return (image_mask & ((1u << ImageMaskBits) - 1u)) |
+		       ((scale_log2 & ((1u << ScaleBits) - 1u)) << ScaleShift) |
+		       (centre ? 1u << CentreBit : 0u) | (remap ? 1u << RemapBit : 0u);
+	}
+};
+
 struct BindingLayout {
+	static constexpr uint32_t NoRescaleControl = UINT32_MAX;
+
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
+	// Shader-data dword holding the RescaleControl word, after the packed memory offsets.
+	uint32_t                       rescale_control_dword = NoRescaleControl;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t MemoryOffsetEndDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] bool HasRescaleControl() const {
+		return rescale_control_dword != NoRescaleControl;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return MemoryOffsetEndDword() + (HasRescaleControl() ? 1u : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -519,6 +556,33 @@ struct ResourceBlock {
 	std::vector<uint32_t> sources;
 };
 
+// How a program's result can depend on which invocations share a wave, as far as the tile-rescale
+// analysis could classify it. Anything beyond LaneSerialized is refused statically.
+enum class CrossLaneClass : uint8_t {
+	// C0: exec-mask algebra only (ballots feeding any/none tests and per-lane bit tests).
+	ExecMaskOnly,
+	// C1: first-active-lane waterfall loops (readfirstlane compared with its own source).
+	Waterfall,
+	// C2: wave-uniform values kept in lanes of a register (writelane/readlane stacks) and
+	// first-active-lane reads of per-lane data.
+	LaneSerialized,
+};
+
+// The renderer-facing result of the tile-rescale pass (passes/TileRescale.h).
+struct TileRescaleInfo {
+	// log2 of the downscale factor k the program was proven for; 0 when it was not rescaled.
+	uint32_t       scale_log2 = 0;
+	CrossLaneClass cross_lane = CrossLaneClass::ExecMaskOnly;
+
+	[[nodiscard]] bool Enabled() const { return scale_log2 != 0; }
+	// The static proof covers C0 completely. C1/C2 also depend on how the guest's wave-level
+	// code behaves at runtime, which the renderer's dual-run check has to confirm first.
+	[[nodiscard]] bool NeedsRuntimeCheck() const {
+		return cross_lane != CrossLaneClass::ExecMaskOnly;
+	}
+	bool operator==(const TileRescaleInfo& other) const = default;
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
@@ -530,6 +594,7 @@ struct CompiledShaderInfo {
 	uint32_t                      param_export_mask   = 0;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
+	TileRescaleInfo               tile_rescale;
 };
 
 struct UniformFillPlan {
@@ -618,6 +683,8 @@ struct Program: ResourcePlan {
 	bool                          bvh_always_miss = false;
 	// Mirrors CompileOptions::bvh_reduced (--rt-mode reduced).
 	bool                          bvh_reduced = false;
+	// Set by ApplyTileRescale (passes/TileRescale.h).
+	TileRescaleInfo               tile_rescale;
 
 };
 
