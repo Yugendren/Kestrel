@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderScale.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -32,11 +33,19 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Whether a remapped dispatch shades the centre of each scaled texel
+// (IR::RescaleControl::CentreBit) rather than the top-left guest pixel of its k x k block. Off
+// until an image comparison against the native reference shows the correction helps
+// (research/remap-detector-2026-09-26.md, section 3).
+static constexpr bool kShadeTexelCentre = false;
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -469,9 +478,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	// A program the recompiler rescaled (computeRescale.h) runs natively, remapped, or natively
+	// with a dual-run check, as its state and the configuration decide.
+	auto  rescale  = BeginTileRescale(program);
 	auto& bindings = m_compute_bindings;
 	m_context.GetBufferCache().BeginBufferScope();
-	PrepareBindings(input_info.stage, bindings);
+	PrepareBindings(input_info.stage, bindings, rescale.Space());
+	GateTileRescale(program, bindings, rescale);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda(program.info.writes_through_addresses);
@@ -482,8 +495,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetBufferCache().RecordGpuFill(fill_descriptor.Base48(), fill_size, fill_value,
 		                                         fill_epoch);
 	}
+	ConfirmTileRescale(program, bindings, rescale);
 
-	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -521,15 +534,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	auto& hazards = m_context.GetCommandScheduler().ShaderHazards();
 	if (hazards.NeedsBarrier(reads, writes)) {
-		ShaderHazardBarrier(vk_buffer);
+		ShaderHazardBarrier(buffer.Handle());
 		hazards.Clear();
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	const ComputeDispatchSize size {thread_group_x, thread_group_y, thread_group_z};
+	RecordComputeDispatch(buffer, pipeline, size);
 
 	// The dependency this dispatch creates is published by the next item that needs it, or by
 	// the scheduler when anything else may observe it.
 	hazards.Record(reads, writes);
+	FinishTileRescale(buffer, pipeline, program, bindings, rescale, size);
 	ResetBindings();
 }
 
@@ -559,11 +573,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	const auto& program = *input_info.stage.program;
+	// Tile rescale runs here exactly as for DispatchDirect(): the control word and the texel
+	// space do not depend on where the workgroup counts come from.
+	auto  rescale  = BeginTileRescale(program);
 	auto& bindings = m_compute_bindings;
 	m_context.GetBufferCache().BeginBufferScope();
-	PrepareBindings(input_info.stage, bindings);
+	PrepareBindings(input_info.stage, bindings, rescale.Space());
+	GateTileRescale(program, bindings, rescale);
 	FindBuffers(bindings);
-	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda(program.info.writes_through_addresses);
 	}
@@ -573,6 +591,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	ConfirmTileRescale(program, bindings, rescale);
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -594,11 +613,229 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	// A dual-run replay reads the same arguments: the full barriers around it order it after
+	// every write this one waits for, so the block is not obtained or fenced a second time.
+	ComputeDispatchSize size;
+	size.args_buffer = args_buffer->Handle();
+	size.args_offset = args_offset;
+	RecordComputeDispatch(buffer, pipeline, size);
 	// Published by the next item that needs it, or by the scheduler, as for DispatchDirect.
 	hazards.Record(unbounded, unbounded);
+	FinishTileRescale(buffer, pipeline, program, bindings, rescale, size);
 	ResetBindings();
+}
+
+void RenderExecutor::RecordComputeDispatch(CommandBuffer&                 buffer,
+                                           const PipelineCache::Pipeline& pipeline,
+                                           const ComputeDispatchSize&     size) {
+	auto vk_buffer = buffer.Handle();
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	if (size.args_buffer != nullptr) {
+		vk_buffer.dispatchIndirect(size.args_buffer, size.args_offset);
+	} else {
+		vk_buffer.dispatch(size.thread_group_x, size.thread_group_y, size.thread_group_z);
+	}
+}
+
+RenderExecutor::TileRescaleDispatch
+RenderExecutor::BeginTileRescale(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	TileRescaleDispatch rescale;
+	if (!program.tile_rescale.Enabled() || !program.bindings.HasRescaleControl() ||
+	    m_tile_rescale.Mode() == Config::ComputeRescale::Off) {
+		return rescale;
+	}
+	m_tile_rescale.Poll(m_context.GetCommandScheduler(), m_context.GetTextureCache());
+	rescale.state = &m_tile_rescale.Track(program.shader_hash, &program);
+	rescale.plan  = rescale.state->Decide(m_tile_rescale.Mode(),
+	                                      program.tile_rescale.NeedsRuntimeCheck());
+	if (rescale.plan == TileRescale::Plan::Native) {
+		m_tile_rescale.Off(*rescale.state, program.shader_hash,
+		                   rescale.state->blacklisted ? TileRescale::Reason::Blacklisted
+		                                              : TileRescale::Reason::ChecksPending);
+	}
+	return rescale;
+}
+
+void RenderExecutor::GateTileRescale(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                     PreparedBindings& bindings, TileRescaleDispatch& rescale) {
+	if (rescale.plan != TileRescale::Plan::Rescale) {
+		return;
+	}
+	const auto rescale_log2 = program.tile_rescale.scale_log2;
+	DescribeRescaleBindings(program, bindings);
+	const auto gate =
+	    TileRescale::EvaluateGate(RenderScale::Factor(), rescale_log2, m_rescale_images);
+	if (gate.on) {
+		rescale.rescaled = true;
+		rescale.mask     = gate.image_mask;
+	} else {
+		m_tile_rescale.Off(*rescale.state, program.shader_hash, gate.reason);
+		// Nothing has been acquired yet -- RebindImages() does that -- so resolving the same
+		// descriptors again in guest texels leaves the scaled images untouched.
+		ResetBindings();
+		ResolveImages(bindings, TextureCache::TexelSpace::Guest);
+	}
+	// A clear word runs the program exactly as translated.
+	SetShaderDataWord(bindings, program.bindings.rescale_control_dword,
+	                  rescale.rescaled ? ShaderRecompiler::IR::RescaleControl::Encode(
+	                                         rescale.mask, rescale_log2, true, kShadeTexelCentre)
+	                                   : 0u);
+}
+
+void RenderExecutor::ConfirmTileRescale(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                        PreparedBindings& bindings, TileRescaleDispatch& rescale) {
+	if (rescale.rescaled) {
+		// RebindImages() re-resolves an entry whose image went away while earlier entries were
+		// acquired. The word has to describe what is bound, so check again; on a change fall back
+		// to guest texels (the scaled images already acquired just resample back to their twins).
+		DescribeRescaleBindings(program, bindings);
+		const auto gate = TileRescale::EvaluateGate(
+		    RenderScale::Factor(), program.tile_rescale.scale_log2, m_rescale_images);
+		if (gate.on && gate.image_mask == rescale.mask) {
+			rescale.state->rescaled++;
+		} else {
+			m_tile_rescale.Off(*rescale.state, program.shader_hash, TileRescale::Reason::Rebound);
+			ResetBindings();
+			ResolveImages(bindings, TextureCache::TexelSpace::Guest);
+			RebindImages(bindings);
+			SetShaderDataWord(bindings, program.bindings.rescale_control_dword, 0);
+			rescale.rescaled = false;
+		}
+	}
+	if (rescale.plan == TileRescale::Plan::NativeWithCheck) {
+		rescale.check = PrepareTileRescaleCheck(program, bindings, *rescale.state);
+	}
+}
+
+void RenderExecutor::FinishTileRescale(CommandBuffer&                                  buffer,
+                                       const PipelineCache::Pipeline&                  pipeline,
+                                       const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                       const PreparedBindings&                         bindings,
+                                       const TileRescaleDispatch&                      rescale,
+                                       const ComputeDispatchSize&                      size) {
+	if (rescale.check) {
+		RecordTileRescaleReplay(buffer, pipeline, program, bindings, *rescale.check,
+		                        *rescale.state, size);
+	}
+	if (rescale.state != nullptr) {
+		m_tile_rescale.NoteDispatched(*rescale.state, program.shader_hash);
+	}
+}
+
+void RenderExecutor::DescribeRescaleBindings(
+    const ShaderRecompiler::IR::CompiledShaderInfo& program, const PreparedBindings& bindings) {
+	auto& images = m_context.GetTextureCache().m_slot_images;
+	m_rescale_images.clear();
+	for (uint32_t i = 0; i < bindings.images.size(); i++) {
+		const auto&            binding = bindings.images[i];
+		TileRescale::BoundImage bound;
+		bound.image           = (static_cast<uint64_t>(binding.image_id.index) << 32u) |
+		                        binding.image_id.generation;
+		bound.guest_address   = binding.desc.info.data.address;
+		bound.guest_size      = binding.desc.info.data.size;
+		bound.storage         = binding.desc.type == TextureCache::BindingType::Storage;
+		bound.texel_addressed = binding.desc.texel_addressed;
+		bound.written = i < program.info.images.size() && program.info.images[i].written;
+		const Image* shape = images.try_get(binding.image_id);
+		if (shape != nullptr && shape->ScaleTwinOwner()) {
+			// A twin stands for its owner: the gate asks about the scaled image behind it.
+			bound.twin = true;
+			shape      = images.try_get(shape->ScaleTwinOwner());
+		}
+		if (shape != nullptr) {
+			const auto& info = shape->info;
+			bound.width      = info.extent.width;
+			bound.height     = info.extent.height;
+			bound.scale      = info.scale;
+			bound.samples    = info.samples;
+			bound.levels     = info.resources.levels;
+			bound.color_2d   = info.type == Prospero::ImageType::kColor2D;
+			bound.depth      = info.IsDepth();
+			bound.block      = info.IsBlock();
+		}
+		m_rescale_images.push_back(bound);
+	}
+}
+
+std::optional<RenderExecutor::TileRescaleCheck>
+RenderExecutor::PrepareTileRescaleCheck(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                        const PreparedBindings&    bindings,
+                                        TileRescale::ProgramState& state) {
+	DescribeRescaleBindings(program, bindings);
+	const auto target = TileRescale::EvaluateCheck(
+	    RenderScale::Factor(), program.tile_rescale.scale_log2, m_rescale_images);
+	if (!target.eligible) {
+		m_tile_rescale.Off(state, program.shader_hash, target.reason);
+		return std::nullopt;
+	}
+	auto&      cache     = m_context.GetTextureCache();
+	const auto native_id = bindings.images[target.written].image_id;
+	auto&      native    = cache.GetImage(native_id);
+	if (!TileRescaleController::CanCompare(native)) {
+		m_tile_rescale.Off(state, program.shader_hash, TileRescale::Reason::CheckFormat);
+		return std::nullopt;
+	}
+	if (!m_tile_rescale.HasFreeSlot()) {
+		m_tile_rescale.Off(state, program.shader_hash, TileRescale::Reason::CheckNoSlot);
+		return std::nullopt;
+	}
+	const auto scratch_id = m_tile_rescale.AcquireScratch(cache, native);
+	// Both runs have to start from the pixels the native dispatch is about to overwrite, so a
+	// read-modify-write replays exactly. The hazard tracker knows nothing of the scratch image,
+	// so the copy is fenced by full barriers rather than by it.
+	m_context.GetCommandScheduler().RequestFullBarrier();
+	cache.GetImage(scratch_id).CopyImage(native);
+	m_context.GetCommandScheduler().RequestFullBarrier();
+	return TileRescaleCheck {native_id, scratch_id};
+}
+
+void RenderExecutor::RecordTileRescaleReplay(
+    CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+    const ShaderRecompiler::IR::CompiledShaderInfo& program, const PreparedBindings& bindings,
+    const TileRescaleCheck& check, TileRescale::ProgramState& state,
+    const ComputeDispatchSize& size) {
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto& cache     = m_context.GetTextureCache();
+	auto& native    = cache.GetImage(check.native);
+	auto& scratch   = cache.GetImage(check.scratch);
+	// The replay reads what the native dispatch read and must not overlap it.
+	scheduler.RequestFullBarrier();
+
+	// Same descriptors, with every binding of the written image -- the storage binding and any
+	// texel-addressed read of it -- moved to the scratch copy through the same view description.
+	// A copy, so the stage's persistent resolution (and its reuse memo) never sees the scratch.
+	PreparedBindings replay    = bindings;
+	const auto       swap_view = [&](vk::ImageView view) {
+		const auto cached = std::ranges::find(native.views, view, &CachedImageView::view);
+		EXIT_IF(cached == native.views.end());
+		return scratch.FindView(cached->info);
+	};
+	for (auto& binding: replay.images) {
+		if (binding.image_id != check.native) {
+			continue;
+		}
+		binding.image_id   = check.scratch;
+		binding.image_view = swap_view(binding.image_view);
+		for (auto& mip_view: binding.mip_views) {
+			mip_view = swap_view(mip_view);
+		}
+	}
+	// Remap with no texel shift: each representative invocation writes its own guest pixel,
+	// so the scratch holds, at every pixel with x and y multiples of k, what a remapped dispatch
+	// would compute for the scaled texel there.
+	SetShaderDataWord(replay, program.bindings.rescale_control_dword,
+	                  ShaderRecompiler::IR::RescaleControl::Encode(
+	                      0, program.tile_rescale.scale_log2, true, false));
+	PreparedBindings* descriptor_stage = &replay;
+	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+	               std::span {&descriptor_stage, 1u});
+	RecordComputeDispatch(buffer, pipeline, size);
+
+	scheduler.RequestFullBarrier();
+	m_tile_rescale.RecordCompare(scheduler, native, scratch, program.tile_rescale.scale_log2,
+	                             state, program.shader_hash);
+	// Whatever is recorded next must not overlap the compare's reads either.
+	scheduler.RequestFullBarrier();
 }
 
 } // namespace Libs::Graphics

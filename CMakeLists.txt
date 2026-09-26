@@ -318,6 +318,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${mesh_draw_args_shader_header}")
 
+set(tile_rescale_compare_shader_source "${gpu_tiler_shader_dir}/tile_rescale_compare.comp")
+set(tile_rescale_compare_shader_spv "${gpu_tiler_generated_dir}/tile_rescale_compare.spv")
+set(tile_rescale_compare_shader_header "${gpu_tiler_generated_dir}/tile_rescale_compare_spv.h")
+add_custom_command(
+	OUTPUT "${tile_rescale_compare_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${tile_rescale_compare_shader_spv}" "${tile_rescale_compare_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${tile_rescale_compare_shader_spv}
+	        -DOUTPUT=${tile_rescale_compare_shader_header} -DSYMBOL=TILE_RESCALE_COMPARE_SPV
+	        -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${tile_rescale_compare_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${tile_rescale_compare_shader_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
@@ -623,6 +639,14 @@ add_executable(draw_reuse_tests EXCLUDE_FROM_ALL
 target_link_libraries(draw_reuse_tests common fmt::fmt Vulkan::Headers xxhash)
 target_include_directories(draw_reuse_tests PRIVATE ${inc_headers})
 
+# Header-only: the tile-rescale gate and per-program state machine (computeRescale.h) are pure
+# functions of the bound images and the check results.
+add_executable(compute_rescale_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ComputeRescaleTests.cpp"
+)
+target_link_libraries(compute_rescale_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(compute_rescale_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -676,6 +700,7 @@ if(BUILD_TESTING)
 	add_test(NAME render_target_memo COMMAND $<TARGET_FILE:render_target_memo_tests>)
 	add_test(NAME dynamic_state_cache COMMAND $<TARGET_FILE:dynamic_state_cache_tests>)
 	add_test(NAME pass_scale COMMAND $<TARGET_FILE:pass_scale_tests>)
+	add_test(NAME compute_rescale COMMAND $<TARGET_FILE:compute_rescale_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
@@ -743,6 +768,7 @@ if(BUILD_TESTING)
 		render_target_memo_tests
 		dynamic_state_cache_tests
 		pass_scale_tests
+		compute_rescale_tests
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests

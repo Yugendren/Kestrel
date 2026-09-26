@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/drawStateTracker.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/computeRescale.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawReuse.h"
 #include "graphics/host_gpu/renderer/meshDrawArgs.h"
@@ -342,6 +343,69 @@ private:
 	void ResolveImages(PreparedBindings& prepared, TextureCache::TexelSpace compute_space);
 	// Sets one shader-data dword after RebindBuffers() may already have uploaded the block.
 	void SetShaderDataWord(PreparedBindings& prepared, uint32_t dword, uint32_t value);
+	// A compute dispatch's size: workgroup counts, or -- DispatchIndirect() -- the guest
+	// indirect-arguments block, already obtained from the buffer cache.
+	struct ComputeDispatchSize {
+		uint32_t   thread_group_x = 0;
+		uint32_t   thread_group_y = 0;
+		uint32_t   thread_group_z = 0;
+		vk::Buffer args_buffer    = nullptr;
+		uint64_t   args_offset    = 0;
+	};
+	// Binds the compute pipeline and records the dispatch, direct or indirect.
+	void RecordComputeDispatch(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+	                           const ComputeDispatchSize& size);
+	// Tile rescale (computeRescale.h). Fills m_rescale_images from what `bindings` resolved to.
+	void DescribeRescaleBindings(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                             const PreparedBindings&                         bindings);
+	// A dual-run check in progress: the image the native dispatch writes and its scratch copy.
+	struct TileRescaleCheck {
+		ImageId native;
+		ImageId scratch;
+	};
+	// How one dispatch of a tile-rescaled program runs. DispatchDirect() and DispatchIndirect()
+	// both walk it through BeginTileRescale() before binding, GateTileRescale() once the images
+	// are resolved, ConfirmTileRescale() once everything is bound and FinishTileRescale() after
+	// the dispatch is recorded.
+	struct TileRescaleDispatch {
+		TileRescale::ProgramState*      state    = nullptr;
+		TileRescale::Plan               plan     = TileRescale::Plan::Native;
+		uint32_t                        mask     = 0;
+		bool                            rescaled = false;
+		std::optional<TileRescaleCheck> check;
+
+		// The space the dispatch's images are first resolved in.
+		[[nodiscard]] TextureCache::TexelSpace Space() const {
+			return plan == TileRescale::Plan::Rescale ? TextureCache::TexelSpace::ScaledGuest
+			                                          : TextureCache::TexelSpace::Guest;
+		}
+	};
+	// Decides, from the program's state and the configuration, whether a program the recompiler
+	// rescaled runs natively, remapped, or natively with a dual-run check.
+	[[nodiscard]] TileRescaleDispatch
+	BeginTileRescale(const ShaderRecompiler::IR::CompiledShaderInfo& program);
+	// A remapped dispatch passes the gate or is re-resolved in guest texels; sets the control word.
+	void GateTileRescale(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                     PreparedBindings& bindings, TileRescaleDispatch& rescale);
+	// Re-checks the gate against what RebindImages() bound, and starts a dual-run check.
+	void ConfirmTileRescale(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                        PreparedBindings& bindings, TileRescaleDispatch& rescale);
+	// Records the dual-run replay, if any, and counts the dispatch.
+	void FinishTileRescale(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+	                       const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                       const PreparedBindings& bindings, const TileRescaleDispatch& rescale,
+	                       const ComputeDispatchSize& size);
+	// Starts a check of a natively bound dispatch -- copies its output's pre-dispatch pixels to
+	// a scratch image -- or counts why it cannot be checked.
+	[[nodiscard]] std::optional<TileRescaleCheck>
+	PrepareTileRescaleCheck(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                        const PreparedBindings& bindings, TileRescale::ProgramState& state);
+	// Replays the dispatch remap-only into the scratch image and records the compare pass.
+	void RecordTileRescaleReplay(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+	                             const ShaderRecompiler::IR::CompiledShaderInfo& program,
+	                             const PreparedBindings& bindings, const TileRescaleCheck& check,
+	                             TileRescale::ProgramState& state,
+	                             const ComputeDispatchSize& size);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -413,6 +477,10 @@ private:
 	// Converts a guest indirect-args block into a mesh draw's parameter and dispatch buffers on the
 	// GPU; see meshDrawArgs.h. Owned here because ExecutePreparedDraw() is its only caller.
 	MeshDrawArgsBuilder                   m_mesh_draw_args_builder;
+	// Decides and verifies the resolution rescaling of tile compute programs; see
+	// computeRescale.h. m_rescale_images is its per-dispatch scratch list.
+	TileRescaleController                 m_tile_rescale;
+	std::vector<TileRescale::BoundImage>  m_rescale_images;
 	std::vector<ImageId>                  m_bound_images;
 	// Indexed by ShaderType, which ends with the tessellation stages.
 	std::array<StageTextures, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1>

@@ -1,0 +1,57 @@
+#version 450
+
+// Tile-rescale dual-run check (renderer/computeRescale.h). The native dispatch wrote
+// native_image; its remap-only replay wrote replay_image, a copy of the pre-dispatch pixels, at
+// the representative guest pixel of each k x k block only. Counts the representative pixels
+// whose stored bits differ, and how many were compared, into one result slot. Both images are
+// bound through the unsigned-integer view of their texel size, so the comparison is of bits,
+// not of values.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform usampler2D native_image;
+layout(binding = 1) uniform usampler2D replay_image;
+
+// Per slot: differing texels, compared texels.
+layout(std430, binding = 2) buffer result_buf {
+    uint result[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint scale_log2;
+    uint slot_dword;
+};
+
+shared uint group_mismatches;
+shared uint group_compared;
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        group_mismatches = 0u;
+        group_compared   = 0u;
+    }
+    barrier();
+
+    const uvec2 pixel = gl_GlobalInvocationID.xy << scale_log2;
+    if (pixel.x < width && pixel.y < height) {
+        const uvec4 native_texel = texelFetch(native_image, ivec2(pixel), 0);
+        const uvec4 replay_texel = texelFetch(replay_image, ivec2(pixel), 0);
+        atomicAdd(group_compared, 1u);
+        if (any(notEqual(native_texel, replay_texel))) {
+            atomicAdd(group_mismatches, 1u);
+        }
+    }
+    barrier();
+
+    // One global atomic per workgroup instead of one per pixel.
+    if (gl_LocalInvocationIndex == 0u) {
+        if (group_mismatches != 0u) {
+            atomicAdd(result[slot_dword], group_mismatches);
+        }
+        if (group_compared != 0u) {
+            atomicAdd(result[slot_dword + 1u], group_compared);
+        }
+    }
+}
