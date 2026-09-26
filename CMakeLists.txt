@@ -508,6 +508,22 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_tracking_tests fmt::fmt common)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
+# The tile-rescale analysis on synthetic programs and on the Astro IR dumps (golden run:
+# KYTY_TILE_RESCALE_DUMPS=<dir with dump-*/ and rd-*.txt>).
+add_executable(tile_rescale_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/TileRescaleTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ExportOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ImageOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/MemoryOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ScalarAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/ShaderDecoder.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/VectorAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/TileRescale.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/TileRescaleGraph.cpp"
+)
+target_link_libraries(tile_rescale_tests fmt::fmt)
+target_include_directories(tile_rescale_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
