@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/pipeline/driverCacheBlob.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderScale.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderProgramMemo.h"
@@ -117,6 +118,20 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
+}
+
+// log2 of the downscale the tile-rescale pass may prove compute programs for: the render scale
+// has to be an exact power-of-two downscale 2^-s, as that is what the scaled images are.
+uint32_t TileRescaleLog2() {
+	if (Config::GetComputeRescale() == Config::ComputeRescale::Off) {
+		return 0;
+	}
+	for (uint32_t scale_log2 = 1; scale_log2 <= 3; scale_log2++) {
+		if (RenderScale::Factor() == 1.0F / static_cast<float>(1u << scale_log2)) {
+			return scale_log2;
+		}
+	}
+	return 0;
 }
 
 // Resource materialisation reads shader resource tables a dword at a time, and each such read
@@ -530,6 +545,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.bvh_always_miss    = Config::GetRtMode() == Config::RtMode::Off;
 		options.bvh_reduced        = Config::GetRtMode() == Config::RtMode::Reduced;
+		options.tile_rescale_log2  = stage == ShaderType::Compute ? TileRescaleLog2() : 0;
 		options.dump_label  = label;
 		options.gpu_vertex_fetch =
 		    stage == ShaderType::Vertex && Config::GetVertexFetchMode() == Config::VertexFetchMode::Gpu;

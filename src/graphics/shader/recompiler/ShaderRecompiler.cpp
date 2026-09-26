@@ -19,6 +19,7 @@
 #include "graphics/shader/recompiler/ir/passes/DynamicBuffer.h"
 #include "graphics/shader/recompiler/ir/passes/GpuVertexFetch.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/recompiler/ir/passes/TileRescale.h"
 #include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
@@ -493,6 +494,37 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// Proves the specialised program safe to run at the render resolution and, if it is, rewrites
+// it for that (ir/passes/TileRescale.h). One log line per program either way, so a census of
+// the log shows what was accepted and why the rest was not.
+void RescaleTileCompute(IR::Program& ir, const CompileOptions& options) {
+	const auto*                cs = options.input_info.compute;
+	const IR::TileRescaleShape shape {
+	    .threads            = {cs->threads_num[0], cs->threads_num[1], cs->threads_num[2]},
+	    .wave_size          = options.wave_size,
+	    .host_subgroup_size = cs->host_subgroup_size,
+	    .tg_size_en         = cs->tg_size_en,
+	    .scale_log2         = options.tile_rescale_log2,
+	};
+	const auto begin   = std::chrono::steady_clock::now();
+	const auto plan    = IR::AnalyzeTileRescale(ir, shape);
+	const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+	                         std::chrono::steady_clock::now() - begin)
+	                         .count();
+	if (!plan.accepted) {
+		LOGF("%s tile rescale: hash=0x%016" PRIx64 " REJECT (%" PRIu64 " reasons): %s\n",
+		     GetDumpLabel(options), ir.shader_hash, static_cast<uint64_t>(plan.reasons.size()),
+		     plan.reasons.empty() ? "" : plan.reasons.front().c_str());
+		return;
+	}
+	LOGF("%s tile rescale: hash=0x%016" PRIx64 " ACCEPT class=C%u s=%u align=%u"
+	     " analysis_us=%" PRIu64 " %s\n",
+	     GetDumpLabel(options), ir.shader_hash, static_cast<unsigned>(plan.cross_lane),
+	     plan.scale_log2, plan.store_align, static_cast<uint64_t>(elapsed), plan.summary.c_str());
+	IR::ApplyTileRescale(ir, plan);
+	IR::EliminateDeadCode(ir.blocks);
+}
+
 } // namespace
 
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
@@ -706,6 +738,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 
+	if (options.tile_rescale_log2 != 0 && options.stage == ShaderType::Compute &&
+	    options.input_info.compute != nullptr) {
+		RescaleTileCompute(ir, options);
+	}
 	IR::CollectShaderInfo(ir, options.input_info);
 	IR::AllocateBindings(ir, push_data_start_dword);
 	std::string ir_dump;
