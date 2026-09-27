@@ -420,7 +420,17 @@ static void ResolveGraphicsDynamicState(const CommandBuffer&         buffer,
 	out.depth_bounds_test_enable = VK_FALSE;
 #else
 	out.depth_bounds_test_enable = depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE;
-	out.depth_bounds             = {depth.depth_min_bounds, depth.depth_max_bounds};
+	// vkCmdSetDepthBounds requires both bounds in [0, 1] without VK_EXT_depth_range_unrestricted
+	// (VUID-vkCmdSetDepthBounds-minDepthBounds-02508/-02509), but the guest registers are raw
+	// floats. Depth values are in [0, 1] too, so clamping leaves the test's outcome unchanged
+	// (fmax/fmin also turn a NaN bound into the matching limit). With the test off the bounds
+	// are unused: record the neutral full range so stale guest values neither break validity nor
+	// defeat the dynamic-state cache.
+	const auto unit          = [](float value) { return std::fmin(std::fmax(value, 0.0f), 1.0f); };
+	out.depth_bounds         = depth.depth_bounds_test_enable
+	                               ? std::array {unit(depth.depth_min_bounds),
+	                                             unit(depth.depth_max_bounds)}
+	                               : std::array {0.0f, 1.0f};
 #endif
 
 	const auto& mode = ctx.GetModeControl();
