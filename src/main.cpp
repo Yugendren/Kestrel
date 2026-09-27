@@ -96,7 +96,10 @@ static void PrintUsage() {
 	         "                                       1440p, 1080p, 720p, 540p. Overridden by\n"
 	         "                                       --render-scale if both are given.\n");
 	::printf("  --rt-mode <full|reduced|off>         Ray tracing fidelity. off makes every BVH\n"
-	         "                                       intersection report a miss. Default: full.\n");
+	         "                                       intersection report a miss (guest BVH builds\n"
+	         "                                       still run); reduced keeps the nearest box\n"
+	         "                                       child. Triangle leaves always miss for now.\n"
+	         "                                       Default: full.\n");
 	::printf("  --compute-rescale <off|auto|verify>  Run per-pixel tile compute the recompiler\n"
 	         "                                       proves safe at the render resolution.\n"
 	         "                                       verify only cross-checks it. Default: auto.\n");

@@ -120,6 +120,28 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// The pipeline cache is the only consumer of --rt-mode (it becomes the bvh_always_miss /
+// bvh_reduced compile options of every program it translates), so it states the effective mode
+// once at startup: benchmarks need to confirm the mode from the log, and "off" is easy to
+// over-read. It only changes how IMAGE_BVH_INTERSECT_RAY is lowered; the guest's own BVH build
+// dispatches and its traversal loops still run (they exit on the first reported miss).
+void LogRtMode() {
+	switch (Config::GetRtMode()) {
+		case Config::RtMode::Off:
+			PipelineCacheLog("Ray tracing: rt-mode=off (every BVH intersection reports a miss; the "
+			                 "guest's BVH builds and traversal loops still run)");
+			break;
+		case Config::RtMode::Reduced:
+			PipelineCacheLog("Ray tracing: rt-mode=reduced (box nodes report only their nearest "
+			                 "child; triangle leaves report a miss)");
+			break;
+		case Config::RtMode::Full:
+			PipelineCacheLog("Ray tracing: rt-mode=full (box nodes report all hit children; "
+			                 "triangle leaves report a miss)");
+			break;
+	}
+}
+
 // log2 of the downscale the tile-rescale pass may prove compute programs for: the render scale
 // has to be an exact power-of-two downscale 2^-s, as that is what the scaled images are.
 uint32_t TileRescaleLog2() {
@@ -655,6 +677,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
       m_pixel_program_memo(std::make_unique<PixelProgramMemo>()),
       m_last_save_time(std::chrono::steady_clock::now()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	LogRtMode();
 	InitializeDriverCache();
 }
 
