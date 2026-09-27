@@ -27,7 +27,11 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// subgroupSizeControl with compute in requiredSubgroupSizeStages: a compute pipeline may pin
+	// its subgroup size anywhere in [min_subgroup_size, max_subgroup_size].
 	bool                               compute_subgroup_size_control_enabled = false;
+	// computeFullSubgroups: a compute pipeline may require every subgroup to be fully populated.
+	bool                               compute_full_subgroups_enabled        = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
@@ -47,6 +51,7 @@ struct GraphicContext {
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
+	uint32_t                           max_compute_workgroup_subgroups       = 0;
 	uint32_t                           max_push_descriptors                  = 0;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
@@ -91,8 +96,35 @@ struct GraphicContext {
 		return it->second.first;
 	}
 
+	// Whether a guest wave64 compute program can run on one 64-wide host subgroup; otherwise the
+	// recompiler splits each wave64 over two 32-lane halves (ShaderWorkgroupInputInfo::
+	// host_subgroup_size). Size control alone is not enough: 64 must be a size it can pin.
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
-		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+		return subgroup_size == 64u || (compute_subgroup_size_control_enabled &&
+		                                min_subgroup_size <= 64u && max_subgroup_size >= 64u);
+	}
+
+	// Whether a compute pipeline of guest wave `wave` with `invocations` invocations per
+	// workgroup can pin its subgroup size to `wave` (requiredSubgroupSize, VUID-02756/02757).
+	[[nodiscard]] bool CanRequireComputeSubgroupSize(uint32_t wave,
+	                                                 uint64_t invocations) const noexcept {
+		return compute_subgroup_size_control_enabled && wave >= min_subgroup_size &&
+		       wave <= max_subgroup_size &&
+		       invocations <= static_cast<uint64_t>(max_compute_workgroup_subgroups) * wave;
+	}
+
+	// The subgroup size a compute pipeline of guest wave `wave` is guaranteed to run at, or 0 when
+	// the driver may choose (and, with SPIR-V 1.6, vary) it. CreatePipelineInternal requests
+	// exactly this size, and recompiler proofs that depend on the real subgroup size (tile
+	// rescale) are given this value, so the two cannot disagree. The fixed-size fallback covers
+	// devices whose only subgroup size is the default (min == max), with or without size control.
+	[[nodiscard]] uint32_t ExactComputeSubgroupSize(uint32_t wave,
+	                                                uint64_t invocations) const noexcept {
+		if (CanRequireComputeSubgroupSize(wave, invocations)) {
+			return wave;
+		}
+		return min_subgroup_size != 0u && min_subgroup_size == max_subgroup_size ? subgroup_size
+		                                                                        : 0u;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

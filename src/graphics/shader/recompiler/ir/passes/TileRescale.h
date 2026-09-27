@@ -28,8 +28,9 @@
 // AnalyzeTileRescale proves on the final, specialised SSA IR that this is sound, refusing
 // otherwise with every failed proof (design and rationale:
 // research/remap-detector-2026-09-26.md, sections 2 and 3):
-//  S0 structure       2D power-of-two workgroup, guest wave32 == host subgroup 32, whole-warp
-//                     slots, no tg_size_en, not the dispatcher fallback.
+//  S0 structure       2D power-of-two workgroup at least k x k, guest wave32 running on a
+//                     pipeline pinned to exactly 32-lane subgroups, whole-warp slots, no
+//                     tg_size_en, not the dispatcher fallback.
 //  S1 side effects    no LDS/GDS, barrier, DPP/WQM/permute/swizzle, append/consume, buffer or
 //                     global stores and atomics (scratch is private), image atomics, size
 //                     queries, GlobalInvocationID/LocalInvocationIndex/LocalInvocationID.z;
@@ -48,17 +49,30 @@
 // Assumption A1: an indexed register write (SelectFlags::indexed_register_write) stays inside
 // its array -- out of bounds is undefined in the source language -- so its rungs never carry a
 // coordinate register away.
+//
+// Assumption A2: each 32-lane host subgroup holds 32 consecutive LocalInvocationIndex values, so
+// a slot of whole warps is also a set of whole subgroups. S0 checks that the pipeline is pinned
+// to 32-lane subgroups (TileRescaleShape::exact_subgroup_size), but Vulkan leaves the packing of
+// invocations into subgroups to the implementation. The pipeline additionally requires full
+// subgroups where the device supports it and LocalSize.x is a multiple of 32 (VUID-02759), which
+// excludes 16-wide tiles; beyond that, contiguous packing is assumed (every known driver packs
+// this way). A2 is what keeps the remapped WorkGroupID uniform across each subgroup, which the
+// translated program relies on wherever it holds it in a scalar register or ballots exec.
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // How the program is dispatched: the parts of the compute input the proofs depend on.
 struct TileRescaleShape {
 	std::array<uint32_t, 3> threads {};
-	uint32_t                wave_size          = 0;
-	uint32_t                host_subgroup_size = 0;
-	bool                    tg_size_en         = false;
+	uint32_t                wave_size           = 0;
+	// The subgroup size the host pipeline is guaranteed to run at, 0 when the driver chooses it
+	// (GraphicContext::ExactComputeSubgroupSize). Not host_subgroup_size: that is 64 on any device
+	// that can run wave64 natively, even when this wave32 program is pinned to 32 lanes, and 32 on
+	// devices that may actually run it at 8 or 16.
+	uint32_t                exact_subgroup_size = 0;
+	bool                    tg_size_en          = false;
 	// log2 of the downscale factor k to prove the program for (render scale 2^-s).
-	uint32_t                scale_log2         = 1;
+	uint32_t                scale_log2          = 1;
 };
 
 struct TileRescalePlan {

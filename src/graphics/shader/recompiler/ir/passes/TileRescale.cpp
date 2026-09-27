@@ -1280,13 +1280,22 @@ public:
 		if (d > 1 || !pow2(w) || !pow2(h)) {
 			log.Reject(fmt::format("workgroup {}x{}x{} is not a power-of-two 2D tile", w, h, d));
 		}
-		// Every remapped slot must be whole warps: that keeps WorkGroupID uniform per warp.
+		// The prologue splits the tile into k x k blocks of (W/k) x (H/k) invocations, so both
+		// sides must hold at least k pixels (its guard EXITs otherwise).
+		if (pow2(w) && pow2(h) &&
+		    (static_cast<uint32_t>(std::countr_zero(w)) < shape.scale_log2 ||
+		     static_cast<uint32_t>(std::countr_zero(h)) < shape.scale_log2)) {
+			log.Reject(fmt::format("workgroup {}x{} is narrower than the {}x{} downscale block", w,
+			                       h, 1u << shape.scale_log2, 1u << shape.scale_log2));
+		}
+		// Every remapped slot must be whole warps: that keeps WorkGroupID uniform per warp. Only
+		// a pipeline pinned to 32-lane subgroups makes a host subgroup one guest wave32.
 		const uint64_t k2 = uint64_t {1} << (2u * shape.scale_log2);
-		if (shape.wave_size != 32 || shape.host_subgroup_size != 32 ||
+		if (shape.wave_size != 32 || shape.exact_subgroup_size != 32 ||
 		    (static_cast<uint64_t>(w) * h) % (k2 * 32u) != 0) {
 			log.Reject(fmt::format("wave{}/host subgroup {}/{} invocations: remapped slots are not "
 			                       "whole warps",
-			                       shape.wave_size, shape.host_subgroup_size, w * h));
+			                       shape.wave_size, shape.exact_subgroup_size, w * h));
 		}
 		if (shape.tg_size_en) {
 			log.Reject("reads its wave index within the workgroup (tg_size_en)");

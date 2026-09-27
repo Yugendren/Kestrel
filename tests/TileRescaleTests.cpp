@@ -218,7 +218,9 @@ private:
     auto kv = KeyValues(words, 1);
     result.hash = std::string(kv["hash"]);
     result.shape.wave_size = static_cast<uint32_t>(ParseInt(kv["wave"]));
-    result.shape.host_subgroup_size =
+    // host_sg: the subgroup size the dumped program ran at (the dumps come from a device whose
+    // compute subgroups are fixed at that size).
+    result.shape.exact_subgroup_size =
         static_cast<uint32_t>(ParseInt(kv["host_sg"]));
     const auto threads = Split(kv["threads"], ',');
     for (size_t i = 0; i < 3 && i < threads.size(); i++) {
@@ -555,6 +557,43 @@ void TestSyntheticCases() {
     passed += ok;
   }
   std::cout << "synthetic: " << passed << "/" << cases.size() << " cases as expected\n";
+}
+
+// S0 on the accepted Astro shape: only a pipeline pinned to 32-lane subgroups qualifies, and the
+// tile must hold a whole k x k block per axis (the prologue EXITs otherwise, so S0 must refuse).
+void TestShapeCases() {
+  const auto analyze = [](ProgramOptions options, uint32_t exact, uint32_t scale_log2) {
+    auto program = ParseIrx(MakeProgram(Base({}), options));
+    Check(program.ok, "shape: parse: " + program.error);
+    program.shape.exact_subgroup_size = exact;
+    program.shape.scale_log2 = scale_log2;
+    return AnalyzeRescaleGraph(program.graph, program.shape).plan;
+  };
+  const auto has_reason = [](const TileRescalePlan &plan, std::string_view text) {
+    return std::any_of(plan.reasons.begin(), plan.reasons.end(),
+                       [&](const std::string &r) { return r.find(text) != std::string::npos; });
+  };
+  int cases = 0;
+  for (const uint32_t exact : {0u, 8u, 16u, 64u}) {
+    const auto plan = analyze({}, exact, 1);
+    Check(!plan.accepted && has_reason(plan, "not whole warps"),
+          "shape: exact subgroup " + std::to_string(exact) + " not rejected as partial warps");
+    cases++;
+  }
+  const auto pinned = analyze({}, 32, 1);
+  Check(pinned.accepted, "shape: exact subgroup 32 rejected: " +
+                             (pinned.reasons.empty() ? std::string() : pinned.reasons[0]));
+  cases++;
+  // 512x2 is 1024 invocations, whole warps at k = 4, but H = 2 < k.
+  const auto thin = analyze({.tx = 512, .ty = 2}, 32, 2);
+  Check(!thin.accepted && has_reason(thin, "narrower than the 4x4 downscale block"),
+        "shape: 512x2 at s=2 not rejected for its height");
+  cases++;
+  // At k = 2 the same tile holds a block per axis.
+  const auto thin_k2 = analyze({.tx = 512, .ty = 2}, 32, 1);
+  Check(!has_reason(thin_k2, "downscale block"), "shape: 512x2 at s=1 rejected for its height");
+  cases++;
+  std::cout << "shape: " << cases << " cases checked\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -898,7 +937,7 @@ void BuildTileProgram(BuiltProgram &built, bool tag_rung) {
 }
 
 void TestProgramWithTaggedRung() {
-  const TileRescaleShape shape{.threads = {16, 16, 1}, .wave_size = 32, .host_subgroup_size = 32};
+  const TileRescaleShape shape{.threads = {16, 16, 1}, .wave_size = 32, .exact_subgroup_size = 32};
 
   BuiltProgram tagged;
   BuildTileProgram(tagged, true);
@@ -926,6 +965,7 @@ void TestProgramWithTaggedRung() {
 
 int main() {
   TestSyntheticCases();
+  TestShapeCases();
   TestProgramWithTaggedRung();
   TestGoldenDumps();
   if (g_failures != 0) {

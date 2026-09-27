@@ -575,11 +575,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
-	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+	const auto wave_size   = input_info.stage.program->wave_size;
+	const auto invocations = input_info.Invocations();
+	// The program was specialised (and possibly proven, see TileRescaleShape) for this exact
+	// subgroup size; the pipeline must not run it at another.
+	EXIT_IF(input_info.exact_subgroup_size !=
+	        graphics.ExactComputeSubgroupSize(wave_size, invocations));
+	if (graphics.CanRequireComputeSubgroupSize(wave_size, invocations)) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+		// Full subgroups rule out partially populated subgroups, so every host subgroup carries a
+		// whole guest wave. Vulkan allows the flag only when LocalSize.x is a multiple of the
+		// required size (VUID-02759). A pinned wave64 implies a native 64-lane host subgroup
+		// (SupportsComputeWave64), so no two-half split reshapes the workgroup and LocalSize.x
+		// is threads_num[0].
+		const auto local_x = input_info.threads_num[0];
+		if (graphics.compute_full_subgroups_enabled && local_x != 0u &&
+		    local_x % wave_size == 0u) {
+			comp_shader_stage_info.flags |=
+			    vk::PipelineShaderStageCreateFlagBits::eRequireFullSubgroups;
+		}
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;

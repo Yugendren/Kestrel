@@ -500,11 +500,11 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 void RescaleTileCompute(IR::Program& ir, const CompileOptions& options) {
 	const auto*                cs = options.input_info.compute;
 	const IR::TileRescaleShape shape {
-	    .threads            = {cs->threads_num[0], cs->threads_num[1], cs->threads_num[2]},
-	    .wave_size          = options.wave_size,
-	    .host_subgroup_size = cs->host_subgroup_size,
-	    .tg_size_en         = cs->tg_size_en,
-	    .scale_log2         = options.tile_rescale_log2,
+	    .threads             = {cs->threads_num[0], cs->threads_num[1], cs->threads_num[2]},
+	    .wave_size           = options.wave_size,
+	    .exact_subgroup_size = cs->exact_subgroup_size,
+	    .tg_size_en          = cs->tg_size_en,
+	    .scale_log2          = options.tile_rescale_log2,
 	};
 	const auto begin   = std::chrono::steady_clock::now();
 	const auto plan    = IR::AnalyzeTileRescale(ir, shape);

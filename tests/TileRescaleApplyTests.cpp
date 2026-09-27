@@ -150,6 +150,7 @@ public:
     m_compute.threads_num[2] = 1;
     m_compute.wave_size = 32;
     m_compute.host_subgroup_size = 32;
+    m_compute.exact_subgroup_size = 32;
     m_compute.thread_ids_num = 2;
     m_compute.group_id[0] = true;
     m_compute.workgroup_register = 12;

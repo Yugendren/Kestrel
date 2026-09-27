@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <algorithm>
 #include <array>
 #include <span>
 #include <string>
@@ -79,6 +80,12 @@ struct ShaderWorkgroupInputInfo {
 	uint32_t scratch_size_dwords = 0;
 	uint32_t host_subgroup_size  = 64;
 	uint32_t wave_size           = 64;
+
+	// Invocations per workgroup; an unset dimension counts as one.
+	[[nodiscard]] constexpr uint64_t Invocations() const {
+		return static_cast<uint64_t>(std::max(threads_num[0], 1u)) * std::max(threads_num[1], 1u) *
+		       std::max(threads_num[2], 1u);
+	}
 };
 
 struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
@@ -171,6 +178,10 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
+	// The host subgroup size the compute pipeline is guaranteed to run at, 0 when the driver
+	// chooses (GraphicContext::ExactComputeSubgroupSize). Unlike host_subgroup_size, which only
+	// selects the wave64 split, this is exact for every wave size.
+	uint32_t           exact_subgroup_size        = 0;
 	ShaderStageRuntime stage;
 };
 

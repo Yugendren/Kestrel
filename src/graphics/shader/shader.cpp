@@ -953,6 +953,7 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.workgroup_register);
 	key.push_back(info.wave_size);
 	key.push_back(info.host_subgroup_size);
+	key.push_back(info.exact_subgroup_size);
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
