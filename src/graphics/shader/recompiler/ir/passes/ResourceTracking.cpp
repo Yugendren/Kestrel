@@ -92,7 +92,8 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
-		m_info.uses_dma = false;
+		m_info.uses_dma                 = false;
+		m_info.writes_through_addresses = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -1911,7 +1912,8 @@ private:
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			if (address_info.access == AddressAccess::Write) {
-				m_program.has_address_writes = true;
+				m_program.has_address_writes    = true;
+				m_info.writes_through_addresses = true;
 			}
 			m_info.uses_dma = true;
 			return;

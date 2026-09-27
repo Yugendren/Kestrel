@@ -466,6 +466,10 @@ struct ShaderInfo {
 	bool                             gpu_vertex_fetch   = false;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// The program stores through a device address (StoreAddress*), so it can change guest bytes
+	// no binding names. Loads through addresses, GPU-selected descriptors and vertex fetch only
+	// read memory and leave this false.
+	bool                             writes_through_addresses = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

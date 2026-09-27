@@ -2997,6 +2997,8 @@ void TestDmaAddressMaterialization() {
 
   Check(fixture.program.info.uses_dma,
         "typed address operations did not enable DMA");
+  Check(fixture.program.info.writes_through_addresses,
+        "an address store was not reported as a write through addresses");
   std::array<uint32_t, 2> user_data{0x2008u, 0u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
@@ -3005,6 +3007,23 @@ void TestDmaAddressMaterialization() {
                              specialization),
         "DMA shader resources did not materialize");
   ApplyResourceSpecialization(fixture.program, specialization);
+}
+
+// Loads through device addresses reach guest memory but cannot change it; the renderer keeps
+// recorded GPU fills across such programs (RenderContext::PrepareBda).
+void TestDmaAddressLoadsDoNotWrite() {
+  Fixture fixture;
+  const auto based =
+      fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  global.offset = static_cast<uint32_t>(-8);
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {based, Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(global, 4));
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.uses_dma && !fixture.program.info.writes_through_addresses,
+        "a load-only address program was reported as writing through addresses");
 }
 
 void TestDynamicFlatAddressesUseDma() {
@@ -3596,6 +3615,7 @@ int main() {
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);
+    Run("DMA address loads do not write", TestDmaAddressLoadsDoNotWrite);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);

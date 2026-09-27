@@ -53,7 +53,9 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	void               PrepareBda();
+	// Makes guest memory current for programs that reach it through buffer device addresses.
+	// `writes_memory`: one of them stores through an address (ShaderInfo::writes_through_addresses).
+	void               PrepareBda(bool writes_memory);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
