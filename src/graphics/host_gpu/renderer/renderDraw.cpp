@@ -2164,13 +2164,19 @@ bool RenderExecutor::KeepDrawTargets(const DrawRenderState& state) {
 	// What discovery still does per draw when its memo hits (ResolveRenderColorTarget(),
 	// ResolveRenderDepthTarget()): the LRU touch and access tick, and marking the image a target
 	// of this draw, so a texture-cache change during resource preparation flags it for rebinding.
+	// All targets are noted under one acquisition of the cache lock, as this runs for every kept
+	// draw.
+	std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX + 1> targets {};
+	uint32_t                                              target_count = 0;
 	for (uint32_t i = 0; i < state.color_count; i++) {
-		cache.NoteImageReuse(state.color_info[i].image_id);
-		BindRenderTarget(state.color_info[i].image_id);
+		targets[target_count++] = state.color_info[i].image_id;
 	}
 	if (state.depth_info.image_id) {
-		cache.NoteImageReuse(state.depth_info.image_id);
-		BindRenderTarget(state.depth_info.image_id);
+		targets[target_count++] = state.depth_info.image_id;
+	}
+	cache.NoteImageReuse(std::span {targets.data(), target_count});
+	for (uint32_t i = 0; i < target_count; i++) {
+		BindRenderTarget(targets[i]);
 	}
 	return true;
 }
@@ -2212,15 +2218,16 @@ PipelineCache::Pipeline* RenderExecutor::ReusableDrawPipeline(const CommandBuffe
 	if (state.ps_active && !m_pixel_bindings_reused) {
 		return nullptr;
 	}
-	auto& cache = m_context.GetTextureCache();
+	std::array<TextureCache::TargetAcquisition, RENDER_COLOR_ATTACHMENTS_MAX + 1> targets {};
+	uint32_t target_count = 0;
 	for (uint32_t i = 0; i < state.color_count; i++) {
-		const auto& color = state.color_info[i];
-		if (!cache.TargetAcquisitionRepeats(color.image_id, color.desc)) {
-			return nullptr;
-		}
+		targets[target_count++] = {state.color_info[i].image_id, &state.color_info[i].desc};
 	}
-	if (state.depth_info.image_id &&
-	    !cache.TargetAcquisitionRepeats(state.depth_info.image_id, state.depth_info.desc)) {
+	if (state.depth_info.image_id) {
+		targets[target_count++] = {state.depth_info.image_id, &state.depth_info.desc};
+	}
+	if (!m_context.GetTextureCache().TargetAcquisitionsRepeat(
+	        std::span {targets.data(), target_count})) {
 		return nullptr;
 	}
 	// Resource preparation may have ended the pass (an upload, a CommandBuffer::RequestFullBarrier

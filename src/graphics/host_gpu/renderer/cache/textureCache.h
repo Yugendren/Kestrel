@@ -11,9 +11,11 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 
 #include <map>
 #include <set>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -66,16 +68,23 @@ public:
 	// change, FindImage() would resolve to this exact id again; this is the cheap remainder of
 	// that lookup instead of repeating it.
 	void                        NoteImageReuse(ImageId id);
+	// NoteImageReuse() for every id in `ids` under one acquisition of the cache lock.
+	void                        NoteImageReuse(std::span<const ImageId> ids);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
-	// Whether FindRenderTarget()/FindDepthTarget() for `id` with the same `desc` as the previous
-	// call for that target would find every step already done, apart from the LRU touch
-	// (NoteImageReuse()). Takes the cache lock.
-	[[nodiscard]] bool          TargetAcquisitionRepeats(ImageId id, const ImageDesc& desc);
+	// One render or depth target of a draw, as FindRenderTarget()/FindDepthTarget() receive it.
+	struct TargetAcquisition {
+		ImageId          id;
+		const ImageDesc* desc = nullptr;
+	};
+	// Whether FindRenderTarget()/FindDepthTarget() for every target in `targets`, each with the
+	// same desc as the previous call for that target, would find every step already done, apart
+	// from the LRU touch (NoteImageReuse()). Takes the cache lock once for all of them.
+	[[nodiscard]] bool TargetAcquisitionsRepeat(std::span<const TargetAcquisition> targets);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -244,6 +253,8 @@ private:
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
+	// Caller holds m_lock. See TargetAcquisitionsRepeat().
+	[[nodiscard]] bool    TargetAcquisitionRepeats(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] bool    IsSampledViewCurrent(const Image& image, const ImageDesc& desc) const;
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
@@ -275,7 +286,27 @@ private:
 	// Guest video-out extent, learned from the scanout surface and only ever grown. The
 	// fidelity classes are defined relative to it; until it is known every target is primary.
 	vk::Extent2D                                      m_display_extent {};
-	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	using SurfaceMetas = std::map<uint64_t, MetaDataInfo>;
+	// Every removal from m_surface_metas goes through EraseSurfaceMeta(), which counts it in
+	// m_surface_meta_removals: entries are otherwise only ever added, so an address seen present
+	// stays present while that count is unchanged (see SurfaceMetaPresent()).
+	SurfaceMetas::iterator                            EraseSurfaceMeta(SurfaceMetas::iterator entry);
+	// m_surface_metas.contains(address), remembering the last address found present. Caller
+	// holds m_lock.
+	[[nodiscard]] bool                                SurfaceMetaPresent(uint64_t address);
+	SurfaceMetas                                      m_surface_metas;
+	uint64_t                                          m_surface_meta_removals = 0;
+	GenerationMemo<uint64_t, bool>                    m_surface_meta_present_memo;
+	// Which image AssociateStencil() would pick for a depth target's stencil range, as last found
+	// by TargetAcquisitionRepeats() (a null id when none matches). The pick is a function of the
+	// registered image set over that range and the depth image's extent, which only change with
+	// Generation(), so a repeated draw's target check skips the page-table walk while it holds.
+	struct StencilLookupKey {
+		ImageId    depth;
+		GuestRange stencil;
+		bool       operator==(const StencilLookupKey&) const = default;
+	};
+	GenerationMemo<StencilLookupKey, ImageId>         m_stencil_lookup_memo;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

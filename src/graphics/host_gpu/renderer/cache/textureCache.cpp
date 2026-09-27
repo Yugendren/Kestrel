@@ -452,7 +452,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		    image->info.metadata.kind == ImageMetadataKind::Htile &&
 		    metadata->second.type == MetaDataInfo::Type::HTile) {
 			// A later binding may have reused this address for another metadata type.
-			m_surface_metas.erase(metadata);
+			EraseSurfaceMeta(metadata);
 		}
 	}
 	UnregisterImage(id);
@@ -1404,7 +1404,10 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
-		m_surface_metas.erase(range.address);
+		if (const auto metadata = m_surface_metas.find(range.address);
+		    metadata != m_surface_metas.end()) {
+			EraseSurfaceMeta(metadata);
+		}
 		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
 			return;
 		}
@@ -1550,6 +1553,20 @@ void TextureCache::NoteImageReuse(ImageId id) {
 	auto& image              = m_slot_images[id];
 	image.tick_accessed_last = m_scheduler.CurrentTick();
 	TouchImage(image);
+}
+
+void TextureCache::NoteImageReuse(std::span<const ImageId> ids) {
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid()) {
+		EXIT("TextureCache: image lookup requires a valid command buffer\n");
+	}
+	const auto       tick = m_scheduler.CurrentTick();
+	std::scoped_lock lock {m_lock};
+	for (const auto id: ids) {
+		auto& image              = m_slot_images[id];
+		image.tick_accessed_last = tick;
+		TouchImage(image);
+	}
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
@@ -2164,6 +2181,24 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	return image.FindView(desc.view_info);
 }
 
+TextureCache::SurfaceMetas::iterator TextureCache::EraseSurfaceMeta(SurfaceMetas::iterator entry) {
+	++m_surface_meta_removals;
+	return m_surface_metas.erase(entry);
+}
+
+// The metadata map holds an entry per metadata surface ever bound and is walked for every depth
+// target a repeated draw keeps, so a kept depth target's presence check is remembered instead.
+bool TextureCache::SurfaceMetaPresent(uint64_t address) {
+	if (m_surface_meta_present_memo.Find(address, m_surface_meta_removals) != nullptr) {
+		return true;
+	}
+	if (!m_surface_metas.contains(address)) {
+		return false;
+	}
+	m_surface_meta_present_memo.Store(address, m_surface_meta_removals, true);
+	return true;
+}
+
 // A draw that continues the previous draw's render pass skips acquiring its targets again, which
 // is only sound when the acquisition would repeat the previous one. The previous call left its
 // image LRU-touched, GPU-owned, refreshed from guest memory, tracked, ahead of its scale twin and
@@ -2192,9 +2227,20 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 //
 // The lock matters: the fault handler marks CPU writes from another thread under it
 // (InvalidateMemory()), as FindRenderTarget() reads them. A write landing after it is released is
-// no different from one landing after FindRenderTarget() returns.
-bool TextureCache::TargetAcquisitionRepeats(ImageId id, const ImageDesc& desc) {
+// no different from one landing after FindRenderTarget() returns. One acquisition covers all of a
+// draw's targets: this runs for every draw that keeps the previous draw's pass, so a lock per
+// target was a measurable share of such a draw's cost.
+bool TextureCache::TargetAcquisitionsRepeat(std::span<const TargetAcquisition> targets) {
 	std::scoped_lock lock {m_lock};
+	for (const auto& target: targets) {
+		if (!TargetAcquisitionRepeats(target.id, *target.desc)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool TextureCache::TargetAcquisitionRepeats(ImageId id, const ImageDesc& desc) {
 	const auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered || image->depth_id ||
 	    image->binding.needs_rebind || image->binding.is_bound) {
@@ -2216,22 +2262,32 @@ bool TextureCache::TargetAcquisitionRepeats(ImageId id, const ImageDesc& desc) {
 	}
 	if (!image->usage.depth_target || image->info.stencil != desc.info.stencil ||
 	    !(image->info.metadata == desc.info.metadata) ||
-	    (desc.info.HasMetadata() && !m_surface_metas.contains(desc.info.metadata.range.address))) {
+	    (desc.info.HasMetadata() && !SurfaceMetaPresent(desc.info.metadata.range.address))) {
 		return false;
 	}
 	if (!desc.info.HasStencil()) {
 		return true;
 	}
-	// AssociateStencil()'s lookup, without creating the association.
-	const Image* stencil = nullptr;
-	for (const auto candidate: FindImagesInRegion(desc.info.stencil.address,
-	                                              desc.info.stencil.size, false)) {
-		const auto* owner = m_slot_images.try_get(candidate);
-		if (owner != nullptr && owner->info.data == desc.info.stencil &&
-		    owner->info.extent == image->info.extent) {
-			stencil = owner;
+	// AssociateStencil()'s lookup, without creating the association. Its answer only moves with
+	// Generation() (see m_stencil_lookup_memo), so a run of repeated draws walks the page table
+	// once; whether the pick is still this depth's association and still refreshed is state the
+	// generation does not cover, so it is checked below on every call.
+	const StencilLookupKey key {.depth = id, .stencil = desc.info.stencil};
+	ImageId                stencil_id {};
+	if (const auto* memo = m_stencil_lookup_memo.Find(key, m_generation); memo != nullptr) {
+		stencil_id = *memo;
+	} else {
+		for (const auto candidate: FindImagesInRegion(desc.info.stencil.address,
+		                                              desc.info.stencil.size, false)) {
+			const auto* owner = m_slot_images.try_get(candidate);
+			if (owner != nullptr && owner->info.data == desc.info.stencil &&
+			    owner->info.extent == image->info.extent) {
+				stencil_id = candidate;
+			}
 		}
+		m_stencil_lookup_memo.Store(key, m_generation, stencil_id);
 	}
+	const Image* stencil = stencil_id ? m_slot_images.try_get(stencil_id) : nullptr;
 	if (stencil == nullptr || stencil->depth_id != id) {
 		return false;
 	}
@@ -2762,7 +2818,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
-			metadata = m_surface_metas.erase(metadata);
+			metadata = EraseSurfaceMeta(metadata);
 		} else {
 			++metadata;
 		}
