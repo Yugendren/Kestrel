@@ -5,6 +5,8 @@ file(GLOB common_src CONFIGURE_DEPENDS
 )
 
 file(GLOB_RECURSE common_headers CONFIGURE_DEPENDS "*.h")
+# Linked into each executable by kyty_add_cpu_check (cmake/KytyOptimization.cmake) instead.
+list(REMOVE_ITEM common_src "${CMAKE_CURRENT_SOURCE_DIR}/cpuCheck.cpp")
 
 if(KYTY_CLANG_CL)
 	set_source_files_properties(${common_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack")

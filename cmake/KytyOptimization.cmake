@@ -48,6 +48,36 @@ if(CLANG OR GCC)
 	kyty_add_driver_compile_option("-ffp-contract=off")
 endif()
 
+# --- Startup ISA check ------------------------------------------------------------------------
+# A binary built for x86-64-vN dies with a bare SIGILL on an older CPU. src/common/cpuCheck.cpp
+# checks CPUID/XGETBV for the level before any other static initialiser and exits with a message
+# naming the missing features. It must itself run on any x86-64, so it is compiled at the
+# baseline ISA; ThinLTO keeps its functions at that level (callee features are per function, and
+# code needing more features is never inlined into it). Only the psABI levels have a known
+# feature set: other KYTY_MARCH values (native, znver2, ...) get no check.
+set(KYTY_CPU_CHECK_LEVEL 0)
+if((CLANG OR GCC) AND KYTY_MARCH MATCHES "^x86-64-v([2-4])$")
+	set(KYTY_CPU_CHECK_LEVEL ${CMAKE_MATCH_1})
+endif()
+
+# Adds the check to an executable. It lives in the executable, not in libcommon: nothing refers
+# to its initialiser, so a static library would never pull the object in. The source properties
+# are per directory and shared by every target that adds the file, so they are set, not appended.
+function(kyty_add_cpu_check target)
+	set(source "${KYTY_SOURCE_DIR}/common/cpuCheck.cpp")
+	target_sources(${target} PRIVATE "${source}")
+	set_property(SOURCE "${source}" PROPERTY COMPILE_DEFINITIONS
+		KYTY_CPU_CHECK_LEVEL=${KYTY_CPU_CHECK_LEVEL})
+	if(KYTY_CPU_CHECK_LEVEL GREATER 0)
+		# Source options follow the directory-wide -march above, so this one wins.
+		if(KYTY_CLANG_CL)
+			set_property(SOURCE "${source}" PROPERTY COMPILE_OPTIONS "/clang:-march=x86-64")
+		else()
+			set_property(SOURCE "${source}" PROPERTY COMPILE_OPTIONS "-march=x86-64")
+		endif()
+	endif()
+endfunction()
+
 # --- ThinLTO ----------------------------------------------------------------------------------
 # The command processor's per-draw path crosses ~40 call sites in a dozen translation units plus
 # libcommon; ThinLTO lets the small accessors among them inline. Debug builds are left alone so the
@@ -124,4 +154,4 @@ if(NOT KYTY_PGO STREQUAL "OFF")
 	endif()
 endif()
 
-message(STATUS "Kyty optimisation: march='${KYTY_MARCH}' lto=${KYTY_LTO} pgo=${KYTY_PGO}")
+message(STATUS "Kyty optimisation: march='${KYTY_MARCH}' cpu_check=v${KYTY_CPU_CHECK_LEVEL} lto=${KYTY_LTO} pgo=${KYTY_PGO}")

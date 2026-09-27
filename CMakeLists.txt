@@ -456,6 +456,13 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(cpu_check_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CpuCheckTests.cpp"
+)
+kyty_add_cpu_check(cpu_check_tests)
+target_compile_definitions(cpu_check_tests PRIVATE KYTY_CPU_CHECK_LEVEL=${KYTY_CPU_CHECK_LEVEL})
+target_include_directories(cpu_check_tests PRIVATE ${inc_headers})
+
 add_executable(stream_buffer_wait_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/StreamBufferWaitTests.cpp"
 )
@@ -704,6 +711,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME cpu_check COMMAND $<TARGET_FILE:cpu_check_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -772,6 +780,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests
+		cpu_check_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -803,6 +812,7 @@ endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
+kyty_add_cpu_check(kyty_emulator)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)
