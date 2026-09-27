@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/computeRescale.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawDelta.h"
 #include "graphics/host_gpu/renderer/drawReuse.h"
 #include "graphics/host_gpu/renderer/meshDrawArgs.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -455,6 +456,12 @@ private:
 	    const PipelineCache::Pipeline& expected, const PipelineCache::Pipeline& reused,
 	    vk::PrimitiveTopology topology, bool primitive_restart_enable);
 	void LogDrawReuseOracleSummary();
+	// Draw entry (renderDraw.cpp): whether the register checks run for a draw that did or did not
+	// keep the previous draw's registers, and the KYTY_DELTA_ORACLE=1 checks of a kept draw.
+	[[nodiscard]] static bool RunsDrawEntryChecks(bool registers_kept);
+	static void               VerifyDrawEntrySkip(bool registers_kept, const char* reason);
+	void VerifyDrawEntryTopology(bool registers_kept, vk::PrimitiveTopology kept,
+	                             vk::PrimitiveTopology resolved);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -510,6 +517,7 @@ private:
 	DrawStateTracker m_draw_state_tracker;
 	DrawReuseRecord  m_draw_reuse;
 	DrawReuseOracle  m_draw_reuse_oracle;
+	DeltaDrawOracle  m_delta_oracle;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -677,6 +677,24 @@ static bool DrawReuseOracleEnabled() {
 	return enabled;
 }
 
+bool DeltaDrawOracle::Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DELTA_ORACLE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void DeltaDrawOracle::LogSummaryIfDue() {
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_summary < std::chrono::seconds(1)) {
+		return;
+	}
+	m_last_summary = now;
+	LOGF("DELTA-ORACLE checked=%" PRIu64 " mismatches=0 entries_kept=%" PRIu64 "\n",
+	     Count(Counter::Checked), Count(Counter::EntriesKept));
+}
+
 // A Vulkan handle as an integer, for identity comparisons.
 template <typename Handle>
 static uint64_t HandleBits(Handle handle) {
@@ -2397,6 +2415,44 @@ IndirectDrawSupport RenderExecutor::SupportsIndirectDraw(CommandBuffer&         
 	return IndirectDrawSupport::Supported;
 }
 
+// The checks a draw runs on the registers before anything is resolved -- a colour-metadata or
+// depth-copy operation in place of the draw, a missing vertex shader, the unsupported-state EXITs
+// of uc_check()/hw_check(), and the topology -- read nothing but registers. When DrawStateTracker
+// vouches that no register but user data changed since the previous draw and that draw was fully
+// recorded with the same inputs (`registers_kept`, drawReuse.h), they would answer as they did for
+// it, and it was recorded: none of them skipped or failed it, and its topology still holds. The
+// checks then only run for KYTY_DELTA_ORACLE=1, which EXITs if one answers differently, and for
+// the debug dump.
+// ResolveColorTargets() is not one of them and runs for every draw: in CB resolve mode it looks
+// the source and destination up in the texture cache (possibly creating them from guest memory)
+// and records the resolve, so its answer is not a function of the registers alone. Outside
+// resolve mode it returns after one register read, so running it costs nothing.
+bool RenderExecutor::RunsDrawEntryChecks(bool registers_kept) {
+	return !registers_kept || DeltaDrawOracle::Enabled() || graphics_debug_dump_enabled();
+}
+
+void RenderExecutor::VerifyDrawEntrySkip(bool registers_kept, const char* reason) {
+	if (registers_kept) {
+		EXIT("DELTA-ORACLE mismatch: the draw kept the previous draw's registers, but its entry "
+		     "checks do not record it: %s\n",
+		     reason);
+	}
+}
+
+void RenderExecutor::VerifyDrawEntryTopology(bool registers_kept, vk::PrimitiveTopology kept,
+                                             vk::PrimitiveTopology resolved) {
+	if (!registers_kept) {
+		return;
+	}
+	m_delta_oracle.Note(DeltaDrawOracle::Counter::Checked);
+	m_delta_oracle.Note(DeltaDrawOracle::Counter::EntriesKept);
+	if (kept != resolved) {
+		EXIT("DELTA-ORACLE mismatch: the draw kept the previous draw's topology %u, its registers "
+		     "give %u\n",
+		     static_cast<uint32_t>(kept), static_cast<uint32_t>(resolved));
+	}
+}
+
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
@@ -2423,6 +2479,9 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (DrawReuseOracleEnabled()) {
 		LogDrawReuseOracleSummary();
 	}
+	if (DeltaDrawOracle::Enabled()) {
+		m_delta_oracle.LogSummaryIfDue();
+	}
 	DrawReuseRequest reuse {};
 	const bool       reuse_tracked = DrawReuseEnabled() && args.indirect == nullptr &&
 	                           args.offset_source == DrawOffsetSource::DrawState;
@@ -2430,14 +2489,23 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		reuse.inputs = CurrentDrawReuseInputs(buffer, true, args.index_type_and_size,
 		                                      args.render_target_slice_offset);
 	}
+	const bool registers_kept =
+	    reuse_tracked && pm4_state_unchanged && previous_draw.KeepsRenderState(reuse.inputs);
+	const bool entry_checks = RunsDrawEntryChecks(registers_kept);
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	if (entry_checks && (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer))) {
+		VerifyDrawEntrySkip(registers_kept, "a colour-metadata operation or depth copy");
+		ResetBindings();
+		return true;
+	}
+	// Not a register-only check: it runs for every draw (see RunsDrawEntryChecks()).
+	if (ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return true;
 	}
 
-	if (!DrawHasValidVertexShader(sh_ctx)) {
+	if (entry_checks && !DrawHasValidVertexShader(sh_ctx)) {
+		VerifyDrawEntrySkip(registers_kept, "no valid vertex shader");
 		return true;
 	}
 
@@ -2458,13 +2526,18 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		     static_cast<uint32_t>(args.base_vertex), args.first_instance);
 	}
 
-	uc_check(ucfg);
-
-	hw_check(buffer);
-
-	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (!GetDrawTopology(ucfg, topology)) {
-		return true;
+	vk::PrimitiveTopology topology =
+	    registers_kept ? previous_draw.Topology() : vk::PrimitiveTopology::ePointList;
+	if (entry_checks) {
+		uc_check(ucfg);
+		hw_check(buffer);
+		vk::PrimitiveTopology resolved = vk::PrimitiveTopology::ePointList;
+		if (!GetDrawTopology(ucfg, resolved)) {
+			VerifyDrawEntrySkip(registers_kept, "no topology");
+			return true;
+		}
+		VerifyDrawEntryTopology(registers_kept, topology, resolved);
+		topology = resolved;
 	}
 
 	DrawIndexBufferSource index_source {};
@@ -2489,9 +2562,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                        args.instance_count, args.first_instance, args.indirect};
 	// 8-bit indices are widened on the host into a transient buffer every draw; such a draw is
 	// never recorded for reuse, and never reuses.
-	bool keep_render_state = reuse_tracked && pm4_state_unchanged &&
-	                         index_source.guest_element_size != 1 &&
-	                         previous_draw.KeepsRenderState(reuse.inputs);
+	bool keep_render_state = registers_kept && index_source.guest_element_size != 1;
 	auto& state = SelectDrawRenderState(keep_render_state, buffer, draw,
 	                                    args.render_target_slice_offset, previous_draw);
 	if (!keep_render_state &&
@@ -2545,20 +2616,32 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (DrawReuseOracleEnabled()) {
 		LogDrawReuseOracleSummary();
 	}
+	if (DeltaDrawOracle::Enabled()) {
+		m_delta_oracle.LogSummaryIfDue();
+	}
 	DrawReuseRequest reuse {};
 	const bool       reuse_tracked = DrawReuseEnabled() && args.indirect == nullptr &&
 	                           args.offset_source == DrawOffsetSource::DrawState;
 	if (reuse_tracked) {
 		reuse.inputs = CurrentDrawReuseInputs(buffer, false, 0, args.render_target_slice_offset);
 	}
+	const bool registers_kept =
+	    reuse_tracked && pm4_state_unchanged && previous_draw.KeepsRenderState(reuse.inputs);
+	const bool entry_checks = RunsDrawEntryChecks(registers_kept);
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	if (entry_checks && (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer))) {
+		VerifyDrawEntrySkip(registers_kept, "a colour-metadata operation or depth copy");
+		ResetBindings();
+		return true;
+	}
+	// Not a register-only check: it runs for every draw (see RunsDrawEntryChecks()).
+	if (ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return true;
 	}
 
-	if (!DrawHasValidVertexShader(sh_ctx)) {
+	if (entry_checks && !DrawHasValidVertexShader(sh_ctx)) {
+		VerifyDrawEntrySkip(registers_kept, "no valid vertex shader");
 		return true;
 	}
 
@@ -2575,20 +2658,27 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		     args.vertex_count, args.instance_count, args.first_vertex, args.first_instance);
 	}
 
-	uc_check(ucfg);
-
-	hw_check(buffer);
+	if (entry_checks) {
+		uc_check(ucfg);
+		hw_check(buffer);
+	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
 	                         args.instance_count, args.first_instance, args.indirect};
 
-	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (!GetDrawTopology(ucfg, topology)) {
-		ResetBindings();
-		return true;
+	vk::PrimitiveTopology topology =
+	    registers_kept ? previous_draw.Topology() : vk::PrimitiveTopology::ePointList;
+	if (entry_checks) {
+		vk::PrimitiveTopology resolved = vk::PrimitiveTopology::ePointList;
+		if (!GetDrawTopology(ucfg, resolved)) {
+			VerifyDrawEntrySkip(registers_kept, "no topology");
+			ResetBindings();
+			return true;
+		}
+		VerifyDrawEntryTopology(registers_kept, topology, resolved);
+		topology = resolved;
 	}
-	bool keep_render_state =
-	    reuse_tracked && pm4_state_unchanged && previous_draw.KeepsRenderState(reuse.inputs);
+	bool keep_render_state = registers_kept;
 	auto& state = SelectDrawRenderState(keep_render_state, buffer, draw,
 	                                    args.render_target_slice_offset, previous_draw);
 	if (!keep_render_state &&

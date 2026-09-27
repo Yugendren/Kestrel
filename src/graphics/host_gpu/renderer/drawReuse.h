@@ -148,6 +148,10 @@ public:
 	}
 
 	[[nodiscard]] const DrawReuseInputs& Inputs() const noexcept { return m_inputs; }
+	// The topology the draw was recorded with.
+	[[nodiscard]] vk::PrimitiveTopology Topology() const noexcept {
+		return static_cast<vk::PrimitiveTopology>(m_feed.topology);
+	}
 
 private:
 	bool                     m_valid = false;
