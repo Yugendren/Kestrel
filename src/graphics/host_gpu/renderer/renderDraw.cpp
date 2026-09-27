@@ -1597,6 +1597,7 @@ static void EmitMeshIndirectArgsConversion(vk::CommandBuffer vk_buffer,
 	args.index_base           = index_source.address;
 	args.max_groups_x         = limits.maxMeshWorkGroupCount[0];
 	args.max_groups_y         = limits.maxMeshWorkGroupCount[1];
+	args.max_groups_total     = limits.maxMeshWorkGroupTotalCount;
 	builder.Record(vk_buffer, args);
 
 	std::array<vk::BufferMemoryBarrier, 2> out_barriers {};
@@ -1863,7 +1864,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// draw.index_count and draw.instance_count are only real counts for a direct draw; an
 		// indirect draw's are read out of the guest argument block by mesh_draw_args.comp, on the
 		// GPU, so neither the zero-count shortcut nor the host workgroup-limit clamp below can run
-		// for it. The shader clamps to the same limits itself (see max_groups_x/max_groups_y).
+		// for it. The shader clamps to the same limits itself (see MeshDrawArgsBuilder::Args).
 		if (draw.indirect == nullptr) {
 			const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
 			if (primitives == 0 || draw.instance_count == 0) {

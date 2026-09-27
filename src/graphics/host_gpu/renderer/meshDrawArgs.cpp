@@ -25,6 +25,7 @@ struct PushConstants {
 	uint32_t index_base_high       = 0;
 	uint32_t max_groups_x          = 0;
 	uint32_t max_groups_y          = 0;
+	uint32_t max_groups_total      = 0;
 };
 
 } // namespace
@@ -116,6 +117,7 @@ void MeshDrawArgsBuilder::Record(vk::CommandBuffer command, const Args& args) co
 	push.index_base_high     = static_cast<uint32_t>(args.index_base >> 32u);
 	push.max_groups_x        = args.max_groups_x;
 	push.max_groups_y        = args.max_groups_y;
+	push.max_groups_total    = args.max_groups_total;
 
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0, writes);

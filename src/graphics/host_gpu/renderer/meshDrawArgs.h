@@ -50,11 +50,13 @@ public:
 		// shader adds start_index * element_size to the latter itself.
 		uint32_t element_size = 0;
 		uint64_t index_base   = 0;
-		// mesh_shader_properties.maxMeshWorkGroupCount[0]/[1]: a direct draw has the host EXIT if it
-		// would exceed these, but an indirect draw's counts are not known until the shader runs, so
-		// it clamps to them instead.
-		uint32_t max_groups_x = 0;
-		uint32_t max_groups_y = 0;
+		// mesh_shader_properties.maxMeshWorkGroupCount[0]/[1] and maxMeshWorkGroupTotalCount: a
+		// direct draw has the host EXIT if it would exceed these, but an indirect draw's counts are
+		// not known until the shader runs, so it clamps to them instead (y last, so x * y stays
+		// within the total).
+		uint32_t max_groups_x     = 0;
+		uint32_t max_groups_y     = 0;
+		uint32_t max_groups_total = 0;
 	};
 
 	// Records the conversion: a compute dispatch that reads `args` and writes the parameter and

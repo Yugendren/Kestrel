@@ -40,6 +40,9 @@ layout(push_constant) uniform PushConstants {
     // shader clamps to these limits instead.
     uint max_groups_x;
     uint max_groups_y;
+    // maxMeshWorkGroupTotalCount bounds the product x * y * z of a VkDrawMeshTasksIndirectCommandEXT
+    // as well; the per-axis limits alone do not imply it.
+    uint max_groups_total;
 };
 
 void main() {
@@ -54,8 +57,13 @@ void main() {
                                 : (index_count - primitive_size) / primitive_step + 1u;
     const uint groups = primitives == 0u ? 0u : (primitives - 1u) / primitives_per_group + 1u;
 
-    dispatch[dispatch_dword_offset + 0u] = min(groups, max_groups_x);
-    dispatch[dispatch_dword_offset + 1u] = min(instance_count, max_groups_y);
+    // Clamp x first, then y against both its own limit and what the total leaves for this x, so
+    // x * y <= max_groups_total without the product itself overflowing 32 bits.
+    const uint groups_x = min(groups, max_groups_x);
+    const uint groups_y = min(min(instance_count, max_groups_y),
+                              max_groups_total / max(groups_x, 1u));
+    dispatch[dispatch_dword_offset + 0u] = groups_x;
+    dispatch[dispatch_dword_offset + 1u] = groups_y;
     dispatch[dispatch_dword_offset + 2u] = 1u;
 
     params[params_dword_offset + 0u] = index_count;
