@@ -610,6 +610,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.compute_full_subgroups_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
+	// Guest waves are translated for 32-lane host subgroups (64 where wave64 runs natively).
+	// A device that can neither pin nor fix compute subgroups at 32 lanes runs them at another
+	// width, where translated wave ops compute over the wrong set of lanes.
+	if (!graphics.GuaranteesComputeSubgroupSize(32u)) {
+		LOGF("Vulkan subgroup warning: compute subgroups cannot be guaranteed 32 lanes wide "
+		     "(sizes %u..%u); translated wave ops (ballot, readlane, DPP-style lane ops) assume "
+		     "32 or 64 lanes and may compute wrong results on this device\n",
+		     graphics.min_subgroup_size, graphics.max_subgroup_size);
+	}
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&

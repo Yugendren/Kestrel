@@ -104,27 +104,38 @@ struct GraphicContext {
 		                                min_subgroup_size <= 64u && max_subgroup_size >= 64u);
 	}
 
-	// Whether a compute pipeline of guest wave `wave` with `invocations` invocations per
-	// workgroup can pin its subgroup size to `wave` (requiredSubgroupSize, VUID-02756/02757).
-	[[nodiscard]] bool CanRequireComputeSubgroupSize(uint32_t wave,
-	                                                 uint64_t invocations) const noexcept {
-		return compute_subgroup_size_control_enabled && wave >= min_subgroup_size &&
-		       wave <= max_subgroup_size &&
-		       invocations <= static_cast<uint64_t>(max_compute_workgroup_subgroups) * wave;
+	// Whether a compute pipeline whose translated program is written for `size`-lane subgroups
+	// (ShaderWorkgroupInputInfo::TranslatedSubgroupSize) and has `host_invocations` invocations
+	// per workgroup (HostInvocations) can pin its subgroup size to `size` (requiredSubgroupSize,
+	// VUID-02756/02757).
+	[[nodiscard]] bool CanRequireComputeSubgroupSize(uint32_t size,
+	                                                 uint64_t host_invocations) const noexcept {
+		return compute_subgroup_size_control_enabled && size >= min_subgroup_size &&
+		       size <= max_subgroup_size &&
+		       host_invocations <= static_cast<uint64_t>(max_compute_workgroup_subgroups) * size;
 	}
 
-	// The subgroup size a compute pipeline of guest wave `wave` is guaranteed to run at, or 0 when
-	// the driver may choose (and, with SPIR-V 1.6, vary) it. CreatePipelineInternal requests
-	// exactly this size, and recompiler proofs that depend on the real subgroup size (tile
-	// rescale) are given this value, so the two cannot disagree. The fixed-size fallback covers
-	// devices whose only subgroup size is the default (min == max), with or without size control.
-	[[nodiscard]] uint32_t ExactComputeSubgroupSize(uint32_t wave,
-	                                                uint64_t invocations) const noexcept {
-		if (CanRequireComputeSubgroupSize(wave, invocations)) {
-			return wave;
+	// The subgroup size a compute pipeline translated for `size`-lane subgroups is guaranteed to
+	// run at, or 0 when the driver may choose (and, with SPIR-V 1.6, vary) it. It is `size`
+	// whenever that can be required, and CreatePipelineInternal requests exactly then, so the
+	// pipeline and every recompiler proof given this value (tile rescale) cannot disagree. The
+	// fixed-size fallback covers devices whose only subgroup size is the default (min == max),
+	// with or without size control; there it may differ from `size`, and the translated wave ops
+	// run at the wrong width (see GuaranteesComputeSubgroupSize).
+	[[nodiscard]] uint32_t ExactComputeSubgroupSize(uint32_t size,
+	                                                uint64_t host_invocations) const noexcept {
+		if (CanRequireComputeSubgroupSize(size, host_invocations)) {
+			return size;
 		}
 		return min_subgroup_size != 0u && min_subgroup_size == max_subgroup_size ? subgroup_size
 		                                                                        : 0u;
+	}
+
+	// Whether a single-subgroup compute workgroup translated for `size`-lane subgroups is
+	// guaranteed to run at exactly that width. When false for 32, every translated wave op
+	// (ballot, readlane, DPP-style lane permutes) may compute wrong results on this device.
+	[[nodiscard]] bool GuaranteesComputeSubgroupSize(uint32_t size) const noexcept {
+		return ExactComputeSubgroupSize(size, size) == size;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

@@ -646,6 +646,14 @@ add_executable(draw_reuse_tests EXCLUDE_FROM_ALL
 target_link_libraries(draw_reuse_tests common fmt::fmt Vulkan::Headers xxhash)
 target_include_directories(draw_reuse_tests PRIVATE ${inc_headers})
 
+# Header-only: the compute subgroup size a pipeline is pinned to (graphicContext.h, shader.h) is
+# a pure function of the device's subgroup properties, so it is checked without a GPU.
+add_executable(compute_subgroup_size_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ComputeSubgroupSizeTests.cpp"
+)
+target_link_libraries(compute_subgroup_size_tests common fmt::fmt Vulkan::Headers)
+target_include_directories(compute_subgroup_size_tests PRIVATE ${inc_headers})
+
 # Header-only: the tile-rescale gate and per-program state machine (computeRescale.h) are pure
 # functions of the bound images and the check results.
 add_executable(compute_rescale_tests EXCLUDE_FROM_ALL

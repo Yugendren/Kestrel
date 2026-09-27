@@ -575,23 +575,28 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
-	const auto wave_size   = input_info.stage.program->wave_size;
-	const auto invocations = input_info.Invocations();
+	// The program was compiled from input_info, so its wave size is input_info's.
+	EXIT_IF(input_info.stage.program->wave_size != input_info.wave_size);
+	// Pin the subgroup to the width the translation assumes (split wave64 -> 32 lanes), with the
+	// same arguments GetComputeProgram gave ExactComputeSubgroupSize.
+	const auto subgroup_size    = input_info.TranslatedSubgroupSize();
+	const auto host_invocations = input_info.HostInvocations();
 	// The program was specialised (and possibly proven, see TileRescaleShape) for this exact
 	// subgroup size; the pipeline must not run it at another.
 	EXIT_IF(input_info.exact_subgroup_size !=
-	        graphics.ExactComputeSubgroupSize(wave_size, invocations));
-	if (graphics.CanRequireComputeSubgroupSize(wave_size, invocations)) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+	        graphics.ExactComputeSubgroupSize(subgroup_size, host_invocations));
+	if (graphics.CanRequireComputeSubgroupSize(subgroup_size, host_invocations)) {
+		comp_subgroup_size.requiredSubgroupSize = subgroup_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 		// Full subgroups rule out partially populated subgroups, so every host subgroup carries a
 		// whole guest wave. Vulkan allows the flag only when LocalSize.x is a multiple of the
-		// required size (VUID-02759). A pinned wave64 implies a native 64-lane host subgroup
-		// (SupportsComputeWave64), so no two-half split reshapes the workgroup and LocalSize.x
-		// is threads_num[0].
+		// required size (VUID-02759). Without the wave64 split LocalSize.x is threads_num[0]. The
+		// split reshapes the workgroup in the emitter (ceil(n / 64) * 32 x 1 x 1, or 2 x n' for
+		// compute derivatives) and LocalSize.x is not known here, so the flag is left off; its
+		// host workgroup is a whole number of 32-lane subgroups either way.
 		const auto local_x = input_info.threads_num[0];
-		if (graphics.compute_full_subgroups_enabled && local_x != 0u &&
-		    local_x % wave_size == 0u) {
+		if (graphics.compute_full_subgroups_enabled && !input_info.SplitsWave64() &&
+		    local_x != 0u && local_x % subgroup_size == 0u) {
 			comp_shader_stage_info.flags |=
 			    vk::PipelineShaderStageCreateFlagBits::eRequireFullSubgroups;
 		}

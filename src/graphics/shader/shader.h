@@ -86,6 +86,26 @@ struct ShaderWorkgroupInputInfo {
 		return static_cast<uint64_t>(std::max(threads_num[0], 1u)) * std::max(threads_num[1], 1u) *
 		       std::max(threads_num[2], 1u);
 	}
+
+	// Whether the recompiler runs each guest wave64 on one 32-lane host subgroup, every host
+	// invocation carrying two guest lanes (the same test as Translate's initial exec and
+	// SpirvEmitter's lane_count).
+	[[nodiscard]] constexpr bool SplitsWave64() const {
+		return wave_size == 64u && host_subgroup_size == 32u;
+	}
+
+	// The host subgroup size the translated program is written for: one host subgroup per guest
+	// wave, so wave32 -> 32, native wave64 -> 64, split wave64 -> 32. Its wave ops (ballot,
+	// readlane, lane permutes) are only correct at exactly this width.
+	[[nodiscard]] constexpr uint32_t TranslatedSubgroupSize() const {
+		return SplitsWave64() ? 32u : wave_size;
+	}
+
+	// Host invocations per workgroup: the split packs each guest wave64 into 32 host
+	// invocations (SpirvEmitter's LocalSize), otherwise the guest workgroup is kept as is.
+	[[nodiscard]] constexpr uint64_t HostInvocations() const {
+		return SplitsWave64() ? (Invocations() + 63u) / 64u * 32u : Invocations();
+	}
 };
 
 struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
