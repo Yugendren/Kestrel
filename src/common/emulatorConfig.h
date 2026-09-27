@@ -55,7 +55,8 @@ enum class ComputeRescale { Off, Auto, Verify };
 struct GraphicsSettings {
 	float  render_scale = 1.0F;
 	RtMode rt_mode      = RtMode::Full;
-	ComputeRescale compute_rescale = ComputeRescale::Off;
+	// Auto is inert at the default render scale 1.0: the pass only runs for a 2^-s downscale.
+	ComputeRescale compute_rescale = ComputeRescale::Auto;
 
 	// Sampler-translation overrides. max_anisotropy 0 follows the guest descriptor; any other
 	// value is an upper bound on the anisotropic ratio. lod_bias is added to the guest's mip

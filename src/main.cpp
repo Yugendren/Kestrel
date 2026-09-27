@@ -99,7 +99,7 @@ static void PrintUsage() {
 	         "                                       intersection report a miss. Default: full.\n");
 	::printf("  --compute-rescale <off|auto|verify>  Run per-pixel tile compute the recompiler\n"
 	         "                                       proves safe at the render resolution.\n"
-	         "                                       verify only cross-checks it. Default: off.\n");
+	         "                                       verify only cross-checks it. Default: auto.\n");
 	::printf("  --anisotropy <0|1|2|4|8|16>          Cap the anisotropic filter ratio. 0 follows\n"
 	         "                                       the guest descriptor. Default: 0.\n");
 	::printf("  --lod-bias <float>                   Added to the guest mip LOD bias (-4..4).\n"
