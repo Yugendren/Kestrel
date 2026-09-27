@@ -827,8 +827,15 @@ void Image::BlitScaled(Image& source, const ImageSubresourceRange& source_range,
 	}
 	m_scheduler.EndRendering();
 
-	// Depth/stencil blits are nearest-only; colour is filtered so downscales average.
-	const bool depth = DepthAspectTransferFormat(backing.format) != vk::Format::eUndefined;
+	// Depth/stencil blits are nearest-only; colour is filtered so downscales average, but only
+	// where the source format supports linear filtering at all: integer formats and some 32-bit
+	// float formats do not (VUID-vkCmdBlitImage-filter-02001), and for integer data an average
+	// would not be meaningful anyway. Images are always created with optimal tiling.
+	const bool depth  = DepthAspectTransferFormat(backing.format) != vk::Format::eUndefined;
+	const bool linear = !depth && static_cast<bool>(
+	                                  m_graphics.GetFormatProperties(source.backing.format)
+	                                      .optimalTilingFeatures &
+	                                  vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
 	const auto mip_offset = [](const VulkanImage& image, uint32_t level) {
 		return vk::Offset3D {static_cast<int32_t>(std::max(image.extent.width >> level, 1u)),
 		                     static_cast<int32_t>(std::max(image.extent.height >> level, 1u)),
@@ -865,7 +872,7 @@ void Image::BlitScaled(Image& source, const ImageSubresourceRange& source_range,
 	command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal,
 	                  static_cast<uint32_t>(regions.size()), regions.data(),
-	                  depth ? vk::Filter::eNearest : vk::Filter::eLinear);
+	                  linear ? vk::Filter::eLinear : vk::Filter::eNearest);
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead,
 	        destination_range, command);
