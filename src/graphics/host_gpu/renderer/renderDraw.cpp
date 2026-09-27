@@ -1396,8 +1396,11 @@ static bool DrawHasDroppedProgram(const DrawRenderState& state) {
 	       (state.ps_active && !state.programs.pixel);
 }
 
+// `registers_kept`: the draw kept the previous draw's render state with every register but user
+// data unchanged (see RunsDrawEntryChecks()), so the program memos may take their register keys
+// as unchanged too.
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           DrawRenderState& state) {
+                           DrawRenderState& state, bool registers_kept) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1424,14 +1427,15 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
+	    {.registers_unchanged = registers_kept, .verify = DeltaDrawOracle::Enabled()});
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	state.ps_active = DrawHasActivePixelShader(buffer);
-	RefreshShaders(buffer, draw, state);
+	RefreshShaders(buffer, draw, state, false);
 	if (DrawHasDroppedProgram(state)) {
 		return false;
 	}
@@ -2188,7 +2192,7 @@ DrawRenderState& RenderExecutor::SelectDrawRenderState(bool& keep, CommandBuffer
                                                        const DrawReuseRecord& previous) {
 	if (keep) {
 		auto& state = KeepDrawRenderState();
-		RefreshShaders(buffer, draw, state);
+		RefreshShaders(buffer, draw, state, true);
 		if (previous.KeepsPrograms(CurrentDrawPrograms(state)) && KeepDrawTargets(state) &&
 		    (!DrawReuseOracleEnabled() ||
 		     OracleConfirmsRenderState(buffer, draw, render_target_slice_offset, state))) {

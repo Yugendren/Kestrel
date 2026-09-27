@@ -1221,18 +1221,32 @@ VertexProgramMemo::~VertexProgramMemo() = default;
 ShaderParams VertexProgramMemo::Prepare(const HW::VertexShaderInfo& regs,
                                         const HW::Context&          context,
                                         const HW::UserConfig&       user_config,
-                                        ShaderVertexInputInfo& info, bool& same_program) {
-	BuildVertexProgramKey(regs, context, user_config, m_scratch_key);
+                                        ShaderVertexInputInfo& info, bool& same_program,
+                                        ProgramRegistersHint hint) {
+	// With the registers vouched unchanged the key is the remembered one (see
+	// ProgramRegistersHint); the registrations are still checked below.
+	const bool key_kept  = m_valid && hint.registers_unchanged;
+	bool       key_built = false;
+	if (!key_kept || hint.verify) {
+		BuildVertexProgramKey(regs, context, user_config, m_scratch_key);
+		key_built = true;
+		if (key_kept && !(m_scratch_key == m_key)) {
+			EXIT("program memo: VS registers were vouched unchanged, but the program key differs\n");
+		}
+	}
 	// Read before any registry lookup: a registration racing with this call then moves the
 	// generation past the recorded one and the next call looks the shader up again.
 	const auto generation = ShaderRegistryGeneration();
 	const bool ngg        = (context.GetShaderStages() & 0x20u) != 0;
 	const bool hit =
-	    m_valid && m_scratch_key == m_key &&
+	    m_valid && (key_kept || m_scratch_key == m_key) &&
 	    m_front.Matches(regs.es_regs.data_addr, generation, ShaderRegistrationAt) &&
 	    (m_back_code.empty() ||
 	     m_back.Matches(regs.gs_regs.data_addr, generation, ShaderRegistrationAt));
 	if (!hit) {
+		if (!key_built) {
+			BuildVertexProgramKey(regs, context, user_config, m_scratch_key);
+		}
 		VertexProgramSource source;
 		auto params = PrepareVertexProgram(regs, context, user_config, info, source);
 		m_key = m_scratch_key;
@@ -1305,10 +1319,20 @@ void VertexProgramMemo::VerifyAgainstFullPreparation(const HW::VertexShaderInfo&
 ShaderParams PixelProgramMemo::Prepare(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    bool dual_source_blending, ShaderPixelInputInfo& info, bool& same_program) {
-	BuildPixelProgramKey(regs, sh, target_export_mapping, dual_source_blending, m_scratch_key);
+    bool dual_source_blending, ShaderPixelInputInfo& info, bool& same_program,
+    ProgramRegistersHint hint) {
+	// See VertexProgramMemo::Prepare(); the export mapping comes from the kept render targets.
+	const bool key_kept  = m_valid && hint.registers_unchanged;
+	bool       key_built = false;
+	if (!key_kept || hint.verify) {
+		BuildPixelProgramKey(regs, sh, target_export_mapping, dual_source_blending, m_scratch_key);
+		key_built = true;
+		if (key_kept && !(m_scratch_key == m_key)) {
+			EXIT("program memo: PS registers were vouched unchanged, but the program key differs\n");
+		}
+	}
 	const auto generation = ShaderRegistryGeneration();
-	same_program          = m_valid && m_scratch_key == m_key &&
+	same_program          = m_valid && (key_kept || m_scratch_key == m_key) &&
 	               m_stamp.Matches(regs.ps_regs.data_addr, generation, ShaderRegistrationAt);
 	if (same_program) {
 		info = m_info;
@@ -1327,6 +1351,9 @@ ShaderParams PixelProgramMemo::Prepare(
 			CheckPixelInputs(full.hash, info, full_info);
 		}
 		return params;
+	}
+	if (!key_built) {
+		BuildPixelProgramKey(regs, sh, target_export_mapping, dual_source_blending, m_scratch_key);
 	}
 	uint64_t registration = 0;
 	auto params = PreparePixelProgram(regs, sh, target_export_mapping, info, registration);

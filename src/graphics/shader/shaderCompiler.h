@@ -26,6 +26,18 @@ struct ShaderParams {
 	}
 };
 
+// What the caller of a program memo's Prepare() (shaderProgramMemo.h) knows about the registers
+// the memo keys its program on.
+struct ProgramRegistersHint {
+	// No register the memo's key reads has been written since its previous Prepare(), which was
+	// for the previous draw: DrawStateTracker vouched for the registers and that draw was fully
+	// recorded (draw-state reuse, drawReuse.h). The key is then the remembered one and is not
+	// built.
+	bool registers_unchanged = false;
+	// Build the key anyway and EXIT if it differs from the remembered one (the oracles).
+	bool verify = false;
+};
+
 void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderPixelInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<uint32_t>& key);

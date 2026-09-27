@@ -962,7 +962,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    ProgramRegistersHint hint) {
 	// The program memos compare this draw with the previous one, so they share m_mutex with the
 	// program cache they feed. Draws are already serialised by the render context lock, so
 	// taking it before the prepare step (instead of after) costs no concurrency.
@@ -974,11 +975,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	// and they stay paired, so the next non-tessellation draw still compares with the previous
 	// non-tessellation one.
 	bool same_vertex_program = false;
+	hint.verify              = hint.verify || ShaderProgramMemoOracleEnabled();
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 	} else {
-		vertex_params[0] = m_vertex_program_memo->Prepare(vertex_regs, context, user_config,
-		                                                  vertex_info[0], same_vertex_program);
+		vertex_params[0] = m_vertex_program_memo->Prepare(
+		    vertex_regs, context, user_config, vertex_info[0], same_vertex_program, hint);
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -1015,7 +1017,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		// The verdict feeds the pixel program's static key, so the memo keys on it too.
 		pixel_params = m_pixel_program_memo->Prepare(pixel_regs, sh, target_export_mapping,
 		                                             dual_source_blending, pixel_info,
-		                                             same_pixel_program);
+		                                             same_pixel_program, hint);
 		pixel_info.dual_source_blending = dual_source_blending;
 		if (pixel_info.dual_source_blending) {
 			// MRT1 supplies a second blend source for the same render target as MRT0.

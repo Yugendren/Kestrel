@@ -236,7 +236,7 @@ public:
 
 	ShaderParams Prepare(const HW::VertexShaderInfo& regs, const HW::Context& context,
 	                     const HW::UserConfig& user_config, ShaderVertexInputInfo& info,
-	                     bool& same_program);
+	                     bool& same_program, ProgramRegistersHint hint = {});
 
 private:
 	void VerifyAgainstFullPreparation(const HW::VertexShaderInfo& regs, const HW::Context& context,
@@ -265,7 +265,7 @@ public:
 	ShaderParams Prepare(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
 	                     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                     bool dual_source_blending, ShaderPixelInputInfo& info,
-	                     bool& same_program);
+	                     bool& same_program, ProgramRegistersHint hint = {});
 
 private:
 	PixelProgramKey           m_key;
