@@ -56,6 +56,9 @@ struct WindowContext {
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
+	// Configured windowed size of a window created fullscreen at the desktop size; applied the
+	// first time it leaves fullscreen, zero otherwise.
+	SDL_Point                      initial_windowed_size {};
 
 	Common::Mutex mutex;
 };

@@ -184,6 +184,14 @@ static void ToggleDesktopFullscreen() {
 	const bool fullscreen = (flags & SDL_WINDOW_FULLSCREEN) != 0u;
 	if (!SDL_SetWindowFullscreen(g_window->window, !fullscreen)) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
+		return;
+	}
+	// A window created at the desktop size (WindowCreate) would otherwise leave fullscreen at
+	// that size; later toggles restore whatever windowed size SDL tracked since.
+	auto& windowed = g_window->initial_windowed_size;
+	if (fullscreen && windowed.x > 0 && windowed.y > 0) {
+		SDL_SetWindowSize(g_window->window, windowed.x, windowed.y);
+		windowed = {};
 	}
 }
 
@@ -774,6 +782,17 @@ static void WindowCreate(WindowContext& context) {
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
 	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
+	// Desktop fullscreen is a request to the window manager; without one (a bare X server) the
+	// window would keep its windowed size. Create it at the desktop size so it covers the
+	// display either way. SDL3 takes the creation size as the size to restore when leaving
+	// fullscreen, and resizing a window whose fullscreen request is still pending resizes the
+	// native window itself, so the configured size is applied on the first toggle out instead.
+	if (SDL_Rect bounds {}; (window_flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN)) != 0u &&
+	                        SDL_GetDisplayBounds(SDL_GetPrimaryDisplay(), &bounds)) {
+		context.initial_windowed_size = {width, height};
+		width                         = bounds.w;
+		height                        = bounds.h;
+	}
 #if defined(__APPLE__)
 	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
