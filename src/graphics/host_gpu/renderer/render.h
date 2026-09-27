@@ -80,6 +80,7 @@ enum class IndirectDrawSupport : uint8_t {
 	IndexEncoding,       // 8-bit indices are widened on the host from a host-known count
 	PrimitiveRestart,    // a custom reset index has to be looked for in the index data
 	ArgumentsNotCached,  // the argument block is not backed by a cached device buffer
+	ArgumentsUnaligned,  // Vulkan needs 4-byte aligned argument/count offsets and stride
 	IndexRangeUnknown,   // INDEX_BUFFER_SIZE gives no range for the GPU to index into
 	// Only decidable once the shaders and their descriptors are resolved: a non-indexed draw whose
 	// vertex count has to be clamped to what the V#s can supply.

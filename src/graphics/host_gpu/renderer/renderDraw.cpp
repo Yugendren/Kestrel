@@ -2333,6 +2333,7 @@ const char* IndirectDrawSupportName(IndirectDrawSupport support) {
 		case IndirectDrawSupport::IndexEncoding: return "index encoding";
 		case IndirectDrawSupport::PrimitiveRestart: return "primitive restart";
 		case IndirectDrawSupport::ArgumentsNotCached: return "arguments not cached";
+		case IndirectDrawSupport::ArgumentsUnaligned: return "arguments unaligned";
 		case IndirectDrawSupport::IndexRangeUnknown: return "index range unknown";
 		case IndirectDrawSupport::RendererRefused: return "renderer refused";
 	}
@@ -2351,6 +2352,18 @@ IndirectDrawSupport RenderExecutor::SupportsIndirectDraw(CommandBuffer&         
 	    (source.count_addr != 0 && !graphics.draw_indirect_count_enabled) ||
 	    !graphics.draw_indirect_first_instance_enabled) {
 		return IndirectDrawSupport::DeviceFeature;
+	}
+
+	// vkCmdDraw*Indirect* take the argument and count offsets, and a used stride, only in
+	// multiples of 4 bytes (VUID-vkCmdDrawIndirect-offset-02710, -vkCmdDrawIndirectCount-
+	// countBufferOffset-02716, -vkCmdDrawIndirect-drawCount-00476, -vkCmdDrawIndirectCount-
+	// stride-03110). A cached buffer's offset keeps the guest address's alignment, so an
+	// unaligned guest block cannot be handed over; the host path reads it byte-exact instead.
+	constexpr uint64_t IndirectAlignment = sizeof(uint32_t);
+	const bool         stride_used       = source.draw_count > 1 || source.count_addr != 0;
+	if (source.args_addr % IndirectAlignment != 0 || source.count_addr % IndirectAlignment != 0 ||
+	    (stride_used && source.stride % IndirectAlignment != 0)) {
+		return IndirectDrawSupport::ArgumentsUnaligned;
 	}
 
 	auto&                 ucfg     = buffer.GetUserConfig();
