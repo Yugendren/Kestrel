@@ -43,6 +43,7 @@ struct WindowContext {
 	void                                                    UpdateIcon();
 	void                                                    UpdateTitle();
 	void                                                    Resize(uint32_t width, uint32_t height);
+	void                                                    OnClientAreaChanged();
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
 	void ProcessEvent(double time_seconds);

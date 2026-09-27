@@ -363,6 +363,29 @@ void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 	graphic_ctx.screen_height = new_height;
 }
 
+// Client-area size in pixels, the unit of the swapchain extent (window coordinates differ from
+// pixels on high-DPI backends such as macOS and Wayland). Queried from the window rather than
+// taken from event data so creation and every size event share one source, and a minimised
+// window's empty client area is skipped instead of reaching Resize().
+static bool QueryPixelSize(SDL_Window* window, uint32_t* width, uint32_t* height) {
+	int w = 0;
+	int h = 0;
+	if (!SDL_GetWindowSizeInPixels(window, &w, &h) || w <= 0 || h <= 0) {
+		return false; // minimised
+	}
+	*width  = static_cast<uint32_t>(w);
+	*height = static_cast<uint32_t>(h);
+	return true;
+}
+
+void WindowContext::OnClientAreaChanged() {
+	uint32_t width  = 0;
+	uint32_t height = 0;
+	if (window != nullptr && QueryPixelSize(window, &width, &height)) {
+		Resize(width, height);
+	}
+}
+
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 	const auto& window_event = event;
 	switch (window_event.type) {
@@ -392,7 +415,7 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			LOGF("Window %" PRIu32 " size changed to %" PRId32 "x%" PRId32 "\n",
 			     window_event.windowID, window_event.data1, window_event.data2);
 
-			Resize(window_event.data1, window_event.data2);
+			OnClientAreaChanged();
 
 			break;
 
@@ -786,6 +809,17 @@ static void WindowCreate(WindowContext& context) {
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();
+
+	// Fullscreen, DPI and window-manager policy can all give a client area other than the
+	// requested size; size the swapchain from what the window actually got.
+	uint32_t pixel_width  = 0;
+	uint32_t pixel_height = 0;
+	if (QueryPixelSize(context.window, &pixel_width, &pixel_height)) {
+		context.graphic_ctx.screen_width  = pixel_width;
+		context.graphic_ctx.screen_height = pixel_height;
+	}
+	LOGF("WindowCreate(): client area = %" PRIu32 "x%" PRIu32 " pixels\n",
+	     context.graphic_ctx.screen_width, context.graphic_ctx.screen_height);
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {

@@ -14,6 +14,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -382,6 +383,8 @@ void Swapchain::Create() {
 		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
 		               surface.capabilities.maxImageExtent.height);
 	}
+	LOGF("Swapchain: extent %" PRIu32 "x%" PRIu32 ", client area %" PRIu32 "x%" PRIu32 "\n",
+	     m_extent.width, m_extent.height, m_window_extent.width, m_window_extent.height);
 	uint32_t image_count = surface.capabilities.minImageCount + 1;
 	if (surface.capabilities.maxImageCount != 0) {
 		image_count = std::min(image_count, surface.capabilities.maxImageCount);
