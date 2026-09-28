@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ir/LaneAddressing.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -92,34 +93,35 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 }
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags) {
-	const auto subid = EmitSubgroupLocalInvocationId(state);
-	const auto control = flags.control;
-	if (flags.dpp8) {
-		return EmitDppPermTargetLane(state, subid, control, 3u);
-	}
-	if (control <= 0xffu) {
-		return EmitDppPermTargetLane(state, subid, control, 2u);
-	}
-	if (control >= 0x101u && control <= 0x10fu) {
-		return EmitDppRowShiftTargetLane(state, subid, control & 0xfu, true);
-	}
-	if (control >= 0x111u && control <= 0x11fu) {
-		return EmitDppRowShiftTargetLane(state, subid, control & 0xfu, false);
-	}
-	if (control >= 0x121u && control <= 0x12fu) {
-		return EmitDppRowRotateRightTargetLane(state, subid, control & 0xfu);
-	}
-	if (control == 0x140u) {
-		return EmitDppMirrorTargetLane(state, subid, false);
-	}
-	if (control == 0x141u) {
-		return EmitDppMirrorTargetLane(state, subid, true);
-	}
-	if (control >= 0x160u && control <= 0x16fu) {
-		const auto target = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpBitwiseXor, TypeU32(state), target, subid,
-		                          ConstantU32(state, control & 0xfu));
-		return {target, ConstantBool(state, true)};
+	const auto subid   = EmitSubgroupLocalInvocationId(state);
+	const auto decoded = IR::DecodeDppControl(flags.control, flags.dpp8);
+	switch (decoded.kind) {
+		case IR::DppControlKind::Dpp8:
+			return EmitDppPermTargetLane(state, subid, decoded.operand, 3u);
+		case IR::DppControlKind::QuadPerm:
+			return EmitDppPermTargetLane(state, subid, decoded.operand, 2u);
+		case IR::DppControlKind::RowShiftLeft:
+			return EmitDppRowShiftTargetLane(state, subid, decoded.operand, true);
+		case IR::DppControlKind::RowShiftRight:
+			return EmitDppRowShiftTargetLane(state, subid, decoded.operand, false);
+		case IR::DppControlKind::RowRotateRight:
+			return EmitDppRowRotateRightTargetLane(state, subid, decoded.operand);
+		case IR::DppControlKind::RowMirror: return EmitDppMirrorTargetLane(state, subid, false);
+		case IR::DppControlKind::RowHalfMirror: return EmitDppMirrorTargetLane(state, subid, true);
+		case IR::DppControlKind::RowShare: {
+			const auto row    = EmitBinaryU32(state, spv::OpBitwiseAnd, subid,
+			                                  ConstantU32(state, 0xfffffff0u));
+			const auto target = EmitBinaryU32(state, spv::OpBitwiseOr, row,
+			                                  ConstantU32(state, decoded.operand));
+			return {target, ConstantBool(state, true)};
+		}
+		case IR::DppControlKind::RowXmask: {
+			const auto target = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitwiseXor, TypeU32(state), target, subid,
+			                          ConstantU32(state, decoded.operand));
+			return {target, ConstantBool(state, true)};
+		}
+		case IR::DppControlKind::Unsupported: break;
 	}
 	return {subid, ConstantBool(state, true)};
 }
