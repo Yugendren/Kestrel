@@ -157,6 +157,48 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	return result;
 }
 
+spv::Op WaveReduceGroupOp(IR::WaveReduceOp op) {
+	switch (op) {
+		case IR::WaveReduceOp::BitwiseOr: return spv::OpGroupNonUniformBitwiseOr;
+		case IR::WaveReduceOp::BitwiseAnd: return spv::OpGroupNonUniformBitwiseAnd;
+		case IR::WaveReduceOp::BitwiseXor: return spv::OpGroupNonUniformBitwiseXor;
+		case IR::WaveReduceOp::IAdd: return spv::OpGroupNonUniformIAdd;
+		case IR::WaveReduceOp::UMin: return spv::OpGroupNonUniformUMin;
+		case IR::WaveReduceOp::UMax: return spv::OpGroupNonUniformUMax;
+		case IR::WaveReduceOp::SMin: return spv::OpGroupNonUniformSMin;
+		case IR::WaveReduceOp::SMax: return spv::OpGroupNonUniformSMax;
+	}
+	EXIT("invalid wave reduction operation\n");
+}
+
+uint32_t EmitWaveReduceCombine(EmitterState& state, IR::WaveReduceOp op, uint32_t lhs,
+                               uint32_t rhs) {
+	switch (op) {
+		case IR::WaveReduceOp::BitwiseOr: return EmitBinaryU32(state, spv::OpBitwiseOr, lhs, rhs);
+		case IR::WaveReduceOp::BitwiseAnd: return EmitBinaryU32(state, spv::OpBitwiseAnd, lhs, rhs);
+		case IR::WaveReduceOp::BitwiseXor: return EmitBinaryU32(state, spv::OpBitwiseXor, lhs, rhs);
+		case IR::WaveReduceOp::IAdd: return EmitAddU32(state, lhs, rhs);
+		case IR::WaveReduceOp::UMin: return EmitUMin32(state, lhs, rhs);
+		case IR::WaveReduceOp::UMax: return EmitUMax32(state, lhs, rhs);
+		case IR::WaveReduceOp::SMin: return EmitSMin32(state, lhs, rhs);
+		case IR::WaveReduceOp::SMax: return EmitSMax32(state, lhs, rhs);
+	}
+	EXIT("invalid wave reduction operation\n");
+}
+
+// `value` where bit `bit_index` of the lane-mask word `word` is set, else the op's identity.
+uint32_t EmitWaveReduceOperand(EmitterState& state, IR::WaveReduceOp op, uint32_t value,
+                               uint32_t word, uint32_t bit_index) {
+	const auto bit = EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                               EmitBinaryU32(state, spv::OpShiftRightLogical, word, bit_index),
+	                               ConstantU32(state, 1));
+	const auto in_mask = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), in_mask, bit,
+	                          ConstantU32(state, 0));
+	return EmitNative<spv::OpSelect, IR::Type::U32>(state, in_mask, value,
+	                                                ConstantU32(state, IR::WaveReduceIdentity(op)));
+}
+
 uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 	uint32_t default_bits = 0;
 	if (state.program.stage == ShaderType::Pixel &&
@@ -845,6 +887,36 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,
 		                          ConstantU32(state, 0));
 	}
+	return result;
+}
+
+// Combines the operand over the invocations whose guest lane id is in the lane mask. A split
+// wave64 (two guest lanes per invocation) first combines its two lanes locally.
+uint32_t EmitWaveReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state     = ctx.state;
+	const auto op        = inst.Flags<IR::WaveReduceFlags>().op;
+	const auto mask_low  = ConstantU32(state, inst.Arg(1).U32());
+	const auto mask_high = ConstantU32(state, inst.Arg(2).U32());
+	const auto lane      = EmitSubgroupLocalInvocationId(state);
+	const auto bit_index = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
+	uint32_t   operand   = 0;
+	if (ctx.other_half == nullptr) {
+		const auto low_lane = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), low_lane, lane,
+		                          ConstantU32(state, 32));
+		const auto word =
+		    EmitNative<spv::OpSelect, IR::Type::U32>(state, low_lane, mask_low, mask_high);
+		operand = EmitWaveReduceOperand(state, op, ctx.Arg(inst, 0), word, bit_index);
+	} else {
+		operand = EmitWaveReduceCombine(
+		    state, op,
+		    EmitWaveReduceOperand(state, op, ctx.HalfArg(inst, 0, 0), mask_low, bit_index),
+		    EmitWaveReduceOperand(state, op, ctx.HalfArg(inst, 0, 1), mask_high, bit_index));
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(WaveReduceGroupOp(op), TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup),
+	                          static_cast<uint32_t>(spv::GroupOperationReduce), operand);
 	return result;
 }
 

@@ -201,6 +201,9 @@ VALUE_OPCODE(ReadLane, U32, U32, U32)
 VALUE_OPCODE(WriteLane, U32, U32, U32, U32)
 VALUE_OPCODE(Permlane16U32, U32, U32, U32, U32, U1)
 VALUE_OPCODE(BpermuteU32, U32, U32, U32, U1)
+// arg0 combined over the invocations whose guest lane id is in the 64-bit lane mask (arg1: lanes
+// 0-31, arg2: lanes 32-63, immediates), with the operation in WaveReduceFlags.
+VALUE_OPCODE(WaveReduceU32, U32, U32, U32, U32)
 
 // Typed shader resources and memory operations. Descriptor state is represented by SSA values;
 // dense bindings are assigned by resource tracking.

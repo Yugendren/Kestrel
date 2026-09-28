@@ -20,6 +20,7 @@
 #include "graphics/shader/recompiler/ir/passes/GpuVertexFetch.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/recompiler/ir/passes/TileRescale.h"
+#include "graphics/shader/recompiler/ir/passes/WaveReduction.h"
 #include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
@@ -687,6 +688,20 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
+	}
+	// Compute subgroups are pinned full, where the guest's lane-exchange scans are exact; the
+	// tile-rescale proof also reasons about those scans as they are.
+	if (options.stage != ShaderType::Compute && options.subgroup_arithmetic) {
+		const auto wave_reductions = IR::RecoverWaveReductions(ir, ir.wave_size);
+		if (wave_reductions.rewritten_reads != 0) {
+			LOGF("%s wave reduction: stage=%s hash=0x%016" PRIx64 " reads=%" PRIu32 "\n",
+			     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+			     wave_reductions.rewritten_reads);
+			IR::ConstantPropagationPass(ir.blocks);
+			IR::ResolveControlFlowIdentities(ir);
+			IR::RemoveIdentities(ir.blocks);
+			IR::EliminateDeadCode(ir.blocks);
+		}
 	}
 	const auto waterfalls = IR::RewriteWaterfallDescriptors(ir);
 	if (waterfalls != 0) {

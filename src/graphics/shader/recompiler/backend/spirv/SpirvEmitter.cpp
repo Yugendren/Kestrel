@@ -288,6 +288,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id = true;
 					break;
 				}
+				case IR::ValueOpcode::WaveReduceU32: {
+					requirements.subgroup_arithmetic          = true;
+					requirements.subgroup_local_invocation_id = true;
+					break;
+				}
 				case IR::ValueOpcode::LaneId:
 					requirements.subgroup_local_invocation_id |=
 					    program.stage != ShaderType::TessellationControl;

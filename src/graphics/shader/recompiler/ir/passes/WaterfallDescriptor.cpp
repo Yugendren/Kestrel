@@ -198,6 +198,7 @@ bool IsLaneReduction(ValueOpcode op) {
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::DppUpdateU32:
 		case ValueOpcode::Permlane16U32:
+		case ValueOpcode::WaveReduceU32:
 		case ValueOpcode::ReadLane: return true;
 		default: return false;
 	}

@@ -33,6 +33,11 @@ struct CompileOptions {
 	// Vertex stage only: keep the guest's own attribute-table and V# reads and fetch vertex data
 	// through the BDA page table instead of fixed-function vertex input.
 	bool                        gpu_vertex_fetch           = false;
+	// The host supports subgroup arithmetic (GroupNonUniformArithmetic) in this stage. Non-compute
+	// stages then replace guest lane-exchange scans with wave reductions
+	// (ir/passes/WaveReduction.h). A property of the device, fixed for the process like the
+	// options above, so programs compiled under it never meet another value.
+	bool                        subgroup_arithmetic        = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;

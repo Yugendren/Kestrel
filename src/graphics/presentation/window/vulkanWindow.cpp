@@ -594,6 +594,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
 	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
 	graphics.max_compute_workgroup_subgroups = subgroup_size_control.maxComputeWorkgroupSubgroups;
+	graphics.subgroup_arithmetic_stages =
+	    (properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eArithmetic)
+	        ? properties11.subgroupSupportedStages
+	        : vk::ShaderStageFlags {};
 	// Enabled wherever the device has it, not only where 64 is in range: a device with sizes
 	// 8..32 (Intel) or 32..32 (NVIDIA) must still pin wave32 compute to 32 lanes, or the driver
 	// may pick (and vary) a narrower subgroup the translated program was not built for. Whether
@@ -603,10 +607,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute);
 	graphics.compute_full_subgroups_enabled = supported_features13.computeFullSubgroups == VK_TRUE;
 
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s "
-	     "full_subgroups=%s wave64=%s\n",
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x arithmetic_stages=0x%08x "
+	     "size_control=%s full_subgroups=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
+	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.subgroup_arithmetic_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.compute_full_subgroups_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");

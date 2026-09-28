@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCacheBlob.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderScale.h"
@@ -571,6 +572,8 @@ struct PipelineCache::ProgramCache {
 		options.dump_label  = label;
 		options.gpu_vertex_fetch =
 		    stage == ShaderType::Vertex && Config::GetVertexFetchMode() == Config::VertexFetchMode::Gpu;
+		options.subgroup_arithmetic =
+		    (subgroup_arithmetic_stages & NativeShaderStage(stage)) == NativeShaderStage(stage);
 		options.input_info  = stage_input;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -619,7 +622,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, vk::ShaderStageFlags subgroup_arithmetic_stages)
+	    : device(device), subgroup_arithmetic_stages(subgroup_arithmetic_stages) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -668,11 +672,15 @@ struct PipelineCache::ProgramCache {
 		}
 	} memo_stats;
 	vk::Device                                                  device;
+	// Stages whose programs may use subgroup arithmetic (CompileOptions::subgroup_arithmetic).
+	vk::ShaderStageFlags                                        subgroup_arithmetic_stages;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)),
+    : m_graphics(graphics),
+      m_program_cache(
+          std::make_unique<ProgramCache>(graphics.device, graphics.subgroup_arithmetic_stages)),
       m_vertex_program_memo(std::make_unique<VertexProgramMemo>()),
       m_pixel_program_memo(std::make_unique<PixelProgramMemo>()),
       m_last_save_time(std::chrono::steady_clock::now()) {

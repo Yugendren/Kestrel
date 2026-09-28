@@ -54,6 +54,9 @@ struct GraphicContext {
 	uint32_t                           max_compute_workgroup_subgroups       = 0;
 	uint32_t                           max_push_descriptors                  = 0;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
+	// Stages whose shaders may use subgroup arithmetic (VkPhysicalDeviceSubgroupProperties:
+	// supportedStages when supportedOperations has ARITHMETIC, else none).
+	vk::ShaderStageFlags               subgroup_arithmetic_stages            = {};
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;

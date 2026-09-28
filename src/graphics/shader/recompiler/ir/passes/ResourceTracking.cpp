@@ -1143,6 +1143,7 @@ private:
 			case ValueOpcode::ReadConstBuffer:
 			case ValueOpcode::ReadFirstLane:
 			case ValueOpcode::ReadLane:
+			case ValueOpcode::WaveReduceU32:
 			case ValueOpcode::Ballot:
 			case ValueOpcode::AnyLane:
 			case ValueOpcode::CompositeExtractU32x4:
@@ -1185,7 +1186,8 @@ private:
 	static bool UniformResult(ValueOpcode opcode) {
 		return opcode == ValueOpcode::GetUserData || opcode == ValueOpcode::ReadConst ||
 		       opcode == ValueOpcode::ReadFirstLane || opcode == ValueOpcode::ReadLane ||
-		       opcode == ValueOpcode::Ballot || opcode == ValueOpcode::AnyLane;
+		       opcode == ValueOpcode::WaveReduceU32 || opcode == ValueOpcode::Ballot ||
+		       opcode == ValueOpcode::AnyLane;
 	}
 
 	static bool WaveUniform(const Inst& inst, std::unordered_set<const Inst*>& visiting) {

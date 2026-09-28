@@ -63,6 +63,32 @@ struct PermlaneFlags {
 static_assert(sizeof(PermlaneFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<PermlaneFlags>);
 
+// WaveReduceU32 flags: the combining operation of a wave reduction recovered from a guest
+// lane-exchange chain (passes/WaveReduction.h). Integer operations only; SMin/SMax compare the
+// 32-bit value as signed.
+enum class WaveReduceOp : uint8_t { BitwiseOr, BitwiseAnd, BitwiseXor, IAdd, UMin, UMax, SMin, SMax };
+
+struct WaveReduceFlags {
+	WaveReduceOp op = WaveReduceOp::BitwiseOr;
+};
+static_assert(sizeof(WaveReduceFlags) <= sizeof(uint64_t));
+static_assert(std::is_trivially_copyable_v<WaveReduceFlags>);
+
+// The value x with x op y == y for every y: what a lane outside the reduced set contributes.
+[[nodiscard]] constexpr uint32_t WaveReduceIdentity(WaveReduceOp op) {
+	switch (op) {
+		case WaveReduceOp::BitwiseAnd:
+		case WaveReduceOp::UMin: return 0xffffffffu;
+		case WaveReduceOp::SMin: return 0x7fffffffu;
+		case WaveReduceOp::SMax: return 0x80000000u;
+		case WaveReduceOp::BitwiseOr:
+		case WaveReduceOp::BitwiseXor:
+		case WaveReduceOp::IAdd:
+		case WaveReduceOp::UMax: break;
+	}
+	return 0u;
+}
+
 struct MemoryFlags {
 	uint32_t index = 0;
 	uint32_t pc    = 0;

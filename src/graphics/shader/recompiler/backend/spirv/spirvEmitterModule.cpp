@@ -665,7 +665,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
-	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
+	    state.requirements.subgroup_shuffle || state.requirements.subgroup_arithmetic ||
+	    state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
@@ -673,6 +674,9 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.requirements.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
+	if (state.requirements.subgroup_arithmetic) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
