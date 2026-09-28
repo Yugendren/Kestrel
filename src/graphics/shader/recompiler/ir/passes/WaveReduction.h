@@ -11,7 +11,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 //
 // The PS5 shader compiler lowers wave intrinsics (WaveActiveBitOr, WaveActiveSum, ...) to a scan
 // that assumes every lane of the guest wave exists: it turns on all lanes (S_ORN2_SAVEEXEC /
-// S_OR_SAVEEXEC ..., -1), masks the operand of the lanes that were off to the operation's
+// S_OR_SAVEEXEC ..., -1; B64, or B32 in wave32 programs), masks the operand of the lanes that were off to the operation's
 // identity (V_CNDMASK with the saved exec), combines lanes through DPP row shifts / xmasks and
 // V_PERMLANEX16, and reads the total with V_READLANE_B32 from the last lane of each half. On the
 // host a lane without a pixel (or beyond the host subgroup) has no invocation, so it cannot relay

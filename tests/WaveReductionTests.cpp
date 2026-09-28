@@ -403,6 +403,55 @@ void TestButterflies() {
   }
 }
 
+// The wave32 form (PS 7f2b4ea6, 828d0301): S_ORN2_SAVEEXEC_B32 vcc_lo, exec_lo writes EXEC_LO as
+// ~x | x and reaches the U1 exec through Translator::ThreadBit; there is no permlane, and the
+// halves are read at lanes 15 and 31.
+Value ThreadBitExec(Chain &chain, Value word) {
+  const auto lane = Value(chain.Emit(ValueOpcode::LaneId, {}));
+  const auto index = Value(chain.Emit(ValueOpcode::BitwiseAnd32, {lane, U32(31)}));
+  const auto shifted = Value(chain.Emit(ValueOpcode::ShiftRightLogical32, {word, index}));
+  const auto bit = Value(chain.Emit(ValueOpcode::BitwiseAnd32, {shifted, U32(1)}));
+  return Value(chain.Emit(ValueOpcode::INotEqual32, {bit, U32(0)}));
+}
+
+Value RowScanOnly(Chain &chain, ValueOpcode op) {
+  auto v = chain.Start();
+  for (const uint16_t control : {0x111, 0x112, 0x114, 0x118}) {
+    v = chain.DppStep(op, v, control, false);
+  }
+  return v;
+}
+
+void TestWave32ExecWord() {
+  Chain chain(32);
+  const auto exec_lo = chain.Undef();
+  const auto not_exec = Value(chain.Emit(ValueOpcode::BitwiseNot32, {exec_lo}));
+  chain.all_lanes =
+      ThreadBitExec(chain, Value(chain.Emit(ValueOpcode::BitwiseOr32, {not_exec, exec_lo})));
+  const auto total = RowScanOnly(chain, ValueOpcode::BitwiseOr32);
+  auto *low = chain.ReadLane(total, 15);
+  auto *high = chain.ReadLane(total, 31);
+  const auto stats = RecoverWaveReductions(chain.program, 32);
+  Check(stats.rewritten_reads == 2,
+        "wave32 exec word: rewritten " + std::to_string(stats.rewritten_reads));
+  CheckRewritten(chain, low, WaveReduceOp::BitwiseOr, Lanes(0, 15), "wave32 exec word lane 15");
+  CheckRewritten(chain, high, WaveReduceOp::BitwiseOr, Lanes(16, 31), "wave32 exec word lane 31");
+}
+
+// ~x | y with two different words is not all ones: the scan is left alone.
+void TestWave32ExecWordMismatch() {
+  Chain chain(32);
+  const auto not_exec = Value(chain.Emit(ValueOpcode::BitwiseNot32, {chain.Undef()}));
+  chain.all_lanes =
+      ThreadBitExec(chain, Value(chain.Emit(ValueOpcode::BitwiseOr32, {not_exec, chain.Undef()})));
+  const auto total = RowScanOnly(chain, ValueOpcode::BitwiseOr32);
+  auto *read = chain.ReadLane(total, 31);
+  const auto stats = RecoverWaveReductions(chain.program, 32);
+  Check(stats.rewritten_reads == 0,
+        "wave32 exec word mismatch: rewritten " + std::to_string(stats.rewritten_reads));
+  CheckUntouched(chain, read, "wave32 exec word mismatch");
+}
+
 } // namespace
 
 int main() {
@@ -414,6 +463,8 @@ int main() {
   TestReadsLeftAlone();
   TestBoundControl();
   TestButterflies();
+  TestWave32ExecWord();
+  TestWave32ExecWordMismatch();
   if (g_failures != 0) {
     std::cerr << "wave reduction tests: " << g_failures << " failure(s)\n";
     return 1;

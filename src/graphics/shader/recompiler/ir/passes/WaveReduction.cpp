@@ -62,21 +62,110 @@ bool IsNegationOf(Value negated, Value value) {
 	       inst->Arg(0).Resolve() == value;
 }
 
-// Whether a U1 lane mask is true in every lane of the guest wave: the immediate true (what
-// S_OR_SAVEEXEC ..., -1 folds to), or x | !x in either order (S_ORN2_SAVEEXEC_B64 s, exec, which
-// translation leaves as LogicalOr(LogicalNot(exec), exec)).
+bool IsWordNegationOf(Value negated, Value value) {
+	const auto* inst = negated.TryInstruction();
+	return inst != nullptr && inst->GetOpcode() == ValueOpcode::BitwiseNot32 &&
+	       inst->Arg(0).Resolve() == value;
+}
+
+// Whether a 32-bit lane-mask word has every bit set on the guest: the immediate ~0, or ~x | x in
+// either order. S_ORN2_SAVEEXEC_B32 s, exec_lo reads EXEC_LO twice through GetExecLo, which SSA
+// resolves to one value, so both operands are the same Value.
+bool IsAllOnesWord(Value word) {
+	word = word.Resolve();
+	if (word.IsImmediate()) {
+		return word.GetType() == Type::U32 && word.U32() == UINT32_MAX;
+	}
+	const auto* inst = word.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseOr32) {
+		return false;
+	}
+	const auto lhs = inst->Arg(0).Resolve();
+	const auto rhs = inst->Arg(1).Resolve();
+	return IsWordNegationOf(lhs, rhs) || IsWordNegationOf(rhs, lhs);
+}
+
+bool IsLaneId(Value value) {
+	const auto* inst = value.Resolve().TryInstruction();
+	return inst != nullptr && inst->GetOpcode() == ValueOpcode::LaneId;
+}
+
+bool IsImmediateU32(Value value, uint32_t expected) {
+	value = value.Resolve();
+	return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == expected;
+}
+
+// Whether `matches(a, b)` holds for the two operands of the binary `inst` in either order.
+template <typename Matches>
+bool EitherOrder(const Inst& inst, Matches matches) {
+	const auto lhs = inst.Arg(0).Resolve();
+	const auto rhs = inst.Arg(1).Resolve();
+	return matches(lhs, rhs) || matches(rhs, lhs);
+}
+
+// Whether a U1 lane mask is Translator::ThreadBit of all-ones words: bit (LaneId & 31) of the
+// word, where the word is W (wave32) or Select(LaneId < 32, W_lo, W_hi) (wave64). This is how a
+// 32-bit EXEC write (S_ORN2_SAVEEXEC_B32 s, exec_lo in a wave32 program) reaches the U1 exec.
+bool IsThreadBitOfAllOnes(Value mask) {
+	const auto* compare = mask.Resolve().TryInstruction();
+	if (compare == nullptr || compare->GetOpcode() != ValueOpcode::INotEqual32) {
+		return false;
+	}
+	return EitherOrder(*compare, [](Value bit, Value zero) {
+		const auto* masked = bit.TryInstruction();
+		if (!IsImmediateU32(zero, 0u) || masked == nullptr ||
+		    masked->GetOpcode() != ValueOpcode::BitwiseAnd32) {
+			return false;
+		}
+		return EitherOrder(*masked, [](Value shifted, Value one) {
+			const auto* shift = shifted.TryInstruction();
+			if (!IsImmediateU32(one, 1u) || shift == nullptr ||
+			    shift->GetOpcode() != ValueOpcode::ShiftRightLogical32) {
+				return false;
+			}
+			const auto* index = shift->Arg(1).Resolve().TryInstruction();
+			if (index == nullptr || index->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
+			    !EitherOrder(*index, [](Value lane, Value low_bits) {
+				    return IsLaneId(lane) && IsImmediateU32(low_bits, 31u);
+			    })) {
+				return false;
+			}
+			const auto word = shift->Arg(0).Resolve();
+			if (IsAllOnesWord(word)) {
+				return true;
+			}
+			const auto* halves = word.TryInstruction();
+			if (halves == nullptr || halves->GetOpcode() != ValueOpcode::SelectU32) {
+				return false;
+			}
+			const auto* low_half = halves->Arg(0).Resolve().TryInstruction();
+			return low_half != nullptr && low_half->GetOpcode() == ValueOpcode::ULessThan32 &&
+			       IsLaneId(low_half->Arg(0)) && IsImmediateU32(low_half->Arg(1), 32u) &&
+			       IsAllOnesWord(halves->Arg(1)) && IsAllOnesWord(halves->Arg(2));
+		});
+	});
+}
+
+// Whether a U1 lane mask is true in every lane of the guest wave:
+//  - the immediate true (what S_OR_SAVEEXEC ..., -1 and S_MOV_B64 exec, -1 fold to);
+//  - x | !x in either order (S_ORN2_SAVEEXEC_B64 s, exec, which translation leaves as
+//    LogicalOr(LogicalNot(exec), exec));
+//  - ThreadBit of all-ones words (S_ORN2_SAVEEXEC_B32 s, exec_lo, the wave32 form).
 bool IsAllLanesTrue(Value mask) {
 	mask = mask.Resolve();
 	if (mask.IsImmediate()) {
 		return mask.GetType() == Type::U1 && mask.U1();
 	}
 	const auto* inst = mask.TryInstruction();
-	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LogicalOr) {
+	if (inst == nullptr) {
 		return false;
 	}
-	const auto lhs = inst->Arg(0).Resolve();
-	const auto rhs = inst->Arg(1).Resolve();
-	return IsNegationOf(lhs, rhs) || IsNegationOf(rhs, lhs);
+	if (inst->GetOpcode() == ValueOpcode::LogicalOr) {
+		const auto lhs = inst->Arg(0).Resolve();
+		const auto rhs = inst->Arg(1).Resolve();
+		return IsNegationOf(lhs, rhs) || IsNegationOf(rhs, lhs);
+	}
+	return IsThreadBitOfAllOnes(mask);
 }
 
 bool ImmediateU32(Value value, uint32_t& result) {
