@@ -6,6 +6,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 
 // Reusing the previous draw's render state.
@@ -58,18 +59,27 @@ struct DrawReuseInputs {
 	// TextureCache::Generation() when discovery ran: an unchanged generation means every image
 	// lookup of that discovery would answer the same way again (see GenerationMemo).
 	uint64_t texture_generation = 0;
-	// ES/GS/LS/HS/PS program addresses (SPI_SHADER_PGM_*), which select the programs.
+	// ES/GS/LS/HS/PS program addresses (SPI_SHADER_PGM_*), which select the programs. LS/HS
+	// come last, see below.
 	uint64_t es_address                 = 0;
 	uint64_t gs_address                 = 0;
-	uint64_t ls_address                 = 0;
-	uint64_t hs_address                 = 0;
 	uint64_t ps_address                 = 0;
 	uint32_t render_target_slice_offset = 0;
 	bool     indexed                    = false;
 	uint32_t index_type_and_size        = 0; // 0 for a non-indexed draw
+	uint64_t ls_address                 = 0;
+	uint64_t hs_address                 = 0;
 
+	// Every draw compares these. Clang merges the defaulted comparison of each padding-free run of
+	// fields into one memcmp and expands it inline only up to 64 bytes (x86-64-v3); a
+	// longer run becomes a libc memcmp call per draw. The padding after `rendering` and `indexed`
+	// splits the fields into runs, and LS/HS sit after `indexed` so the middle run stays short.
 	bool operator==(const DrawReuseInputs&) const = default;
 };
+static_assert(offsetof(DrawReuseInputs, indexed) + sizeof(bool) -
+                      offsetof(DrawRecordingPosition, dynamic_state_invalidations) <=
+                  64,
+              "the comparison run between `rendering` and `indexed` no longer expands inline");
 
 // The programs a draw runs: one vertex stage, or three for a tessellation draw (LS/HS/TES, see
 // PipelineCache::GraphicsPrograms), and the pixel stage when it is active. The registers only

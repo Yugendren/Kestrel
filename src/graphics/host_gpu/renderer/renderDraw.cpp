@@ -731,12 +731,12 @@ static DrawReuseInputs CurrentDrawReuseInputs(const CommandBuffer& buffer, bool 
 	    .texture_generation         = buffer.GetContext().GetTextureCache().Generation(),
 	    .es_address                 = shaders.GetVs().es_regs.data_addr,
 	    .gs_address                 = shaders.GetVs().gs_regs.data_addr,
-	    .ls_address                 = shaders.GetVs().ls_regs.data_addr,
-	    .hs_address                 = shaders.GetVs().hs_regs.data_addr,
 	    .ps_address                 = shaders.GetPs().ps_regs.data_addr,
 	    .render_target_slice_offset = render_target_slice_offset,
 	    .indexed                    = indexed,
 	    .index_type_and_size        = indexed ? index_type_and_size : 0u,
+	    .ls_address                 = shaders.GetVs().ls_regs.data_addr,
+	    .hs_address                 = shaders.GetVs().hs_regs.data_addr,
 	};
 }
 
