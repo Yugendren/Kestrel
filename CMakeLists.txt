@@ -903,7 +903,18 @@ if(APPLE)
 		COMMENT "Codesign kyty_emulator with JIT entitlements (macOS)")
 endif()
 
+# Shipped game patches (patches/*.xml) go next to the executable, where the patch loader looks by
+# default, so both the build tree and an installed build find them. A separate target copies them
+# on every build, so an edited patch file is picked up without relinking the emulator.
+add_custom_target(kyty_game_patches
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/patches"
+		"$<TARGET_FILE_DIR:kyty_emulator>/patches"
+	COMMENT "Copy shipped game patches"
+)
+add_dependencies(kyty_emulator kyty_game_patches)
+
 install(TARGETS kyty_emulator DESTINATION .)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/patches/" DESTINATION patches)
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 endif()

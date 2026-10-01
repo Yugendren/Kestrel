@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Astro's Playroom steps its simulation by a fixed 1/60 s per presented frame
+     (SetFrameRate(double fps) at 0x1b4b8c0 stores fps, period_us and float dt).
+     This patch makes the setter use fps * 0.5, so each frame advances 1/30 s:
+     correct game speed at exactly 30 presented fps. It MUST run with --frame-cap 30;
+     uncapped it would run at double speed, so the emulator refuses it otherwise. -->
+<Patch>
+  <TitleID>
+    <ID>PPSA01325</ID>
+  </TitleID>
+  <Metadata Title="Astro's Playroom"
+            Name="Astro's Playroom - correct speed at 30 fps"
+            Note="Game logic steps 1/30 s per frame. Requires --frame-cap 30."
+            Author="yugendren"
+            PatchVer="1.0"
+            AppVer="01.905.000"
+            AppElf="eboot.bin"
+            ImageBase="0x0"
+            RequiresFrameCap="30">
+    <PatchList>
+      <!-- SetFrameRate: fps *= 0.5 (0.5 at 0x1f46058), then store fps, 1e6/fps (us) and (float)(1/fps). -->
+      <Line Type="bytes" Address="0x01b4b8c0"
+            Value="c5fb590590a73f00c5fb1105a859bd00c5fb100d48bf4800c5f35ec8c4e1fb2cd1488915a059bd00c5fb101500c04800c5eb5ec0c5fb5ac0c5fa11058059bd00c3cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            Original="c5fb100d58bf4800c5fb1015a0c1480048b90000000000000080c5fb11059659bd00c5f35ec8c5f35cdac4e1fb2cd1c4e1fb2cc34831c1c5f92ecac5fb1015edbf4800480f43d14889157a59bd00c5eb5ec0c5fb5ac0c5fa11056259bd00c3"/>
+      <!-- Static initial values before the first SetFrameRate call: fps, dt, period_us. -->
+      <Line Type="float64" Address="0x02721278" Value="30.0" Original="0000000000004e40"/>
+      <Line Type="float32" Address="0x02721280" Value="0.033333335" Original="8988883c"/>
+      <Line Type="bytes64" Address="0x02721288" Value="33333" Original="1a41000000000000"/>
+    </PatchList>
+  </Metadata>
+</Patch>
