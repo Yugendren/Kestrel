@@ -131,4 +131,13 @@ are code caves: the pages are mapped zero-filled at those addresses and freed wi
 | File | Game | Version | Patch | Requires |
 |---|---|---|---|---|
 | `patches/PPSA01325.xml` | Astro's Playroom | 01.905.000 | `Astro's Playroom - correct speed at 30 fps`: the engine steps a fixed 1/60 s per presented frame (`SetFrameRate(double fps)` at 0x1b4b8c0). The patch makes the setter use fps x 0.5 and sets the static initial values to 30.0 / 1/30 / 33333 us, so each frame advances 1/30 s. | `--frame-cap 30` |
-| `patches/PPSA01342.xml` | Demon's Souls | 01.005.000 | `Demon's Souls - job workers sleep instead of spinning` (off unless enabled): the 13 BPE job threads busy-poll for work; the poll call at +0x820f3b is routed through a code cave in the text segment's zero tail (+0x1f04600) that calls the poll and, when it returns false, `sceKernelUsleep(100)` through the game's own import slot. | |
+| `patches/PPSA01325.xml` | Astro's Playroom | 01.905.000 | `Astro's Playroom - correct speed at any frame rate` (off unless enabled): a code cave in the text segment's zero tail (+0x1f36b00), called instead of the per-frame function 0x1842eb0 at 0x1842e83, measures the real time since the previous frame, clamps it to 10..120 fps, and stores it as the engine's timestep (`period_us` and float `dt`). The 1/fps getter at 0x1b4b930 returns `dt`, which frees the fps double at 0x2721278 to hold the previous timestamp. | |
+
+### Playing Astro's Playroom unlocked
+
+Run with `--patch "Astro's Playroom - correct speed at any frame rate"` and no frame cap (or any
+cap). Game logic follows real time, clamped to 10..120 fps, so game speed is right at any frame
+rate. Jumps get lower below about 30 fps, because the game's own physics integrates at large steps
+(measured jump apex -10% at 20 fps and -24% at 15 fps, relative to 30 fps). F10 / `--perf-overlay`
+shows fps and frame time. Do not enable it together with the 30 fps patch: the loader refuses the
+second one.

@@ -2,7 +2,7 @@
 <!-- Astro's Playroom steps its simulation by a fixed 1/60 s per presented frame
      (SetFrameRate(double fps) at 0x1b4b8c0 stores fps, period_us and float dt).
      This patch makes the setter use fps * 0.5, so each frame advances 1/30 s:
-     correct game speed at exactly 30 presented fps. It MUST run with --frame-cap 30;
+     correct game speed at exactly 30 presented fps. It MUST run with the frame cap option set to 30;
      uncapped it would run at double speed, so the emulator refuses it otherwise. -->
 <Patch>
   <TitleID>
@@ -26,6 +26,39 @@
       <Line Type="float64" Address="0x02721278" Value="30.0" Original="0000000000004e40"/>
       <Line Type="float32" Address="0x02721280" Value="0.033333335" Original="8988883c"/>
       <Line Type="bytes64" Address="0x02721288" Value="33333" Original="1a41000000000000"/>
+    </PatchList>
+  </Metadata>
+  <!-- Astro's Playroom steps its simulation by the fixed timestep that SetFrameRate(double fps) at
+       0x1b4b8c0 stores at start-up (fps double 0x2721278, float dt 0x2721280, u64 period_us
+       0x2721288; 60 fps). This patch makes the timestep follow measured real time instead.
+       Once per frame, at the call of the one-frame function 0x1842eb0 in Application::Run
+       (0x1842e83), a code cave reads sceKernelGetProcessTime, takes the time since the previous
+       frame clamped to [1/120 s, 1/10 s], and stores it as period_us and dt = period_us / 1e6.
+       Game speed is then correct at any presented frame rate down to 10 fps, with or without a
+       frame cap. The cave lives in the zero tail of the text segment (0x1f36b00, after the file data
+       that ends at 0x1f36afc; the tail runs to 0x1f38000), so no game code is overwritten. The previous-frame
+       timestamp is kept in the fps double, whose only reader, the 1/fps getter 0x1b4b930, is
+       changed to return (double)dt. -->
+  <Metadata Title="Astro's Playroom"
+            Name="Astro's Playroom - correct speed at any frame rate"
+            Note="Game logic follows real elapsed time (clamped to 10-120 fps). Works with any frame cap or none. Do not combine with the 30 fps patch."
+            Author="yugendren"
+            PatchVer="1.0"
+            AppVer="01.905.000"
+            AppElf="eboot.bin"
+            ImageBase="0x0">
+    <PatchList>
+      <!-- Application::Run: call the timestep cave instead of the one-frame function; the cave tail-jumps to it. -->
+      <Line Type="bytes" Address="0x01842e83" Value="e8783c6f00" Original="e828000000"/>
+      <!-- Cave (text segment zero tail): push rdi; call sceKernelGetProcessTime; pop rdi; delta = now - last; last = now;
+           if delta is not positive (first frame, or SetFrameRate rewrote the slot) jump to 0x1842eb0;
+           delta = clamp(delta, 8333, 100000) us; period_us = delta; dt = (float)(delta / 1e6); jmp 0x1842eb0. -->
+      <Line Type="bytes" Address="0x01f36b00" Value="57e82af3ffff5f488b0d6aa77e0048890563a77e004829c80f8692c390ffb98d2000004839c8480f42c1b9a08601004839c8480f47c14889054ba77e00c4e1fb2ac0c5fb5e05d60c0a00c5fb5ac0c5fa11052aa77e00e955c390ff" Original="00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"/>
+      <!-- 1/fps getter: return (double)dt instead of 1.0 / fps, freeing the fps double for the timestamp. -->
+      <Line Type="bytes" Address="0x01b4b930" Value="c5fa5a054859bd00c3cccccccccccccccc" Original="c5fb1005b8bf4800c5fb5e053859bd00c3"/>
+      <!-- Guard that writes nothing: the SetFrameRate body must be unpatched, so this patch and the
+           30 fps patch are never applied together (whichever comes second is refused). -->
+      <Line Type="bytes" Address="0x01b4b8c0" Value="c5fb100d58bf4800" Original="c5fb100d58bf4800"/>
     </PatchList>
   </Metadata>
 </Patch>
