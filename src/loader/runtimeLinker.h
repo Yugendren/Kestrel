@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "loader/patches/patchManager.h"
 #include "loader/symbolDatabase.h"
 
 #include <filesystem>
@@ -186,13 +187,14 @@ public:
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 
 private:
-	static void LoadProgramToMemory(Program* program);
+	void        LoadProgramToMemory(Program* program);
 	static void ParseProgramDynamicInfo(Program* program);
 	static void CreateSymbolDatabase(Program* program);
 	static void Relocate(Program* program);
 	static void DeleteProgram(Program* program);
 	static void SetupTlsHandler(Program* program);
 	void        PreloadAdjacentPrograms();
+	void        RelocateCheckingPatches(Program* program);
 
 	Program* FindProgram(const ModuleId& m, const LibraryId& l);
 
@@ -203,6 +205,7 @@ private:
 	std::unique_ptr<SymbolDatabase> m_symbols;
 	bool                            m_relocated = false;
 	Common::Mutex                   m_mutex;
+	Patches::PatchManager           m_patches;
 
 	application_heap_malloc_func_t         m_application_heap_malloc         = nullptr;
 	application_heap_free_func_t           m_application_heap_free           = nullptr;

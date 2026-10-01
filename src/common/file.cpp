@@ -480,4 +480,8 @@ void File::RemoveReadonly(const std::filesystem::path& name) {
 	SysFileRemoveReadonly(name);
 }
 
+std::filesystem::path File::GetExecutablePath() {
+	return SysFileGetExecutablePath();
+}
+
 } // namespace Common

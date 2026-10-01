@@ -20,6 +20,10 @@
 #include <unistd.h>
 #include <utime.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 // NOLINTNEXTLINE(readability-identifier-naming)
 enum sys_file_type_t {
 	SYS_FILE_ERROR,       // NOLINT(readability-identifier-naming)
@@ -669,6 +673,24 @@ void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	}
 
 	chmod(real_name_str.c_str(), s.st_mode | S_IWUSR);
+}
+
+std::filesystem::path SysFileGetExecutablePath() {
+	std::error_code error;
+#if defined(__APPLE__)
+	uint32_t size = 0;
+	_NSGetExecutablePath(nullptr, &size);
+	std::string path(size, '\0');
+	if (_NSGetExecutablePath(path.data(), &size) != 0) {
+		return {};
+	}
+	path.resize(std::strlen(path.c_str()));
+	auto canonical = std::filesystem::canonical(path, error);
+	return error ? std::filesystem::path(path) : canonical;
+#else
+	auto path = std::filesystem::read_symlink("/proc/self/exe", error);
+	return error ? std::filesystem::path {} : path;
+#endif
 }
 
 #endif

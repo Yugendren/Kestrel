@@ -519,4 +519,21 @@ void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	                                     (~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)));
 }
 
+std::filesystem::path SysFileGetExecutablePath() {
+	std::wstring path(MAX_PATH, L'\0');
+	for (;;) {
+		const DWORD length =
+		    GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+		if (length == 0) {
+			return {};
+		}
+		// A full buffer means the path was truncated.
+		if (length < path.size()) {
+			path.resize(length);
+			return path;
+		}
+		path.resize(path.size() * 2);
+	}
+}
+
 #endif

@@ -94,6 +94,8 @@ public:
 	static bool CopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static bool RenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static void RemoveReadonly(const std::filesystem::path& name);
+	// Absolute path of the running emulator executable; empty if the platform cannot tell.
+	static std::filesystem::path GetExecutablePath();
 
 	KYTY_CLASS_NO_COPY(File);
 

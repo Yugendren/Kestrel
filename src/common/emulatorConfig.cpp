@@ -1,6 +1,7 @@
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
+#include "common/file.h"
 
 #include <algorithm>
 #include <cmath>
@@ -127,6 +128,21 @@ float GetLodBias() {
 uint32_t GetFrameCap() {
 	const uint32_t cap = g_config->graphics.frame_cap;
 	return cap == 0 ? 0 : std::clamp(cap, 1u, 480u);
+}
+
+std::filesystem::path GetPatchDirectory() {
+	if (!g_config->patches.directory.empty()) {
+		return g_config->patches.directory;
+	}
+	// Next to the executable rather than the working directory, so a packaged build finds its
+	// shipped patches however it is started.
+	const auto executable = Common::File::GetExecutablePath();
+	return executable.empty() ? std::filesystem::path("patches")
+	                          : executable.parent_path() / "patches";
+}
+
+const std::vector<std::string>& GetEnabledPatches() {
+	return g_config->patches.enabled;
 }
 
 uint32_t GetConsoleLanguage() {

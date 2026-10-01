@@ -184,6 +184,11 @@ struct Elf64_Phdr // NOLINT(readability-identifier-naming)
 	Elf64_Xword p_align;  /* Alignment of segment */
 };
 
+// Segments the runtime linker maps into a module's image.
+inline bool IsMappedSegment(const Elf64_Phdr& phdr) {
+	return phdr.p_memsz != 0 && (phdr.p_type == PT_LOAD || phdr.p_type == PT_OS_RELRO);
+}
+
 struct Elf64_Shdr // NOLINT(readability-identifier-naming)
 {
 	Elf64_Word  sh_name;      /* Section name */

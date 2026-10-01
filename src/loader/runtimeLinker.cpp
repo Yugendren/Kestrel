@@ -1312,10 +1312,16 @@ void RuntimeLinker::RelocateAll() {
 	Common::LockGuard lock(m_mutex);
 
 	for (auto* p: m_programs) {
-		Relocate(p);
+		RelocateCheckingPatches(p);
 	}
 
 	m_relocated = true;
+}
+
+void RuntimeLinker::RelocateCheckingPatches(Program* program) {
+	const auto patched_bytes = m_patches.CaptureWrites(*program);
+	Relocate(program);
+	m_patches.CheckAfterRelocation(*program, patched_bytes);
 }
 
 void RuntimeLinker::RelocateProgram(Program* program) {
@@ -1337,6 +1343,7 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 
 	if (auto it = std::find(m_programs.begin(), m_programs.end(), program);
 	    it != m_programs.end()) {
+		m_patches.ForgetModule(**it);
 		DeleteProgram(*it);
 		m_programs.erase(it);
 	} else {
@@ -1486,6 +1493,7 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	m_patches.Clear();
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);
@@ -1987,7 +1995,7 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	uint64_t base_size = 0;
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
-		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
+		if (IsMappedSegment(phdr[i])) {
 			uint64_t last_addr = phdr[i].p_vaddr + GetAlignedSize(phdr + i);
 			if (last_addr > base_size) {
 				base_size = last_addr;
@@ -2080,8 +2088,19 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t                                   eh_frame_header_size = 0;
 #endif
 
+	// Copy every segment's file bytes before anything rewrites the image, so game patches verify
+	// against (and are applied to) the pristine file while the whole mapping is still writable.
+	// The loader's own code rewriting below then treats patched code like any other guest code.
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
-		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
+		if (IsMappedSegment(phdr[i])) {
+			program->elf->LoadSegment(phdr[i].p_vaddr + program->base_vaddr, phdr[i].p_offset,
+			                          phdr[i].p_filesz);
+		}
+	}
+	m_patches.ApplyToModule(*program);
+
+	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+		if (IsMappedSegment(phdr[i])) {
 			uint64_t segment_addr        = phdr[i].p_vaddr + program->base_vaddr;
 			uint64_t segment_file_size   = phdr[i].p_filesz;
 			uint64_t segment_memory_size = GetAlignedSize(phdr + i);
@@ -2093,8 +2112,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     "[%d] mode        = %s\n",
 			     i, segment_addr, i, segment_file_size, i, segment_memory_size, i,
 			     magic_enum::enum_name(mode));
-
-			program->elf->LoadSegment(segment_addr, phdr[i].p_offset, segment_file_size);
 
 			bool skip_protect = (phdr[i].p_type == PT_LOAD && is_next_gen &&
 			                     mode == Common::VirtualMemory::Mode::NoAccess);

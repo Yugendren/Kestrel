@@ -75,6 +75,14 @@ struct GraphicsSettings {
 	// flips per second; guest-visible vblank timing is unaffected.
 	uint32_t frame_cap      = 0;
 };
+// Game patches (loader/patches). A patch is applied to a matching module when it is named here,
+// listed in the directory's patches.json, or marked isEnabled="true" in its file.
+struct PatchSettings {
+	// Empty selects the "patches" directory next to the emulator executable.
+	std::filesystem::path    directory;
+	std::vector<std::string> enabled;
+};
+
 // Where the vertex attribute and V# tables are decoded. Cpu: the command processor reads
 // them and binds fixed-function vertex input. Gpu: the vertex shader reads them itself
 // through the buffer device address page table, so GPU-written tables never stall the CPU.
@@ -93,6 +101,7 @@ struct ConfigOptions {
 	bool                   amd_cpu_enabled             = false;
 	uint32_t               vblank_frequency            = 60;
 	GraphicsSettings       graphics;
+	PatchSettings          patches;
 	VertexFetchMode        vertex_fetch                = VertexFetchMode::Cpu;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -158,6 +167,8 @@ float    GetLodBias();
 inline float    GetPostScale() { return Detail::g_hot_values.post_scale; }
 inline uint32_t GetShadowMax() { return Detail::g_hot_values.shadow_max; }
 uint32_t GetFrameCap();
+std::filesystem::path           GetPatchDirectory();
+const std::vector<std::string>& GetEnabledPatches();
 VertexFetchMode GetVertexFetchMode();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();

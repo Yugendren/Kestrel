@@ -71,5 +71,6 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 void SysFileRemoveReadonly(const std::filesystem::path& name);
+std::filesystem::path SysFileGetExecutablePath();
 
 #endif /* KYTY_COMMON_PLATFORM_SYSFILEIO_H_ */

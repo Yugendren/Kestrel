@@ -73,6 +73,10 @@ static void PrintUsage() {
 	::printf("Options:\n");
 	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
+	::printf("  --patch <name>                       Enable the game patch with this name; may be\n"
+	         "                                       repeated. See also <patches dir>/patches.json.\n");
+	::printf("  --patches <dir>                      Game patch directory (*.xml). Default: patches\n"
+	         "                                       next to the emulator executable.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
 	::printf(
@@ -426,6 +430,19 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.game_patch = path;
+		} else if (arg == "--patch") {
+			if (value.empty()) {
+				::printf("--patch needs a patch name\n");
+				return false;
+			}
+			options.config.patches.enabled.push_back(value);
+		} else if (arg == "--patches") {
+			value = Common::FixFilenameSlash(value);
+			if (!Common::File::IsDirectoryExisting(value)) {
+				::printf("--patches must point to an existing directory: %s\n", value.c_str());
+				return false;
+			}
+			options.config.patches.directory = value;
 		} else if (arg == "--screen-width") {
 			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
 		} else if (arg == "--screen-height") {
