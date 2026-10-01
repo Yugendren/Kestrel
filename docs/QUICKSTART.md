@@ -8,7 +8,7 @@ Kestrel never distributes games. You need your own legally obtained dump.
 ## 1. Prerequisites
 
 Hardware: a CPU with AVX2 (Intel Haswell or newer, AMD Zen 1 or newer), a Vulkan 1.3 GPU with a
-current driver, 16 GB RAM or more, and a controller. See the
+current driver, 16 GB RAM or more, and a controller (or a keyboard). See the
 [requirements](../README.md#requirements).
 
 Windows:
@@ -155,14 +155,17 @@ Options: `-Preset NAME`, `-Config FILE`, `-Game DIR`, `-Help` on Windows, and `-
 `--config FILE`, `--game DIR`, `--help` on Linux. The launcher prints the command and the
 `saves:` folder before it starts the emulator.
 
-A controller is required. Kestrel reads DualSense, DualShock 4 and Xbox pads through SDL. There
-is no keyboard mapping. You can remap with `--keymap Control=Input` in `extra_args`.
+A controller is recommended. Kestrel reads DualSense, DualShock 4 and Xbox pads through SDL. A
+keyboard also works by default: WASD is the left stick, T/F/G/H the right stick, arrow keys the
+D-pad, J/L/K/I Cross/Circle/Square/Triangle, Q/E L1/R1, Z/C L2/R2, Left Shift/Left Ctrl L3/R3,
+Enter Options, Backspace/Tab the left and right touchpad halves. F1, F7, F9, F10, F11 and Esc
+are reserved. You can remap with `--keymap Control=Input` in `extra_args`.
 
 ## 7. Reading what you see
 
 The window title shows `frame: N, fps: N` while the game runs.
 
-Coming soon: a performance overlay, toggled with F10. It shows:
+The performance overlay is toggled with F10. It shows:
 
 - fps: frames per second now
 - frame time: how long the last frame took
@@ -176,8 +179,9 @@ overlay, the launcher says so and the window title shows fps instead.
 
 Astro's Playroom runs in slow motion below 60 fps, because the game's speed is tied to its
 frame rate. The `astro-low` and `astro-high` presets enable the game-speed patch with a 30 fps
-cap, which gives correct speed at 30 fps (see section 4 to turn it off). Correct speed at any
-frame rate is in testing. See the [status page](STATUS.md).
+cap, which gives correct speed at 30 fps (see section 4 to turn it off). The
+`astro-low-unlocked` and `astro-high-unlocked` presets use the any-frame-rate patch instead, with
+a 30 fps cap by default so a 60 Hz display does not judder. See the [status page](STATUS.md).
 
 ## 8. First-run shader stutter
 

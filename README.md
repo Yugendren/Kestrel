@@ -19,7 +19,7 @@ The emulator binary is still named `kyty_emulator` (`kyty_emulator.exe` on Windo
 
 | Game | Title ID | State | Notes |
 | --- | --- | --- | --- |
-| Astro's Playroom | PPSA01325 | Playable-ish | Boots, menus and gameplay through the hub work. 25-60 fps depending on the scene. Correct game speed at 30 fps with the game-speed patch plus `--frame-cap 30` (the `astro-low` and `astro-high` presets enable both). The Cooling Springs crash is fixed on `main` (tri-fan geometry shader support, by nmzik). Known crash: entering the SSD Speedway portal. Variable-step game speed (correct at any fps) is in testing. |
+| Astro's Playroom | PPSA01325 | Playable-ish | Boots, menus and gameplay through the hub work. 25-60 fps depending on the scene. Correct game speed at any frame rate with the any-frame-rate patch (the `astro-low-unlocked` and `astro-high-unlocked` presets enable it). Use `--frame-cap 30` on a 60 Hz display, or a divisor of your refresh rate, or VRR, to avoid judder. The 30 fps patch plus cap is in the `astro-low` and `astro-high` presets. The Cooling Springs crash is fixed on `main` (tri-fan geometry shader support, by nmzik). Known crash: entering the SSD Speedway portal. |
 | Demon's Souls (v01.005) | PPSA01342 | Not playable yet | Reaches gameplay on a development branch. About 2 fps, dark square specks, two intermittent crashes. |
 | Astro Bot | PPSA21564 | Untested | Not tried on Kestrel yet. Upstream KytyPS5 reports a crash after the Team Asobi splash. |
 | Ghost of Yotei | - | Planned | Later target. |
@@ -35,7 +35,7 @@ Details and numbers are on the [status page](docs/STATUS.md).
   RTX 3060 (12 GB). 8 GB or more VRAM is recommended. A 4K internal render needs more.
 - RAM: 16 GB or more recommended.
 - OS: Windows 10/11 x64, or a current x86-64 Linux. macOS is not a Kestrel target.
-- A controller. There is no keyboard mapping.
+- A controller is recommended. A keyboard also works, see [Keyboard](#keyboard).
 
 ## Features
 
@@ -67,9 +67,10 @@ On `main` today:
 - **Launcher scripts** (`kestrel.bat`, `kestrel.sh`): presets for each game and GPU class, a
   dry-run mode, and a report mode that records a run for bug reports.
 - **Game-speed patches** (`--patch "<name>"`, `--patches <dir>`): a patch loader that reads
-  GoldHEN/shadPS4 XML patch files. Patches are opt-in by name and off by default. The first
-  patch is Astro's Playroom "correct speed at 30 fps", which needs `--frame-cap 30`. See
-  [PATCHES.md](PATCHES.md).
+  GoldHEN/shadPS4 XML patch files. Patches are opt-in by name and off by default. For Astro's
+  Playroom there are two: "correct speed at 30 fps" (needs `--frame-cap 30`) and "correct speed
+  at any frame rate". With the any-frame-rate patch, use `--frame-cap 30` on a 60 Hz display (or
+  refresh/3 on 120/144 Hz, or VRR) to avoid judder. See [PATCHES.md](PATCHES.md).
 - **Shader and pipeline caches**: kept in `_PipelineCache` so later runs stutter less.
 
 ### Coming soon
@@ -77,14 +78,11 @@ On `main` today:
 These are built and tested on branches but are not on `main` yet. The launcher skips them with
 a warning if your build lacks them.
 
-- **Variable-step game speed**: Astro's Playroom at correct speed at any frame rate. In testing.
 - **FSR 1 upscaler** (`--upscaler fsr1`, `--fsr-sharpness`): optional AMD FSR 1 upscale from
   render resolution to the window. It improves the final image, not performance.
-- **Performance overlay** (F10 toggles, `--perf-overlay` starts it shown): fps, frame time,
-  1% low, a graph, CPU and GPU load, and VRAM. Until it lands the window title shows fps.
-- **Frame-time log** (`--frame-time-log <file>`): one line per presented frame.
-- **Performance ports in A/B testing**: SRT JIT, queue-drain (from upstream, by nmzik),
-  hardware buffer bounds (from BryanKAdams/KytyPS5), and relocatable draw records.
+- **Performance ports in A/B testing**: SRT JIT, hardware buffer bounds (from
+  BryanKAdams/KytyPS5), queue-drain (from upstream, by nmzik) and relocatable draw records.
+  See the [roadmap](docs/ROADMAP.md).
 
 ## Quick start
 
@@ -104,8 +102,44 @@ a warning if your build lacks them.
 
 The full steps are in [docs/QUICKSTART.md](docs/QUICKSTART.md).
 
-More: [docs/STATUS.md](docs/STATUS.md) (progress and roadmap) and
-[docs/BRANCHES.md](docs/BRANCHES.md) (branch policy and contributing).
+More: [docs/STATUS.md](docs/STATUS.md) (progress), [docs/ROADMAP.md](docs/ROADMAP.md) (where
+to help) and [docs/BRANCHES.md](docs/BRANCHES.md) (branch policy and contributing).
+
+## Keyboard
+
+A keyboard works with no setup. You can remap with `--keymap Control=Input` (see
+[docs/QUICKSTART.md](docs/QUICKSTART.md)).
+
+| PS5 control | Key |
+| --- | --- |
+| Left stick | W A S D |
+| Right stick (up, left, down, right) | T F G H |
+| D-pad | Arrow keys |
+| Cross, Circle, Square, Triangle | J, L, K, I |
+| L1, R1 | Q, E |
+| L2, R2 | Z, C |
+| L3, R3 | Left Shift, Left Ctrl |
+| Options | Enter |
+| Touchpad left half, right half | Backspace, Tab |
+
+Reserved keys (they cannot be remapped): F1 RenderDoc frame capture, F7 mouse-to-joystick, F9
+clip recording, F10 performance overlay, F11 fullscreen toggle, Esc.
+
+## Contributing / where to help
+
+The [roadmap](docs/ROADMAP.md) lists what is slow, what is broken, and where to start in the
+source. Good first tasks:
+
+- **Cooling Springs GPU census**: the scene takes about 40 ms of GPU time at 1080p. Find the
+  expensive passes.
+- **Queue-drain A/B**: measure the upstream queue-drain fix (by nmzik) against `main`.
+- **Hardware buffer bounds A/B**: measure `VK_EXT_robustness2` bounds (from BryanKAdams) against
+  `main`.
+- **PGO builds** of `main` for Windows and Linux.
+
+Rule: every performance PR includes before and after scorecard numbers (CPU Plaza, pre-plaza and
+Cooling Springs, still and moving). The roadmap explains how to measure. Branch policy is in
+[docs/BRANCHES.md](docs/BRANCHES.md).
 
 ## Reporting results
 
