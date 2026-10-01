@@ -92,6 +92,7 @@ Presets:
 | --- | --- | --- |
 | `astro-low` | Astro's Playroom | 3060-class, render scale 0.5 (1080p internal) |
 | `astro-high` | Astro's Playroom | 4080/5090-class, render scale 1.0 (native 4K internal), fullscreen |
+| `astro-low-unlocked`, `astro-high-unlocked` | Astro's Playroom | Same as `astro-low` / `astro-high`, but with the correct-speed-at-any-frame-rate patch and no frame cap |
 | `ds-low` | Demon's Souls | 3060-class, render scale 0.5 |
 | `ds-high` | Demon's Souls | 4080/5090-class, render scale 1.0, fullscreen |
 | `default` | any | plain emulator defaults |
