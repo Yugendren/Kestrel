@@ -1,5 +1,6 @@
 #include "loader/patches/patchManager.h"
 
+#include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"

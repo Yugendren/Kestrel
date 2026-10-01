@@ -3,6 +3,7 @@
 #include "common/stringUtils.h"
 
 #include <bit>
+#include <cctype>
 #include <charconv>
 #include <cstdio>
 #include <fmt/format.h>
@@ -16,11 +17,15 @@ namespace Loader::Patches {
 
 namespace {
 
+bool IsSpace(char c) {
+	return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
 std::string_view Trim(std::string_view text) {
-	while (!text.empty() && Common::IsSpace(text.front())) {
+	while (!text.empty() && IsSpace(text.front())) {
 		text.remove_prefix(1);
 	}
-	while (!text.empty() && Common::IsSpace(text.back())) {
+	while (!text.empty() && IsSpace(text.back())) {
 		text.remove_suffix(1);
 	}
 	return text;
@@ -322,7 +327,7 @@ bool ParseHexBytes(std::string_view text, std::vector<uint8_t>* out) {
 	out->clear();
 	int high = -1;
 	for (const char c: text) {
-		if (Common::IsSpace(c)) {
+		if (IsSpace(c)) {
 			continue;
 		}
 		const int digit = HexDigit(c);
