@@ -160,7 +160,7 @@ public:
 	void RelocateAll();
 	void RelocateProgram(Program* program);
 
-	void  Execute(const std::filesystem::path& game_patch = {});
+	void  Execute();
 	int   StartModule(Program* program, size_t args, const void* argp, module_func_t func);
 	int   StopModule(Program* program, size_t args, const void* argp, module_func_t func);
 	void  StartAllModules();

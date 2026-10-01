@@ -368,6 +368,209 @@ void TestFrameCap() {
 	Check(image.text[0] == 0x90, "written at the required cap");
 }
 
+const char* const CHEAT_JSON = R"({
+  "name": "Astro's Playroom", "id": "PPSA01325", "version": "01.905.000", "process": "eboot.bin",
+  "mods": [
+    {"name": "Default on", "memory": [{"offset": "0x401002", "off": "1213", "on": "aabb"}]},
+    {"name": "Off", "enabled": false, "memory": [{"offset": "401000", "off": "10", "on": "90"}]},
+    {"name": "Bad bytes", "memory": [{"offset": "401000", "off": "10", "on": "9090"}]},
+    {"name": "Bad offset", "memory": [{"offset": "zz", "off": "10", "on": "90"}]},
+    {"memory": [{"offset": "401000", "off": "10", "on": "90"}]},
+    {"name": "Empty", "memory": []}
+  ]
+})";
+
+PatchFile ParseCheat(const std::string& json) {
+	PatchFile   file;
+	std::string error;
+	if (!ParseCheatJson(json, &file, &error)) {
+		std::fprintf(stderr, "PatchLoaderTests: cheat parse failed: %s\n", error.c_str());
+		std::abort();
+	}
+	return file;
+}
+
+void TestParseCheatJson() {
+	const auto file = ParseCheat(CHEAT_JSON);
+	Check(file.entries.size() == 6, "one entry per mod");
+
+	const auto& on = file.entries[0];
+	Check(on.error.empty(), "valid mod");
+	Check(on.title_ids == std::vector<std::string> {"PPSA01325"}, "id is the title id");
+	Check(on.title == "Astro's Playroom", "name is the title");
+	Check(on.app_version == "01.905.000" && on.app_elf == "eboot.bin", "version and process");
+	Check(on.name == "Default on", "mod name");
+	Check(on.enabled_by_default, "a mod without \"enabled\" is enabled");
+	Check(on.auto_image_base, "cheat entries have no stated image base");
+	Check(on.lines.size() == 1 && on.lines[0].address == 0x401002, "hex offset with 0x");
+	Check(on.lines[0].value == Bytes {0xaa, 0xbb}, "on is the value");
+	Check(on.lines[0].original == Bytes {0x12, 0x13}, "off is the original");
+
+	const auto& off = file.entries[1];
+	Check(off.error.empty() && !off.enabled_by_default, "\"enabled\": false");
+	Check(off.lines[0].address == 0x401000, "hex offset without 0x");
+
+	Check(file.entries[2].error == "write at 401000: off has 1 byte(s), on has 2",
+	      "off and on lengths differ");
+	Check(file.entries[3].error == "invalid offset \"zz\"", "invalid offset");
+	Check(file.entries[4].error == "missing name", "missing name");
+	Check(file.entries[5].error == "no \"memory\" writes", "empty memory list");
+
+	PatchFile   broken;
+	std::string error;
+	Check(!ParseCheatJson("{", &broken, &error) && !error.empty(), "malformed JSON");
+	Check(!ParseCheatJson(R"({"id": "X", "version": "1", "mods": []})", &broken, &error),
+	      "missing process");
+	Check(!ParseCheatJson(R"({"id": "X", "version": "1", "process": "e", "mods": {}})", &broken,
+	                      &error),
+	      "mods is not an array");
+}
+
+PatchEntry AutoEntry(std::vector<PatchLine> lines) {
+	auto entry            = Entry(std::move(lines));
+	entry.auto_image_base = true;
+	return entry;
+}
+
+void TestResolveImageBase() {
+	Image       image;
+	std::string reason;
+
+	// Written against an image loaded at 0x400000: text+2 is 0x401002.
+	const auto shifted = AutoEntry({Line(0x401002, {0xaa, 0xbb}, {0x12, 0x13}),
+	                                Line(0x404007, {0xcc}, {0xa7})});
+	const std::vector<const PatchEntry*> one {&shifted};
+	Check(ResolveImageBase(one, image.segments, &reason) == 0x400000, "anchor at a shifted base");
+
+	const auto rebased = Rebase(shifted, 0x400000);
+	Check(!rebased.auto_image_base, "rebased entry is module-relative");
+	Check(rebased.lines[0].address == 0x1002 && rebased.lines[1].address == 0x4007,
+	      "rebased addresses");
+	Image applied;
+	Check(ApplyPatch(shifted, applied.segments, {}).status == ApplyStatus::Rejected,
+	      "an unresolved entry is not applied");
+	Check(ApplyPatch(rebased, applied.segments, {}).status == ApplyStatus::Applied &&
+	          applied.text[2] == 0xaa && applied.data[7] == 0xcc,
+	      "the rebased entry applies");
+
+	// The anchor byte 0x11 occurs at text+1 and data+0 (after the writes below). The first
+	// candidate (text+1, base 0x7fff) puts the second line on 0x12 instead of 0x55; the second
+	// (data+0, base 0x5000) verifies both.
+	Image twice;
+	twice.data[0]   = 0x11;
+	twice.data[1]   = 0x55;
+	const auto pair = AutoEntry({Line(0x9000, {0x90}, {0x11}), Line(0x9001, {0x90}, {0x55})});
+	const std::vector<const PatchEntry*> pair_list {&pair};
+	Check(ResolveImageBase(pair_list, twice.segments, &reason) == 0x5000,
+	      "first candidate fails validation, the second is accepted");
+
+	// Zero-Original lines do not anchor; nothing else does either.
+	const auto zeros = AutoEntry({Line(0x9000, {0x90}, {0x00})});
+	const std::vector<const PatchEntry*> zero_list {&zeros};
+	Check(!ResolveImageBase(zero_list, image.segments, &reason).has_value() &&
+	          reason.find("no line has non-zero original") != std::string::npos,
+	      "no anchor: rejected");
+
+	const auto missing = AutoEntry({Line(0x9000, {0x90}, {0xee, 0xef})});
+	const std::vector<const PatchEntry*> missing_list {&missing};
+	Check(!ResolveImageBase(missing_list, image.segments, &reason).has_value() &&
+	          reason.find("not in the module") != std::string::npos,
+	      "anchor not found: rejected");
+
+	// One source: the base must suit every entry; an entry that verifies nowhere does not hide
+	// the others, and is rejected when applied.
+	const std::vector<const PatchEntry*> with_outdated {&missing, &shifted};
+	Check(ResolveImageBase(with_outdated, image.segments, &reason) == 0x400000,
+	      "the base verifying the most entries");
+	const auto outdated = Rebase(missing, 0x400000);
+	Check(ApplyPatch(outdated, image.segments, {}).status == ApplyStatus::Rejected,
+	      "the outdated entry is rejected at that base");
+
+	// The anchor must not imply a negative base.
+	const auto low = AutoEntry({Line(0x1001, {0x90}, {0x14})});
+	const std::vector<const PatchEntry*> low_list {&low};
+	Check(!ResolveImageBase(low_list, image.segments, &reason).has_value(), "negative base");
+}
+
+void TestCodeCaves() {
+	Image image;
+	// The module is loaded at 0x80000000 and maps 0x8000 bytes. A cave line 0x10 bytes below the
+	// module wraps around 2^64 in module-relative terms; one more crosses two pages above it.
+	constexpr uint64_t BASE  = 0x80000000;
+	constexpr uint64_t SIZE  = 0x8000;
+	const uint64_t     below = 0 - uint64_t {0x10};
+	auto entry = Entry({Line(below, {0xe9, 0x01}, {0x00, 0x00}),
+	                    Line(0xbffe, {0xc3, 0xc3, 0xc3, 0xc3}, Bytes(4, 0)),
+	                    Line(0x1000, {0xe9}, {0x10})});
+	const std::vector<const PatchEntry*> list {&entry};
+	const auto ranges = CaveRanges(list, BASE, SIZE);
+	Check(ranges.size() == 2, "two cave ranges");
+	Check(ranges[0].vaddr == 0x8000 && ranges[0].size == 2 * CAVE_PAGE_SIZE,
+	      "adjacent pages above the module are merged");
+	Check(ranges[1].vaddr == 0 - CAVE_PAGE_SIZE && ranges[1].size == CAVE_PAGE_SIZE,
+	      "the page below the module wraps around 2^64");
+
+	// Unaligned load address: pages are aligned in absolute terms.
+	// Loaded 0x1000 bytes higher: the upper line moves to BASE + 0xcffe..0xd001, one page at
+	// BASE + 0xc000; the lower one to BASE + 0xff0, in the page at BASE.
+	const auto shifted = CaveRanges(list, BASE + 0x1000, SIZE);
+	Check(shifted.size() == 2 && shifted[0].vaddr == 0xb000 &&
+	          shifted[0].size == CAVE_PAGE_SIZE && shifted[1].vaddr == 0 - uint64_t {0x1000},
+	      "pages aligned in absolute addresses");
+
+	// Lines inside the module are never caves, whatever their Original.
+	const auto inside = Entry({Line(0x4000, {0x90}, {0x00})});
+	const std::vector<const PatchEntry*> inside_list {&inside};
+	Check(CaveRanges(inside_list, BASE, SIZE).empty(), "zero Original inside the module");
+	const auto nonzero = Entry({Line(0x9000, {0x90}, {0x01})});
+	const std::vector<const PatchEntry*> nonzero_list {&nonzero};
+	Check(CaveRanges(nonzero_list, BASE, SIZE).empty(), "non-zero Original is not a cave");
+	const auto across = Entry({Line(0 - uint64_t {1}, {0x90, 0x90}, {0x00, 0x00})});
+	const std::vector<const PatchEntry*> across_list {&across};
+	Check(CaveRanges(across_list, BASE, SIZE).empty(), "a line wrapping into the module");
+
+	// The caller maps the ranges zero-filled and passes them as segments.
+	Bytes above(ranges[0].size, 0);
+	Bytes under(ranges[1].size, 0);
+	auto  segments = image.segments;
+	segments.push_back({ranges[0].vaddr, above});
+	segments.push_back({ranges[1].vaddr, under});
+	const auto result = ApplyPatch(entry, segments, {});
+	Check(result.status == ApplyStatus::Applied && result.bytes_written == 7, "cave lines applied");
+	Check(under[CAVE_PAGE_SIZE - 0x10] == 0xe9 && under[CAVE_PAGE_SIZE - 0xf] == 0x01,
+	      "cave below the module written");
+	Check(above[0x3ffe] == 0xc3 && above[0x4001] == 0xc3, "write across two cave pages");
+	Check(image.text[0] == 0xe9, "module line written");
+
+	// Cave bytes verify against their zero Original: applying again fails and writes nothing.
+	const auto pristine_above = above;
+	auto       again          = Entry({Line(0xbffe, {0x90}, {0x00}), Line(0x1001, {0x90}, {0x11})});
+	Check(ApplyPatch(again, segments, {}).status == ApplyStatus::Rejected &&
+	          above == pristine_above && image.text[1] == 0x11,
+	      "a used cave byte does not verify; nothing written");
+
+	// Without the cave segment the line is outside the module's file data.
+	Check(ApplyPatch(Entry({Line(0x9000, {0x90}, {0x00})}), image.segments, {}).status ==
+	          ApplyStatus::Rejected,
+	      "unmapped cave line rejected");
+}
+
+void TestZeroOriginalInModuleIsVerified() {
+	Image image;
+	image.text[4] = 0x00;
+	// The old cheat loader skipped zero-off lines; now they are verified like any other.
+	auto mismatch = Entry({Line(0x1000, {0x90}, {0x10}), Line(0x1005, {0x90}, {0x00})});
+	const auto result = ApplyPatch(mismatch, image.segments, {});
+	Check(result.status == ApplyStatus::Rejected &&
+	          result.reason.find("original bytes differ at +0x1005") != std::string::npos,
+	      "zero Original inside the module must match");
+	Check(image.text[0] == 0x10, "nothing written");
+	auto match = Entry({Line(0x1004, {0x90}, {0x00})});
+	Check(ApplyPatch(match, image.segments, {}).status == ApplyStatus::Applied &&
+	          image.text[4] == 0x90,
+	      "a matching zero Original applies");
+}
+
 } // namespace
 
 int main() {
@@ -380,6 +583,10 @@ int main() {
 	TestApplySuccess();
 	TestApplyIsAtomic();
 	TestFrameCap();
+	TestParseCheatJson();
+	TestResolveImageBase();
+	TestCodeCaves();
+	TestZeroOriginalInModuleIsVerified();
 	std::printf("PatchLoaderTests: all passed\n");
 	return 0;
 }

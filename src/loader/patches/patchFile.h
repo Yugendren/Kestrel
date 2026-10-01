@@ -22,12 +22,15 @@
 // writes anything: Line Original="<hex>" (the bytes the line replaces), Metadata
 // ElfXXH3="<hex>" (XXH3-64 of the module file on disk) and Metadata RequiresFrameCap="<fps>".
 //
+// The etaHEN/GoldHEN cheat JSON format (see ParseCheatJson()) is read into the same model.
+//
 // This part is pure (no emulator state), so it is unit-tested on its own.
 namespace Loader::Patches {
 
 // One write. `address` is module-relative, i.e. an ELF p_vaddr: the file's Address minus the
-// entry's ImageBase. `original` is empty when the file gives no Original attribute; otherwise it
-// has exactly the length of `value`.
+// entry's ImageBase -- except in an entry with auto_image_base, where it is the file's address
+// until the entry is rebased (see Rebase() in patchApplier.h). `original` is empty when the file
+// gives no Original attribute; otherwise it has exactly the length of `value`.
 struct PatchLine {
 	uint64_t             address = 0;
 	std::vector<uint8_t> value;
@@ -50,6 +53,13 @@ struct PatchEntry {
 	uint32_t required_frame_cap = 0;
 	// XXH3-64 of the module file the patch was made against.
 	std::optional<uint64_t> elf_xxh3;
+	// The line addresses are absolute addresses in an image loaded at a base the file does not
+	// state (cheat JSON). The base is found by locating the lines' Original bytes in the module
+	// (ResolveImageBase() in patchApplier.h); until then the entry cannot be applied.
+	bool                    auto_image_base = false;
+	// The file the entry was read from, set by the caller that reads it. Entries from one source
+	// are applied together: they share one resolved image base and their code caves.
+	std::string             source;
 	std::vector<PatchLine>  lines;
 	// Non-empty when the block is well-formed XML but cannot be applied (an unsupported line
 	// type, a value that does not fit its type, ...). The entry is kept rather than dropped so
@@ -65,6 +75,18 @@ struct PatchFile {
 // (malformed XML, no <Patch> root); problems inside one <Metadata> block land in that entry's
 // `error` and leave the other blocks usable.
 bool ParsePatchFile(std::string_view xml, PatchFile* out, std::string* error);
+
+// Parses an etaHEN/GoldHEN cheat file (the launcher's _Patches/<TITLE_ID>.json):
+//
+//   {"id": "PPSA01325", "version": "01.905.000", "process": "eboot.bin",
+//    "mods": [{"name": "...", "enabled": true,
+//              "memory": [{"offset": "1b4b8c0", "off": "c5fb...", "on": "c5fb..."}]}]}
+//
+// Each mod becomes one entry with auto_image_base set: title_ids {id}, app_version version,
+// app_elf process, enabled_by_default the mod's "enabled" (true when absent), and one line per
+// memory write at the hexadecimal "offset" with Value "on" and Original "off". Returns false only
+// when the text is not a cheat document; problems inside one mod land in that entry's `error`.
+bool ParseCheatJson(std::string_view json, PatchFile* out, std::string* error);
 
 // Encodes a <Line> Value of the given Type into the bytes written to guest memory:
 //   bytes                      hex string, spaces allowed

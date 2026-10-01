@@ -16,7 +16,6 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/elf.h"
-#include "loader/gamePatch.h"
 #include "loader/jit.h"
 #include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
@@ -1331,9 +1330,6 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
 	RelocateAll();
-	if (!GamePatch::ApplyPending(program)) {
-		EXIT("Failed to apply pending game cheat\n");
-	}
 }
 
 void RuntimeLinker::UnloadProgram(Program* program) {
@@ -1443,7 +1439,7 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
-void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
+void RuntimeLinker::Execute() {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
@@ -1463,13 +1459,6 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 	PreloadAdjacentPrograms();
 	RelocateAll();
-
-	if (!game_patch.empty()) {
-		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
-		                      m_programs)) {
-			EXIT("Failed to apply game cheat\n");
-		}
-	}
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -1492,7 +1481,6 @@ void RuntimeLinker::Clear() {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
 	Common::LockGuard lock(m_mutex);
-	GamePatch::Clear();
 	m_patches.Clear();
 
 	for (auto* p: m_programs) {

@@ -253,6 +253,69 @@ PatchEntry ParseEntry(const pugi::xml_node& metadata, const std::vector<std::str
 	return entry;
 }
 
+// A cheat file's "offset": hexadecimal, with or without a 0x prefix.
+bool ParseHexAddress(std::string_view text, uint64_t* out) {
+	text = Trim(text);
+	if (text.starts_with("0x") || text.starts_with("0X")) {
+		text.remove_prefix(2);
+	}
+	if (text.empty()) {
+		return false;
+	}
+	const auto [end, result] = std::from_chars(text.data(), text.data() + text.size(), *out, 16);
+	return result == std::errc {} && end == text.data() + text.size();
+}
+
+// The string value of `key` in a JSON object, trimmed; empty when absent or not a string.
+std::string JsonString(const nlohmann::json& object, const char* key) {
+	const auto value = object.find(key);
+	if (value == object.end() || !value->is_string()) {
+		return {};
+	}
+	return std::string(Trim(value->get_ref<const std::string&>()));
+}
+
+// Fills the name, enabled flag and lines of a cheat mod; returns the reason the mod cannot be
+// applied, or an empty string.
+std::string ParseCheatMod(const nlohmann::json& mod, PatchEntry* entry) {
+	entry->name = JsonString(mod, "name");
+	if (entry->name.empty()) {
+		return "missing name";
+	}
+	if (const auto enabled = mod.find("enabled"); enabled != mod.end()) {
+		if (!enabled->is_boolean()) {
+			return "\"enabled\" is not true or false";
+		}
+		entry->enabled_by_default = enabled->get<bool>();
+	}
+	const auto memory = mod.find("memory");
+	if (memory == mod.end() || !memory->is_array() || memory->empty()) {
+		return "no \"memory\" writes";
+	}
+	for (const auto& write: *memory) {
+		const auto offset = JsonString(write, "offset");
+		const auto off    = JsonString(write, "off");
+		const auto on     = JsonString(write, "on");
+
+		PatchLine line;
+		if (!ParseHexAddress(offset, &line.address)) {
+			return fmt::format("invalid offset \"{}\"", offset);
+		}
+		if (!ParseHexBytes(on, &line.value)) {
+			return fmt::format("write at {}: invalid on \"{}\"", offset, on);
+		}
+		if (!ParseHexBytes(off, &line.original)) {
+			return fmt::format("write at {}: invalid off \"{}\"", offset, off);
+		}
+		if (line.original.size() != line.value.size()) {
+			return fmt::format("write at {}: off has {} byte(s), on has {}", offset,
+			                   line.original.size(), line.value.size());
+		}
+		entry->lines.push_back(std::move(line));
+	}
+	return {};
+}
+
 } // namespace
 
 bool ParseHexBytes(std::string_view text, std::vector<uint8_t>* out) {
@@ -344,6 +407,31 @@ bool ParsePatchFile(std::string_view xml, PatchFile* out, std::string* error) {
 	out->entries.clear();
 	for (const auto& metadata: root.children("Metadata")) {
 		out->entries.push_back(ParseEntry(metadata, title_ids));
+	}
+	return true;
+}
+
+bool ParseCheatJson(std::string_view json, PatchFile* out, std::string* error) {
+	const auto root = nlohmann::json::parse(json.begin(), json.end(), nullptr, false);
+	const auto mods = root.is_object() ? root.find("mods") : root.end();
+	if (root.is_discarded() || !root.is_object() || JsonString(root, "id").empty() ||
+	    JsonString(root, "version").empty() || JsonString(root, "process").empty() ||
+	    mods == root.end() || !mods->is_array()) {
+		*error = "expected a cheat JSON object with \"id\", \"version\", \"process\" and a "
+		         "\"mods\" array";
+		return false;
+	}
+	out->entries.clear();
+	for (const auto& mod: *mods) {
+		PatchEntry entry;
+		entry.title_ids          = {JsonString(root, "id")};
+		entry.title              = JsonString(root, "name");
+		entry.app_version        = JsonString(root, "version");
+		entry.app_elf            = JsonString(root, "process");
+		entry.enabled_by_default = true;
+		entry.auto_image_base    = true;
+		entry.error              = ParseCheatMod(mod, &entry);
+		out->entries.push_back(std::move(entry));
 	}
 	return true;
 }

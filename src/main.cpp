@@ -72,7 +72,8 @@ static void PrintUsage() {
 	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
-	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
+	::printf("  --game-patch <json>                  etaHEN/GoldHEN cheat JSON (applied via the patch\n"
+	         "                                       loader); may be repeated.\n");
 	::printf("  --patch <name>                       Enable the game patch with this name; may be\n"
 	         "                                       repeated. See also <patches dir>/patches.json.\n");
 	::printf("  --patches <dir>                      Game patch directory (*.xml). Default: patches\n"
@@ -418,10 +419,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 		} else if (arg == "--game-patch") {
-			if (!options.game_patch.empty()) {
-				::printf("--game-patch can only be specified once\n");
-				return false;
-			}
 			value = Common::FixFilenameSlash(value);
 			const auto path = Common::PathFromUtf8(value);
 
@@ -429,7 +426,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("--game-patch must point to an existing file: %s\n", value.c_str());
 				return false;
 			}
-			options.game_patch = path;
+			options.config.patches.files.emplace_back(path);
 		} else if (arg == "--patch") {
 			if (value.empty()) {
 				::printf("--patch needs a patch name\n");

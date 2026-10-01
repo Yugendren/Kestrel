@@ -145,6 +145,10 @@ const std::vector<std::string>& GetEnabledPatches() {
 	return g_config->patches.enabled;
 }
 
+const std::vector<std::filesystem::path>& GetPatchFiles() {
+	return g_config->patches.files;
+}
+
 uint32_t GetConsoleLanguage() {
 	return g_config->console_language;
 }

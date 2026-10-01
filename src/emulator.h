@@ -12,7 +12,6 @@ struct RunOptions {
 	Config::ConfigOptions config;
 	std::filesystem::path app0_dir;
 	std::filesystem::path elf;
-	std::filesystem::path game_patch;
 };
 
 void Run(const RunOptions& options);

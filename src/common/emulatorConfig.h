@@ -79,8 +79,11 @@ struct GraphicsSettings {
 // listed in the directory's patches.json, or marked isEnabled="true" in its file.
 struct PatchSettings {
 	// Empty selects the "patches" directory next to the emulator executable.
-	std::filesystem::path    directory;
-	std::vector<std::string> enabled;
+	std::filesystem::path              directory;
+	std::vector<std::string>           enabled;
+	// etaHEN/GoldHEN cheat JSON files (--game-patch), read in addition to the directory. Their
+	// mods are enabled by the file's own "enabled" flags.
+	std::vector<std::filesystem::path> files;
 };
 
 // Where the vertex attribute and V# tables are decoded. Cpu: the command processor reads
@@ -169,6 +172,7 @@ inline uint32_t GetShadowMax() { return Detail::g_hot_values.shadow_max; }
 uint32_t GetFrameCap();
 std::filesystem::path           GetPatchDirectory();
 const std::vector<std::string>& GetEnabledPatches();
+const std::vector<std::filesystem::path>& GetPatchFiles();
 VertexFetchMode GetVertexFetchMode();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();

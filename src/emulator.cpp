@@ -172,14 +172,13 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
-static void Execute(const std::filesystem::path& game_patch) {
-	auto           patch_path = game_patch;
+static void Execute() {
 	Common::Thread guest_thread(
-	    [](void* param) {
+	    [](void* /*param*/) {
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
+		    rt->Execute();
 	    },
-	    &patch_path);
+	    nullptr);
 	Libs::Graphics::WindowRun();
 	std::quick_exit(0);
 }
@@ -222,7 +221,7 @@ void Run(const RunOptions& options) {
 
 	LoadElf(options.elf);
 
-	Execute(options.game_patch);
+	Execute();
 }
 
 } // namespace Emulator

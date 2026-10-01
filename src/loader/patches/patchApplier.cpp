@@ -46,6 +46,39 @@ std::span<uint8_t> FindTarget(std::span<const ImageSegment> image, uint64_t vadd
 	return {};
 }
 
+bool IsZero(std::span<const uint8_t> bytes) {
+	return std::all_of(bytes.begin(), bytes.end(), [](uint8_t byte) { return byte == 0; });
+}
+
+// Lines whose Original locates them in the module: present and not all zero.
+bool IsLocatable(const PatchLine& line) {
+	return !line.original.empty() && !IsZero(line.original);
+}
+
+const PatchLine* FindAnchor(const PatchEntry& entry) {
+	const auto anchor = std::find_if(entry.lines.begin(), entry.lines.end(), IsLocatable);
+	return anchor == entry.lines.end() ? nullptr : &*anchor;
+}
+
+// Whether every locatable line of `entry` finds its Original at `line.address - image_base`.
+bool VerifiesAt(const PatchEntry& entry, std::span<const ImageSegment> image, uint64_t image_base) {
+	return std::all_of(entry.lines.begin(), entry.lines.end(), [&](const PatchLine& line) {
+		if (!IsLocatable(line)) {
+			return true;
+		}
+		const auto target = FindTarget(image, line.address - image_base, line.original.size());
+		return !target.empty() &&
+		       std::equal(line.original.begin(), line.original.end(), target.begin());
+	});
+}
+
+bool IsCaveLine(const PatchLine& line, uint64_t module_size) {
+	// value is never empty, so `size - 1` cannot wrap; the second test keeps the line from
+	// wrapping around 2^64 into the module.
+	return !line.original.empty() && IsZero(line.original) && line.address >= module_size &&
+	       line.value.size() - 1 <= UINT64_MAX - line.address;
+}
+
 } // namespace
 
 bool IsForGame(const PatchEntry& entry, std::string_view title_id, std::string_view app_version) {
@@ -90,10 +123,112 @@ std::vector<std::string> PatchSelection::UnknownNames(std::span<const PatchEntry
 	return unknown;
 }
 
+std::optional<uint64_t> ResolveImageBase(std::span<const PatchEntry* const> entries,
+                                         std::span<const ImageSegment>     image,
+                                         std::string*                      reason) {
+	std::vector<const PatchEntry*> located;
+	for (const auto* entry: entries) {
+		if (entry->error.empty() && FindAnchor(*entry) != nullptr) {
+			located.push_back(entry);
+		}
+	}
+	if (located.empty()) {
+		*reason = "no line has non-zero original bytes to locate the image base with";
+		return std::nullopt;
+	}
+
+	std::optional<uint64_t> best;
+	size_t                  best_count = 0;
+	for (const auto* anchor_entry: located) {
+		const auto& anchor = *FindAnchor(*anchor_entry);
+		const auto& needle = anchor.original;
+		for (const auto& segment: image) {
+			const auto begin = segment.bytes.begin();
+			const auto end   = segment.bytes.end();
+			for (auto found = std::search(begin, end, needle.begin(), needle.end()); found != end;
+			     found      = std::search(found + 1, end, needle.begin(), needle.end())) {
+				const uint64_t vaddr = segment.vaddr + static_cast<uint64_t>(found - begin);
+				// The anchor's file address is at least its module-relative one: a base is never
+				// negative.
+				if (anchor.address < vaddr) {
+					continue;
+				}
+				const uint64_t image_base = anchor.address - vaddr;
+				const auto     verifies   = [&](const PatchEntry* entry) {
+					return VerifiesAt(*entry, image, image_base);
+				};
+				const auto count =
+				    static_cast<size_t>(std::count_if(located.begin(), located.end(), verifies));
+				if (count == located.size()) {
+					return image_base;
+				}
+				if (count > best_count) {
+					best       = image_base;
+					best_count = count;
+				}
+			}
+		}
+	}
+	if (!best.has_value()) {
+		*reason = "the original bytes are not in the module at any image base";
+	}
+	return best;
+}
+
+PatchEntry Rebase(const PatchEntry& entry, uint64_t image_base) {
+	PatchEntry rebased      = entry;
+	rebased.auto_image_base = false;
+	for (auto& line: rebased.lines) {
+		line.address -= image_base;
+	}
+	return rebased;
+}
+
+std::vector<AddressRange> CaveRanges(std::span<const PatchEntry* const> entries,
+                                     uint64_t module_base, uint64_t module_size) {
+	// Pages are aligned in absolute addresses, then expressed module-relative again; both
+	// conversions are modulo 2^64.
+	std::vector<uint64_t> pages;
+	for (const auto* entry: entries) {
+		if (!entry->error.empty() || entry->auto_image_base) {
+			continue;
+		}
+		for (const auto& line: entry->lines) {
+			if (!IsCaveLine(line, module_size)) {
+				continue;
+			}
+			const uint64_t first = (module_base + line.address) & ~(CAVE_PAGE_SIZE - 1);
+			const uint64_t last =
+			    (module_base + line.address + (line.value.size() - 1)) & ~(CAVE_PAGE_SIZE - 1);
+			for (uint64_t page = first;; page += CAVE_PAGE_SIZE) {
+				pages.push_back(page - module_base);
+				if (page == last) {
+					break;
+				}
+			}
+		}
+	}
+	std::sort(pages.begin(), pages.end());
+	pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+
+	std::vector<AddressRange> ranges;
+	for (const auto page: pages) {
+		if (!ranges.empty() && ranges.back().vaddr + ranges.back().size == page) {
+			ranges.back().size += CAVE_PAGE_SIZE;
+		} else {
+			ranges.push_back({page, CAVE_PAGE_SIZE});
+		}
+	}
+	return ranges;
+}
+
 ApplyResult ApplyPatch(const PatchEntry& entry, std::span<const ImageSegment> image,
                        const ApplyOptions& options) {
 	if (!entry.error.empty()) {
 		return Rejected("invalid patch: " + entry.error);
+	}
+	if (entry.auto_image_base) {
+		return Rejected("the image base is not resolved");
 	}
 	if (entry.required_frame_cap != 0 && entry.required_frame_cap != options.frame_cap) {
 		ApplyResult result;

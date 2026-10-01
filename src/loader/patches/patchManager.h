@@ -5,7 +5,10 @@
 #include "loader/patches/patchApplier.h"
 #include "loader/patches/patchFile.h"
 
+#include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Loader {
@@ -14,10 +17,23 @@ struct Program;
 
 namespace Patches {
 
+// Frees the guest pages of a code cave.
+struct CodeCaveDeleter {
+	uint64_t size = 0;
+	void     operator()(uint8_t* pages) const;
+};
+
+// Guest pages mapped at a fixed address for the cave lines of a patch (see CaveRanges()). Owning:
+// the pages are unmapped when it is destroyed.
+using CodeCave = std::unique_ptr<uint8_t, CodeCaveDeleter>;
+
 // Applies the enabled game patches to modules as the runtime linker loads them. The patch
-// directory (Config::GetPatchDirectory(): every *.xml plus patches.json) is read on the first
-// module load, when the configuration and the game's param.json are known. Every decision is
-// reported on one "[patch]" line. When no patch is enabled for a module nothing is written.
+// sources are read on the first module load, when the configuration and the game's param.json
+// are known: the patch directory (Config::GetPatchDirectory(): every *.xml plus patches.json) and
+// the cheat JSON files given with --game-patch (Config::GetPatchFiles(), whose mods are enabled by
+// the file itself). Every decision is reported on one "[patch]" line. When no patch is enabled
+// for a module nothing is written. A patch that fails is reported and skipped; the game runs
+// without it.
 //
 // Not thread-safe: the runtime linker calls it under its own lock.
 class PatchManager {
@@ -41,7 +57,7 @@ public:
 	// fills in, which is an error in the patch.
 	void CheckAfterRelocation(const Program& program, const std::vector<uint8_t>& before) const;
 
-	// Drops the records of an unloaded module.
+	// Drops the records of an unloaded module and frees its code caves.
 	void ForgetModule(const Program& program);
 
 	void Clear();
@@ -54,14 +70,27 @@ private:
 		uint64_t       size  = 0;
 	};
 
-	void LoadPatchDirectory();
+	struct ModuleCave {
+		const Program* program = nullptr;
+		CodeCave       pages;
+	};
 
-	bool                      m_directory_loaded = false;
+	void LoadPatchSources();
+	// Applies the selected entries of one source to `program`: resolves their image base when
+	// the source does not state it, maps their code caves and applies each entry. Caves no
+	// applied entry wrote to are freed again.
+	void ApplySource(const Program& program, std::string_view module_name,
+	                 std::span<const PatchEntry* const> entries,
+	                 std::span<const ImageSegment>      file_image);
+
+	bool                      m_sources_loaded = false;
 	std::string               m_title_id;
 	std::string               m_app_version;
+	// Entries of one source are contiguous, in the order the sources were read.
 	std::vector<PatchEntry>   m_entries;
 	PatchSelection            m_selection;
 	std::vector<AppliedWrite> m_writes;
+	std::vector<ModuleCave>   m_caves;
 };
 
 } // namespace Patches
