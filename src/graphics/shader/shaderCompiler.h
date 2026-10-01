@@ -44,6 +44,10 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<u
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
+// False when PrepareProgram(VertexShaderInfo) would EXIT because the merged (NGG) GS assembly is
+// unsupported; true for any non-merged stage. Check before preparing a draw so it can be skipped.
+bool ShaderMergedGsAssemblySupported(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                     const HW::UserConfig& user_config);
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info);

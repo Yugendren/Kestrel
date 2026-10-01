@@ -984,6 +984,58 @@ static void ShaderSetNggBackUserData(const HW::VertexShaderInfo& regs, ShaderPar
 	params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
 }
 
+namespace {
+
+// The merged (NGG) GS assembly numbers derived from the registers; shared by PrepareVertexProgram()
+// and ShaderMergedGsAssemblySupported() so the draw-entry check cannot drift from what the
+// preparation enforces.
+struct MergedGsAssembly {
+	bool     components_supported = false;
+	bool     shape_supported      = false;
+	uint32_t max_primitives       = 0;
+	uint32_t primitives_per_group = 0;
+
+	[[nodiscard]] bool Supported() const {
+		return components_supported && shape_supported && primitives_per_group != 0u;
+	}
+};
+
+MergedGsAssembly AnalyzeMergedGsAssembly(const HW::VertexShaderInfo& regs,
+                                         const HW::Context&          context,
+                                         const HW::UserConfig&       user_config) {
+	const auto&         sh    = context.GetShaderRegisters();
+	const auto&         group = user_config.GetGeControl();
+	ShaderMeshInputInfo mesh;
+	mesh.input_primitive = static_cast<uint32_t>(user_config.GetPrimType());
+	mesh.max_vertices    = sh.m_geMaxOutputPerSubgroup;
+
+	MergedGsAssembly out;
+	out.components_supported = regs.gs_regs.rsrc1.gs_vgpr_component_count == 3u &&
+	                           regs.gs_regs.rsrc2.es_vgpr_component_count == 3u;
+	const auto prim = user_config.GetPrimType();
+	out.shape_supported =
+	    (prim == Prospero::PrimitiveType::kPointList || prim == Prospero::PrimitiveType::kLineList ||
+	     prim == Prospero::PrimitiveType::kTriFan || prim == Prospero::PrimitiveType::kTriStrip ||
+	     prim == Prospero::PrimitiveType::kTriList) &&
+	    sh.m_vgtGsOutPrimType == 2u && sh.m_vgtGsMaxVertOut >= 3u &&
+	    group.vertex_group_size >= mesh.InputPrimitiveSize() && mesh.max_vertices != 0u;
+	if (out.shape_supported) {
+		out.max_primitives       = group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
+		out.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
+		                                     mesh.InputPrimitiveCount(group.vertex_group_size),
+		                                     mesh.max_vertices / sh.m_vgtGsMaxVertOut});
+	}
+	return out;
+}
+
+} // namespace
+
+bool ShaderMergedGsAssemblySupported(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                     const HW::UserConfig& user_config) {
+	return (context.GetShaderStages() & 0x20u) == 0 ||
+	       AnalyzeMergedGsAssembly(regs, context, user_config).Supported();
+}
+
 static ShaderParams PrepareVertexProgram(const HW::VertexShaderInfo& regs,
                                          const HW::Context&          context,
                                          const HW::UserConfig&       user_config,
@@ -1028,25 +1080,16 @@ static ShaderParams PrepareVertexProgram(const HW::VertexShaderInfo& regs,
 		params.hash = XXH3_64bits(hashes, sizeof(hashes));
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
-	EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
-	                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
+	const auto assembly = AnalyzeMergedGsAssembly(regs, context, user_config);
+	EXIT_NOT_IMPLEMENTED(!assembly.components_supported);
 	const auto& group = user_config.GetGeControl();
-	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
-	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
-	    sh.m_vgtGsOutPrimType != 2u || sh.m_vgtGsMaxVertOut < 3u ||
-	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
-	    mesh.max_vertices == 0u) {
+	if (!assembly.shape_supported) {
 		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
 		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
 		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
 	}
-	mesh.max_primitives       = group.primitive_group_size * (sh.m_vgtGsMaxVertOut - 2u);
-	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
-	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
-	                                      mesh.max_vertices / sh.m_vgtGsMaxVertOut});
+	mesh.max_primitives       = assembly.max_primitives;
+	mesh.primitives_per_group = assembly.primitives_per_group;
 	EXIT_IF(mesh.primitives_per_group == 0u);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
 	mesh.threads_num[0] =

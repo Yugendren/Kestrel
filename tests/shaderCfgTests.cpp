@@ -9811,6 +9811,21 @@ void TestMergedShaderUserDataSnapshot() {
   Check(fan_input.mesh.primitives_per_group == 30 && fan_input.mesh.vertices_per_group == 32 &&
             fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 192,
         "captured triangle-fan GS configuration lost its subgroup assembly limits");
+  Check(ShaderMergedGsAssemblySupported(regs, context, user_config),
+        "captured triangle-fan GS configuration was rejected as an unsupported assembly");
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kLineStrip);
+  Check(!ShaderMergedGsAssemblySupported(regs, context, user_config),
+        "line-strip merged GS input was accepted");
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kRectList);
+  Check(!ShaderMergedGsAssemblySupported(regs, context, user_config),
+        "rect-list merged GS input was accepted");
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriFan);
+  context.SetGsMaxVertOut(300);
+  Check(!ShaderMergedGsAssemblySupported(regs, context, user_config),
+        "merged GS output larger than the subgroup output limit was accepted");
+  context.SetShaderStages(0);
+  Check(ShaderMergedGsAssemblySupported(regs, context, user_config),
+        "a stage that is not merged was rejected by the merged GS assembly check");
 }
 
 void TestEmbeddedFetchPreservesSharedScalarLoad() {

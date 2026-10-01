@@ -46,6 +46,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
@@ -564,6 +565,35 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
 	return vs.es_regs.data_addr != 0;
+}
+
+// Merged GS assemblies the shader preparation cannot build are skipped, not fatal. Warns once per
+// distinct configuration.
+static bool DrawHasSupportedMergedGs(CommandBuffer& buffer) {
+	const auto& vs  = buffer.GetShaders().GetVs();
+	const auto& ctx = buffer.GetRegisters();
+	const auto& ucfg = buffer.GetUserConfig();
+	if (ShaderMergedGsAssemblySupported(vs, ctx, ucfg)) {
+		return true;
+	}
+	const auto&    sh    = ctx.GetShaderRegisters();
+	const auto&    group = ucfg.GetGeControl();
+	const std::array<uint32_t, 6> key {static_cast<uint32_t>(ucfg.GetPrimType()),
+	                                   sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
+	                                   group.primitive_group_size, group.vertex_group_size,
+	                                   sh.m_geMaxOutputPerSubgroup};
+	static std::mutex                    mutex;
+	static std::set<std::array<uint32_t, 6>> warned;
+	{
+		std::lock_guard lock(mutex);
+		if (!warned.insert(key).second) {
+			return false;
+		}
+	}
+	std::printf("warning: skipping draws with unsupported merged GS assembly: input=%u output=%u "
+	            "vertices=%u GE=%u/%u max_output=%u\n",
+	            key[0], key[1], key[2], key[3], key[4], key[5]);
+	return false;
 }
 
 static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
@@ -2519,6 +2549,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		VerifyDrawEntrySkip(registers_kept, "no valid vertex shader");
 		return true;
 	}
+	if (entry_checks && !DrawHasSupportedMergedGs(buffer)) {
+		VerifyDrawEntrySkip(registers_kept, "unsupported merged GS assembly");
+		return true;
+	}
 
 	if (graphics_debug_dump_enabled()) {
 		LOGF("GraphicsRenderDrawIndex():Shader:\n");
@@ -2653,6 +2687,10 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	if (entry_checks && !DrawHasValidVertexShader(sh_ctx)) {
 		VerifyDrawEntrySkip(registers_kept, "no valid vertex shader");
+		return true;
+	}
+	if (entry_checks && !DrawHasSupportedMergedGs(buffer)) {
+		VerifyDrawEntrySkip(registers_kept, "unsupported merged GS assembly");
 		return true;
 	}
 
