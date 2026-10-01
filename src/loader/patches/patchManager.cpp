@@ -70,16 +70,37 @@ std::optional<uint64_t> HashFile(const std::filesystem::path& path) {
 	return XXH3_64bits_digest(state.get());
 }
 
-// The file-backed bytes of every segment the loader copied from the module file.
+// The file-backed bytes of every segment the loader copied from the module file, plus the tail
+// code cave of each executable one. The loader maps the whole module as one zero-filled block and
+// then protects each segment over [p_vaddr, p_vaddr + AlignUp(p_memsz, p_align)); the tail is cut
+// off at that protected end and at the start of any later segment, so it is mapped and becomes
+// executable together with the segment, and the red-zone patcher (which only scans p_filesz) and
+// relocation do not touch it.
 std::vector<ImageSegment> FileImage(const Program& program) {
 	std::vector<ImageSegment> image;
 	const auto*               ehdr = program.elf->GetEhdr();
 	const auto*               phdr = program.elf->GetPhdr();
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
-		if (IsMappedSegment(phdr[i]) && phdr[i].p_filesz != 0) {
-			auto* bytes = reinterpret_cast<uint8_t*>(program.base_vaddr + phdr[i].p_vaddr);
-			image.push_back({phdr[i].p_vaddr, {bytes, phdr[i].p_filesz}});
+		if (!IsMappedSegment(phdr[i]) || phdr[i].p_filesz == 0) {
+			continue;
 		}
+		auto*        bytes = reinterpret_cast<uint8_t*>(program.base_vaddr + phdr[i].p_vaddr);
+		ImageSegment segment {phdr[i].p_vaddr, {bytes, phdr[i].p_filesz}, {}};
+		if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X) != 0) {
+			const uint64_t align = phdr[i].p_align;
+			uint64_t       limit =
+			    phdr[i].p_vaddr +
+			    (align != 0 ? (phdr[i].p_memsz + (align - 1)) & ~(align - 1) : phdr[i].p_memsz);
+			for (Elf64_Half j = 0; j < ehdr->e_phnum; j++) {
+				if (IsMappedSegment(phdr[j]) && phdr[j].p_vaddr > phdr[i].p_vaddr) {
+					limit = std::min<uint64_t>(limit, phdr[j].p_vaddr);
+				}
+			}
+			const auto size =
+			    SegmentTailSize(phdr[i].p_vaddr, phdr[i].p_filesz, phdr[i].p_memsz, limit);
+			segment.tail = {bytes + phdr[i].p_filesz, size};
+		}
+		image.push_back(segment);
 	}
 	return image;
 }

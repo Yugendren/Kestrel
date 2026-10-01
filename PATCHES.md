@@ -97,6 +97,16 @@ are code caves: the pages are mapped zero-filled at those addresses and freed wi
   with `ElfXXH3`. A patch is atomic: every line is checked (inside one segment's file data, no
   overlapping lines, original bytes match) before any byte is written; on any failure nothing is
   written and the reason is logged.
+- **Segment tail code caves.** Besides a segment's file data, a `bytes` line may lie entirely in
+  the zero-filled tail of an executable `PT_LOAD` segment: from `p_vaddr + p_filesz` up to
+  `AlignUp(p_vaddr + p_memsz, 0x4000)` (the guest page the loader maps with), cut off at the start
+  of the next segment and at the end of the range the loader protects for this segment. Such a line
+  must have an `Original` that is all zero (a pin with `ElfXXH3` does not replace it), and the
+  zeros are verified against the live memory like any other `Original`. The tail is part of the
+  module's single mapping and receives the segment's executable protection, the red-zone patcher
+  only scans `p_filesz` and relocation does not target it, so code placed there is ordinary
+  executable guest code; a line that starts in file data and runs into the tail is rejected. The
+  atomic all-or-nothing rule applies unchanged.
 - **Exact version.** `TitleID` + `AppVer` + `AppElf` (+ `ElfXXH3`) must all match; a patch for
   another version is never applied.
 - **Load order.** Patches are applied to the module's pristine file bytes right after its
@@ -121,3 +131,4 @@ are code caves: the pages are mapped zero-filled at those addresses and freed wi
 | File | Game | Version | Patch | Requires |
 |---|---|---|---|---|
 | `patches/PPSA01325.xml` | Astro's Playroom | 01.905.000 | `Astro's Playroom - correct speed at 30 fps`: the engine steps a fixed 1/60 s per presented frame (`SetFrameRate(double fps)` at 0x1b4b8c0). The patch makes the setter use fps x 0.5 and sets the static initial values to 30.0 / 1/30 / 33333 us, so each frame advances 1/30 s. | `--frame-cap 30` |
+| `patches/PPSA01342.xml` | Demon's Souls | 01.005.000 | `Demon's Souls - job workers sleep instead of spinning` (off unless enabled): the 13 BPE job threads busy-poll for work; the poll call at +0x820f3b is routed through a code cave in the text segment's zero tail (+0x1f04600) that calls the poll and, when it returns false, `sceKernelUsleep(100)` through the game's own import slot. | |

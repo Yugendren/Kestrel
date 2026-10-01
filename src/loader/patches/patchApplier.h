@@ -60,10 +60,15 @@ private:
 
 // The file-backed part of one loaded segment: module-relative p_vaddr and the p_filesz bytes
 // in memory. Patches only touch file bytes; the zero-filled tail of a segment is not part of the
-// file a patch was made against. A code cave (see CaveRanges()) is passed as one more segment.
+// file a patch was made against, except for the segment tail code cave below. A code cave (see
+// CaveRanges()) is passed as one more segment.
 struct ImageSegment {
 	uint64_t           vaddr = 0;
 	std::span<uint8_t> bytes;
+	// Segment tail code cave: the zero-filled memory that directly follows `bytes` (p_filesz up
+	// to the end of the segment's mapped guest pages, see SegmentTailSize()). Empty unless the
+	// segment is executable. Only a line whose Original is all zero may lie in it.
+	std::span<uint8_t> tail;
 };
 
 // A module-relative address range.
@@ -74,6 +79,12 @@ struct AddressRange {
 
 // Code caves are allocated in whole guest pages of this size.
 constexpr uint64_t CAVE_PAGE_SIZE = 0x4000;
+
+// Size of the tail code cave of an executable PT_LOAD segment: from vaddr + filesz up to
+// AlignUp(vaddr + memsz, CAVE_PAGE_SIZE), but never beyond `limit`, the module-relative address
+// where the next segment starts or where the loader's protection of this segment ends, whichever
+// is lower. 0 when the segment has no room left.
+uint64_t SegmentTailSize(uint64_t vaddr, uint64_t filesz, uint64_t memsz, uint64_t limit);
 
 // Finds the image base the auto_image_base entries of one source were written against, so that
 // the module-relative address of a line is its address minus the base (see Rebase()).

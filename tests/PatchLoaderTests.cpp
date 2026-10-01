@@ -573,6 +573,72 @@ void TestZeroOriginalInModuleIsVerified() {
 
 } // namespace
 
+void TestSegmentTailCodeCave() {
+	// Text at 0x1000: 16 file bytes, memsz 0x20 -> the tail runs to the page end 0x4000 (0x3ff0
+	// bytes after the file bytes), but the next segment starts at 0x2000.
+	Check(SegmentTailSize(0x1000, 16, 0x20, UINT64_MAX) == 0x4000 - 0x1010, "tail ends at the page");
+	Check(SegmentTailSize(0x1000, 16, 0x20, 0x2000) == 0x2000 - 0x1010, "tail stops at next segment");
+	Check(SegmentTailSize(0x0, 0x3ff0, 0x3ff0, UINT64_MAX) == 0x10, "short of the page end");
+	Check(SegmentTailSize(0x0, 0x4000, 0x4000, UINT64_MAX) == 0, "no tail when memsz fills pages");
+	Check(SegmentTailSize(0x0, 0x2000, 0x2800, UINT64_MAX) == 0x2000, "memsz past filesz");
+	Check(SegmentTailSize(0x0, 0x3000, 0x3000, 0x3000) == 0, "no room before the limit");
+
+	// Same module as Image, with a 0x20 byte tail (the page end) after the text.
+	Bytes tail(0x20, 0);
+
+	// Executable segment: accepted, written into the tail.
+	{
+		Image image;
+		image.segments[0].tail = {tail.data(), tail.size()};
+		auto entry = Entry({Line(0x1010, {0x48, 0x31, 0xc0, 0xc3}, {0, 0, 0, 0}),
+		                    Line(0x1000, {0x90}, {0x10})});
+		const auto result = ApplyPatch(entry, image.segments, {});
+		Check(result.status == ApplyStatus::Applied && result.bytes_written == 5, "tail accepted");
+		Check(tail[0] == 0x48 && tail[3] == 0xc3 && tail[4] == 0, "tail bytes written");
+		Check(image.text[0] == 0x90, "file line applied with it");
+		std::fill(tail.begin(), tail.end(), uint8_t {0});
+
+		// Last bytes of the tail are usable, one past the end is not.
+		auto last = Entry({Line(0x1010 + 0x1c, {1, 2, 3, 4}, {0, 0, 0, 0})});
+		Check(ApplyPatch(last, image.segments, {}).status == ApplyStatus::Applied, "tail end ok");
+		std::fill(tail.begin(), tail.end(), uint8_t {0});
+		auto past = Entry({Line(0x1010 + 0x1d, {1, 2, 3, 4}, {0, 0, 0, 0})});
+		Check(ApplyPatch(past, image.segments, {}).status == ApplyStatus::Rejected,
+		      "past the page end rejected");
+		auto crossing = Entry({Line(0x100e, {1, 2, 3, 4}, {0x1e, 0x1f, 0, 0})});
+		Check(ApplyPatch(crossing, image.segments, {}).status == ApplyStatus::Rejected,
+		      "a line from file bytes into the tail is rejected");
+		Check(std::all_of(tail.begin(), tail.end(), [](uint8_t b) { return b == 0; }),
+		      "rejected tail lines write nothing");
+
+		// Original must be present and all zero.
+		auto nonzero = Entry({Line(0x1010, {1}, {0x01})});
+		const auto nonzero_result = ApplyPatch(nonzero, image.segments, {});
+		Check(nonzero_result.status == ApplyStatus::Rejected &&
+		          nonzero_result.reason.find("not all zero") != std::string::npos,
+		      "non-zero Original rejected");
+		auto none = Entry({Line(0x1010, {1})});
+		Check(ApplyPatch(none, image.segments, {}).status == ApplyStatus::Rejected,
+		      "tail line without Original rejected");
+		ApplyOptions pinned;
+		pinned.file_hash_verified = true;
+		Check(ApplyPatch(none, image.segments, pinned).status == ApplyStatus::Rejected,
+		      "an ElfXXH3 pin does not excuse a tail line without Original");
+		auto atomic = Entry({Line(0x1010, {1}, {0}), Line(0x1000, {0x90}, {0x00})});
+		Check(ApplyPatch(atomic, image.segments, {}).status == ApplyStatus::Rejected &&
+		          tail[0] == 0,
+		      "all-or-nothing with a bad file line");
+	}
+
+	// Non-executable segment (no tail): rejected.
+	{
+		Image image;
+		auto  entry = Entry({Line(0x1010, {0x90}, {0x00})});
+		Check(ApplyPatch(entry, image.segments, {}).status == ApplyStatus::Rejected,
+		      "tail of a non-executable segment rejected");
+	}
+}
+
 int main() {
 	TestParse();
 	TestParseEntryErrors();
@@ -587,6 +653,7 @@ int main() {
 	TestResolveImageBase();
 	TestCodeCaves();
 	TestZeroOriginalInModuleIsVerified();
+	TestSegmentTailCodeCave();
 	std::printf("PatchLoaderTests: all passed\n");
 	return 0;
 }

@@ -46,6 +46,21 @@ std::span<uint8_t> FindTarget(std::span<const ImageSegment> image, uint64_t vadd
 	return {};
 }
 
+// The tail code cave holding [vaddr, vaddr + size), or an empty span.
+std::span<uint8_t> FindTail(std::span<const ImageSegment> image, uint64_t vaddr, uint64_t size) {
+	for (const auto& segment: image) {
+		const uint64_t start = segment.vaddr + segment.bytes.size();
+		if (vaddr < start) {
+			continue;
+		}
+		const uint64_t offset = vaddr - start;
+		if (offset <= segment.tail.size() && size <= segment.tail.size() - offset) {
+			return segment.tail.subspan(offset, size);
+		}
+	}
+	return {};
+}
+
 bool IsZero(std::span<const uint8_t> bytes) {
 	return std::all_of(bytes.begin(), bytes.end(), [](uint8_t byte) { return byte == 0; });
 }
@@ -175,6 +190,16 @@ std::optional<uint64_t> ResolveImageBase(std::span<const PatchEntry* const> entr
 	return best;
 }
 
+uint64_t SegmentTailSize(uint64_t vaddr, uint64_t filesz, uint64_t memsz, uint64_t limit) {
+	if (memsz > UINT64_MAX - vaddr - (CAVE_PAGE_SIZE - 1)) {
+		return 0;
+	}
+	const uint64_t start = vaddr + filesz;
+	const uint64_t end   = std::min((vaddr + memsz + (CAVE_PAGE_SIZE - 1)) & ~(CAVE_PAGE_SIZE - 1),
+	                                limit);
+	return end > start ? end - start : 0;
+}
+
 PatchEntry Rebase(const PatchEntry& entry, uint64_t image_base) {
 	PatchEntry rebased      = entry;
 	rebased.auto_image_base = false;
@@ -258,7 +283,15 @@ ApplyResult ApplyPatch(const PatchEntry& entry, std::span<const ImageSegment> im
 	std::vector<std::span<uint8_t>> targets;
 	targets.reserve(lines.size());
 	for (const auto& line: lines) {
-		const auto target = FindTarget(image, line.address, line.value.size());
+		auto target = FindTarget(image, line.address, line.value.size());
+		if (target.empty()) {
+			target = FindTail(image, line.address, line.value.size());
+			if (!target.empty() && (line.original.empty() || !IsZero(line.original))) {
+				return Rejected(fmt::format("line at +0x{:x} lies in a segment tail code cave and "
+				                            "its Original is not all zero",
+				                            line.address));
+			}
+		}
 		if (target.empty()) {
 			return Rejected(fmt::format("+0x{:x} ({} bytes) is outside the module's file data",
 			                            line.address, line.value.size()));
