@@ -248,6 +248,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
 	"${KYTY_SOURCE_DIR}/loader/*.h"
+	"${KYTY_SOURCE_DIR}/loader/patches/*.cpp"
+	"${KYTY_SOURCE_DIR}/loader/patches/*.h"
 )
 
 find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
@@ -370,7 +372,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak pugixml::pugixml)
 
 # Linux system libraries.
 if(LINUX)
@@ -450,6 +452,16 @@ add_executable(frame_pacer_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FramePacerTests.cpp"
 )
 target_include_directories(frame_pacer_tests PRIVATE ${inc_headers})
+
+# The patch file parser, matcher and verify-then-write applier (loader/patches/patchFile.cpp,
+# patchApplier.cpp) are pure; the emulator glue lives in patchManager.cpp.
+add_executable(patch_loader_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PatchLoaderTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/patches/patchApplier.cpp"
+	"${KYTY_SOURCE_DIR}/loader/patches/patchFile.cpp"
+)
+target_link_libraries(patch_loader_tests common fmt::fmt nlohmann_json::nlohmann_json pugixml::pugixml)
+target_include_directories(patch_loader_tests PRIVATE ${inc_headers})
 
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"

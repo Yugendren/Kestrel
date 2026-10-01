@@ -26,7 +26,19 @@ FetchContent_Declare(
 	GIT_SHALLOW FALSE
 )
 
-FetchContent_MakeAvailable(xbyak zydis)
+# XML parser for game patch files (src/loader/patches). The emulator builds without
+# exceptions, and patch files never need XPath.
+set(PUGIXML_NO_EXCEPTIONS ON CACHE BOOL "" FORCE)
+set(PUGIXML_NO_XPATH ON CACHE BOOL "" FORCE)
+set(PUGIXML_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	pugixml
+	GIT_REPOSITORY https://github.com/zeux/pugixml.git
+	GIT_TAG v1.14
+	GIT_SHALLOW TRUE
+)
+
+FetchContent_MakeAvailable(xbyak zydis pugixml)
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL3)
