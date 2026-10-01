@@ -98,6 +98,18 @@ Presets:
 
 Demon's Souls presets turn on red-zone protection. All presets turn ray tracing off.
 
+The Astro's Playroom presets also enable the game-speed patch ("Astro's Playroom - correct
+speed at 30 fps") and a 30 fps frame cap (`game_speed_patch = on`, `patch_frame_cap = 30`).
+The launcher passes `--patch "<name>" --frame-cap 30` when your build supports `--patch`. To
+turn it off, add this to `kestrel.local.ini`:
+
+```ini
+[speed]
+game_speed_patch = off
+```
+
+See [PATCHES.md](../PATCHES.md) for the patch loader itself.
+
 Minimal `kestrel.local.ini` for Astro's Playroom on an RTX 5090 (Windows):
 
 ```ini
@@ -161,8 +173,10 @@ Coming soon: a performance overlay, toggled with F10. It shows:
 To start with the overlay shown, set `overlay = on` under `[debug]`. If your build lacks the
 overlay, the launcher says so and the window title shows fps instead.
 
-Astro's Playroom runs in slow motion below 60 fps. The game's speed is tied to its frame rate.
-A fix is in progress. See the [status page](STATUS.md).
+Astro's Playroom runs in slow motion below 60 fps, because the game's speed is tied to its
+frame rate. The `astro-low` and `astro-high` presets enable the game-speed patch with a 30 fps
+cap, which gives correct speed at 30 fps (see section 4 to turn it off). Correct speed at any
+frame rate is in testing. See the [status page](STATUS.md).
 
 ## 8. First-run shader stutter
 
