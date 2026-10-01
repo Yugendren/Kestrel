@@ -9,7 +9,8 @@ cheat JSON files (`--game-patch`, written by the launcher's Cheats dialog).
 
 - Patch files are `*.xml` files in a patch directory: by default `patches/` next to the emulator
   executable (the build copies the shipped `patches/` folder there), or `--patches <dir>`.
-- Every patch is off unless it is enabled, in one of three ways:
+- Every patch is **off by default** and stays off unless it is explicitly enabled, in one of three
+  ways (to switch a patch off again, drop the option / list entry):
   - `--patch "<name>"` on the command line (can be repeated; names match case-insensitively),
   - `<patch dir>/patches.json`: `{"enabled": ["<name>", "..."]}`,
   - `isEnabled="true"` on the patch's `Metadata` element (shadPS4 convention).
@@ -23,7 +24,8 @@ cheat JSON files (`--game-patch`, written by the launcher's Cheats dialog).
   [patch] warning: no patch named "..." for PPSA01325 version 01.905.000
   ```
 
-Example (Astro's Playroom at correct game speed with 30 presented fps):
+Example (Astro's Playroom at correct game speed with 30 presented fps; both options are needed,
+without `--patch` the game runs unmodified, without `--frame-cap 30` the patch is refused):
 
 ```
 kyty_emulator --game <Astro dir> --frame-cap 30 --patch "Astro's Playroom - correct speed at 30 fps"
