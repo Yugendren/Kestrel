@@ -19,7 +19,7 @@ The emulator binary is still named `kyty_emulator` (`kyty_emulator.exe` on Windo
 
 | Game | Title ID | State | Notes |
 | --- | --- | --- | --- |
-| Astro's Playroom | PPSA01325 | Playable-ish | Boots, menus and gameplay through the hub work. 25-60 fps depending on the scene. Below 60 fps the game runs in slow motion. A fix is in progress. |
+| Astro's Playroom | PPSA01325 | Playable-ish | Boots, menus and gameplay through the hub work. 25-60 fps depending on the scene. Correct game speed at 30 fps with the game-speed patch plus `--frame-cap 30` (the `astro-low` and `astro-high` presets enable both). The Cooling Springs crash is fixed on `main` (tri-fan geometry shader support, by nmzik). Known crash: entering the SSD Speedway portal. Variable-step game speed (correct at any fps) is in testing. |
 | Demon's Souls (v01.005) | PPSA01342 | Not playable yet | Reaches gameplay on a development branch. About 2 fps, dark square specks, two intermittent crashes. |
 | Astro Bot | PPSA21564 | Untested | Not tried on Kestrel yet. Upstream KytyPS5 reports a crash after the Team Asobi splash. |
 | Ghost of Yotei | - | Planned | Later target. |
@@ -61,6 +61,10 @@ On `main` today:
   The window title also shows `frame: N, fps: N` while running.
 - **Launcher scripts** (`kestrel.bat`, `kestrel.sh`): presets for each game and GPU class, a
   dry-run mode, and a report mode that records a run for bug reports.
+- **Game-speed patches** (`--patch "<name>"`, `--patches <dir>`): a patch loader that reads
+  GoldHEN/shadPS4 XML patch files. Patches are opt-in by name and off by default. The first
+  patch is Astro's Playroom "correct speed at 30 fps", which needs `--frame-cap 30`. See
+  [PATCHES.md](PATCHES.md).
 - **Shader and pipeline caches**: kept in `_PipelineCache` so later runs stutter less.
 
 ### Coming soon
@@ -68,10 +72,7 @@ On `main` today:
 These are built and tested on branches but are not on `main` yet. The launcher skips them with
 a warning if your build lacks them.
 
-- **Game-speed patches**: a patch loader that reads GoldHEN/shadPS4 XML patch files. Patches
-  are opt-in by name with `--patch`; all are off by default. The first patch is Astro's
-  Playroom "correct speed at 30 fps", which needs `--frame-cap 30`. Variable-step game speed,
-  correct at any frame rate, comes next.
+- **Variable-step game speed**: Astro's Playroom at correct speed at any frame rate. In testing.
 - **FSR 1 upscaler** (`--upscaler fsr1`, `--fsr-sharpness`): optional AMD FSR 1 upscale from
   render resolution to the window. It improves the final image, not performance.
 - **Performance overlay** (F10 toggles, `--perf-overlay` starts it shown): fps, frame time,
