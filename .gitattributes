@@ -1,0 +1,4 @@
+# Kestrel launcher scripts: keep the line endings each shell expects on every checkout
+kestrel.sh text eol=lf
+kestrel.bat text eol=crlf
+kestrel.ps1 text eol=crlf
