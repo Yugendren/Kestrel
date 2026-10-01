@@ -260,7 +260,7 @@ function Build-Args([string]$GamePath, [string]$ReportDir) {
             $pc = Get-NonZero 'speed.patch_frame_cap'
             if ($cap -eq '' -and $pc -ne '') { $cap = $pc }
         } else {
-            Need-Flag 'speed.game_speed_patch' '--patch' '; skipped (patch_frame_cap not applied)'
+            Warn 'speed.game_speed_patch needs --patch (not in this build); skipped (patch_frame_cap not applied)'
         }
     }
     if ($cap -ne '') { $a.Add('--frame-cap'); $a.Add($cap) }

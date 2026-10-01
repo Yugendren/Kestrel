@@ -18,7 +18,7 @@ EMU=""
 EMU_DIR=""
 PRESET=""
 GUEST_LOG_PATH=""
-COMING_SOON=" --upscaler --fsr-sharpness --patch --perf-overlay --frame-time-log "
+COMING_SOON=" --upscaler --fsr-sharpness --perf-overlay --frame-time-log "
 
 # ---------------------------------------------------------------- helpers
 die() { echo "kestrel: error: $*" >&2; exit 2; }
